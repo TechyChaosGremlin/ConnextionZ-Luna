@@ -272,6 +272,26 @@ class PlatformAnalyticsService:
             current_day += timedelta(days=1)
         return points
 
+    @staticmethod
+    def _normalize_sort_key(sort_by: str | None) -> str:
+        if sort_by is None:
+            return "views"
+        normalized = sort_by.strip().lower().replace("-", "_")
+        aliases = {
+            "views": "views",
+            "likes": "likes",
+            "comments": "comments",
+            "shares": "shares",
+            "saves": "saves",
+            "engagement": "engagement",
+            "engagementrate": "engagement",
+            "engagement_rate": "engagement",
+            "completion": "completion_rate",
+            "completionrate": "completion_rate",
+            "completion_rate": "completion_rate",
+        }
+        return aliases.get(normalized, "views")
+
     async def top_content(self, start: datetime, end: datetime, sort_by: str = "views", limit: int = 10) -> list[dict]:
         metric = {
             "views": EventType.VIDEO_VIEWED,
@@ -279,7 +299,7 @@ class PlatformAnalyticsService:
             "comments": EventType.COMMENT_CREATED,
             "shares": EventType.SHARE_CREATED,
             "saves": EventType.SAVE_CREATED,
-        }.get(sort_by, EventType.VIDEO_VIEWED)
+        }.get(self._normalize_sort_key(sort_by), EventType.VIDEO_VIEWED)
         stmt = self._period(
             select(
                 AnalyticsEvent.post_id,
@@ -309,7 +329,11 @@ class PlatformAnalyticsService:
         posts_result = await self.db.execute(
             select(Post).where(Post.id.in_([row.post_id for row in grouped_rows]))
         )
-        posts = {post.id: post for post in posts_result.scalars().all()}
+        scalar_rows = getattr(posts_result, "scalars", None)
+        if callable(scalar_rows):
+            posts = {post.id: post for post in scalar_rows().all()}
+        else:
+            posts = {post.id: post for post in posts_result.all()}
         for row in grouped_rows:
             item = grouped[row.post_id]
             item["post"] = posts.get(row.post_id)
@@ -334,5 +358,13 @@ class PlatformAnalyticsService:
             item["completion_rate"] = item["completed"] / views * 100 if views else None
             item["average_watch_time"] = item["watch_ms"] / views / 1000 if views else None
             rows.append(item)
-        rows.sort(key=lambda row: row["engagement_rate"] if sort_by == "engagement" else (row["completion_rate"] or 0) if sort_by == "completion_rate" else row.get(sort_by, 0), reverse=True)
-        return rows[: max(1, min(limit, 20))]
+        sort_key = self._normalize_sort_key(sort_by)
+        rows.sort(
+            key=lambda row: (
+                row["engagement_rate"] if sort_key == "engagement" else
+                (row["completion_rate"] or 0) if sort_key == "completion_rate" else
+                row.get(sort_key, 0)
+            ),
+            reverse=True,
+        )
+        return rows[: max(0, min(limit, 10))]

@@ -184,3 +184,55 @@ async def test_platform_trends_fill_missing_days():
     assert rows[0]["views"] == 0
     assert rows[1]["views"] == 7
     assert rows[2]["engagement"] == 0
+
+
+@pytest.mark.asyncio
+async def test_top_content_supports_completion_and_engagement_sort_aliases():
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = rows
+
+        def all(self):
+            return self.rows
+
+    post_a = SimpleNamespace(id=uuid.uuid4(), title="A", caption="A", thumbnail=None, media_url=None, published_at=None)
+    post_b = SimpleNamespace(id=uuid.uuid4(), title="B", caption="B", thumbnail=None, media_url=None, published_at=None)
+
+    def build_rows(post, views, likes, comments, shares, saves, completed):
+        return [
+            SimpleNamespace(post_id=post.id, event_type=EventType.VIDEO_VIEWED, count=views, unique_users=views, duration_ms=0),
+            SimpleNamespace(post_id=post.id, event_type=EventType.LIKE_CREATED, count=likes, unique_users=likes, duration_ms=0),
+            SimpleNamespace(post_id=post.id, event_type=EventType.COMMENT_CREATED, count=comments, unique_users=comments, duration_ms=0),
+            SimpleNamespace(post_id=post.id, event_type=EventType.SHARE_CREATED, count=shares, unique_users=shares, duration_ms=0),
+            SimpleNamespace(post_id=post.id, event_type=EventType.SAVE_CREATED, count=saves, unique_users=saves, duration_ms=0),
+            SimpleNamespace(post_id=post.id, event_type=EventType.VIDEO_COMPLETED, count=completed, unique_users=completed, duration_ms=0),
+        ]
+
+    low = build_rows(post_a, views=10, likes=1, comments=0, shares=0, saves=0, completed=2)
+    high = build_rows(post_b, views=20, likes=5, comments=2, shares=1, saves=1, completed=8)
+
+    db = AsyncMock()
+    db.execute.side_effect = [
+        Result(rows=low + high),
+        Result(rows=[post_a, post_b]),
+        Result(rows=low + high),
+        Result(rows=[post_a, post_b]),
+    ]
+
+    completion_rows = await PlatformAnalyticsService(db).top_content(
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 28, tzinfo=timezone.utc),
+        "completionRate",
+        10,
+    )
+    assert completion_rows[0]["post"].id == post_b.id
+    assert completion_rows[0]["completion_rate"] == pytest.approx(40.0)
+
+    engagement_rows = await PlatformAnalyticsService(db).top_content(
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 28, tzinfo=timezone.utc),
+        "engagementRate",
+        10,
+    )
+    assert engagement_rows[0]["post"].id == post_b.id
+    assert engagement_rows[0]["engagement_rate"] == pytest.approx(45.0)
