@@ -18,6 +18,12 @@ Creator analytics is available to the authenticated creator through the existing
 - Completion rate: `VIDEO_COMPLETED` divided by `VIDEO_VIEWED`, multiplied by 100.
 - Engagement rate: `(likes + comments + shares + saves) / views * 100`; it is `0` when views are zero.
 
+## Collaboration metrics
+
+Collaboration metrics are calculated from non-deleted collaborations involving the authenticated creator and created within the requested period. The response includes total requests, proposed/pending, accepted or progressed (`accepted`, `in_progress`, or `completed`), declined, cancelled, active, and completed counts. Acceptance rate is accepted-or-progressed requests divided by total requests; completion rate is completed requests divided by accepted-or-progressed requests. Both rates are null when their denominator is zero.
+
+Average response time is returned in hours only when an existing `accepted_at` participant timestamp can be parsed; it measures the time from `proposed_at` (falling back to the collaboration `created_at`) to the earliest participant acceptance. Daily trends include request, pending, accepted, declined, completed, and cancelled collaboration counts by creation date.
+
 Missing watch duration and zero qualifying views do not produce fabricated rates. Per-video follower attribution is unavailable because follow events are creator-level and do not identify the originating video.
 
 ## Authorization and limitations

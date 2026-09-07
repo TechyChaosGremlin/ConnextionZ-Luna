@@ -534,6 +534,11 @@ type AnalyticsSummary {
   totalCollaborationRequests: Int!
   pendingCollaborations: Int!
   acceptedCollaborations: Int!
+  declinedCollaborations: Int!
+  cancelledCollaborations: Int!
+  collaborationAcceptanceRate: Float
+  collaborationCompletionRate: Float
+  averageResponseHours: Float
   collaborationSuccessRate: Float
   totalEarnings: Float
   earningsCurrency: String!
@@ -572,6 +577,12 @@ type AnalyticsTrendPoint {
   shares: Int!
   saves: Int!
   followersGained: Int!
+  collaborationsRequested: Int!
+  collaborationsPending: Int!
+  collaborationsAccepted: Int!
+  collaborationsDeclined: Int!
+  collaborationsCompleted: Int!
+  collaborationsCancelled: Int!
 }
 
 type PlatformAnalytics {

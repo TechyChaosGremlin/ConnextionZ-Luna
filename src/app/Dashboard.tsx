@@ -523,17 +523,11 @@ function Collabs({
   const pipeline: { label: string; value: string | number; hint: string; tone?: string }[] = [
     { label: "Requests received", value: c.totalRequests ?? "-", hint: `Last ${data.days} days` },
     { label: "Pending", value: c.pending ?? "-", hint: "Waiting on you", tone: "#f59e0b" },
-    { label: "Accepted", value: c.accepted ?? "-", hint: "You said yes" },
+    { label: "Accepted", value: c.accepted ?? "-", hint: "Accepted or progressed" },
+    { label: "Declined", value: c.declined ?? "-", hint: "Turned down" },
+    { label: "Cancelled", value: c.cancelled ?? "-", hint: "Closed before completion" },
     { label: "Completed", value: c.completed ?? "-", hint: "Shipped together" },
     { label: "Active projects", value: c.active ?? "-", hint: "In flight now", tone: ACCENT },
-    { label: "Repeat collaborators", value: c.repeatCollaborators ?? "-", hint: "Came back for another" },
-  ];
-
-  const opportunities: { label: string; value: string | number }[] = [
-    { label: "Freelance opportunities", value: c.freelanceOpportunities ?? "-" },
-    { label: "Job offers received", value: c.jobOffers ?? "-" },
-    { label: "Brand invitations", value: c.brandInvitations ?? "-" },
-    { label: "Advertising opportunities", value: c.adOpportunities ?? "-" },
   ];
 
   return (
@@ -541,9 +535,9 @@ function Collabs({
       {/* ── Headline three ── */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         {[
-          { label: "Collab Score", value: c.collabScore == null ? "-" : c.collabScore.toFixed(1), icon: Sparkles },
-          { label: "Success rate", value: c.successRatePct == null ? "-" : `${c.successRatePct}%`, icon: TrendingUp },
-          { label: "Avg. reply", value: c.avgResponseHours == null ? "-" : `${c.avgResponseHours}h`, icon: Users },
+          { label: "Acceptance rate", value: c.acceptanceRatePct == null ? "-" : `${c.acceptanceRatePct.toFixed(1)}%`, icon: TrendingUp },
+          { label: "Completion rate", value: c.completionRatePct == null ? "-" : `${c.completionRatePct.toFixed(1)}%`, icon: TrendingUp },
+          { label: "Avg. reply", value: c.avgResponseHours == null ? "-" : `${c.avgResponseHours.toFixed(1)}h`, icon: Users },
         ].map((item) => {
           const Icon = item.icon;
           return (
@@ -584,24 +578,25 @@ function Collabs({
               {c.pending} request{c.pending === 1 ? "" : "s"} waiting on you
             </span>
             <span className="block text-[12px] mt-0.5" style={{ color: t.sub }}>
-              Replying inside a day is what keeps your score above 4.5
+              Response time is measured when acceptance timestamps are available.
             </span>
           </span>
         </motion.button>
       )}
 
-      {/* ── Opportunities ── */}
+      {/* ── Daily activity ── */}
       <p className="text-[11px] font-bold uppercase tracking-widest mb-2 px-1" style={{ color: t.sectionLbl }}>
-        Opportunities
+        Daily activity
       </p>
       <div className="rounded-2xl overflow-hidden" style={{ background: t.groupBg, border: t.groupBorder }}>
-        {opportunities.map((item, i) => (
-          <div key={item.label} className="flex items-center justify-between px-4 py-3.5"
-            style={{ borderBottom: i < opportunities.length - 1 ? `1px solid ${t.divider}` : "none" }}>
-            <span className="text-[14px]" style={{ color: t.body }}>{item.label}</span>
-            <span className="text-[15px] font-extrabold" style={{ color: ACCENT }}>{item.value}</span>
+        {c.trends.filter((point) => point.requested > 0 || point.accepted > 0 || point.completed > 0).slice(-7).map((point, i, rows) => (
+          <div key={point.date} className="flex items-center justify-between px-4 py-3.5"
+            style={{ borderBottom: i < rows.length - 1 ? `1px solid ${t.divider}` : "none" }}>
+            <span className="text-[14px]" style={{ color: t.body }}>{point.date}</span>
+            <span className="text-[12px]" style={{ color: t.sub }}>{point.requested} requests · {point.accepted} accepted · {point.completed} completed</span>
           </div>
         ))}
+        {c.trends.every((point) => point.requested === 0 && point.accepted === 0 && point.completed === 0) && <p className="px-4 py-3.5 text-[13px]" style={{ color: t.sub }}>No collaboration activity in this period.</p>}
       </div>
 
       <p className="text-[11px] leading-relaxed mt-4 px-1 flex items-start gap-2" style={{ color: t.sub }}>

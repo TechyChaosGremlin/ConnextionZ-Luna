@@ -90,27 +90,62 @@ class CreatorAnalyticsService:
             "engagement_rate": engagements / views * 100 if views > 0 else 0.0,
         }
 
-    async def _collaboration_totals(self, creator_id: uuid.UUID) -> dict:
-        counts = await CollaborationRepository(self.db).status_counts_for_user(creator_id)
+    @staticmethod
+    def _parse_timestamp(value) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
 
-        def status_count(status: CollaborationStatus) -> int:
-            return int(counts.get(status, counts.get(status.value, 0)) or 0)
-
-        pending = status_count(CollaborationStatus.PROPOSED)
-        accepted = status_count(CollaborationStatus.ACCEPTED)
-        active = status_count(CollaborationStatus.IN_PROGRESS)
-        completed = status_count(CollaborationStatus.COMPLETED)
-        cancelled = status_count(CollaborationStatus.CANCELLED)
-        declined = status_count(CollaborationStatus.DECLINED)
-        resolved = completed + cancelled
-
+    async def _collaboration_totals(
+        self, creator_id: uuid.UUID, start: datetime, end: datetime
+    ) -> dict:
+        collaborations = await CollaborationRepository(self.db).get_for_user_in_period(
+            creator_id, start, end
+        )
+        accepted_statuses = {
+            CollaborationStatus.ACCEPTED,
+            CollaborationStatus.IN_PROGRESS,
+            CollaborationStatus.COMPLETED,
+        }
+        pending = sum(collaboration.status == CollaborationStatus.PROPOSED for collaboration in collaborations)
+        accepted = sum(collaboration.status in accepted_statuses for collaboration in collaborations)
+        declined = sum(collaboration.status == CollaborationStatus.DECLINED for collaboration in collaborations)
+        active = sum(collaboration.status == CollaborationStatus.IN_PROGRESS for collaboration in collaborations)
+        completed = sum(collaboration.status == CollaborationStatus.COMPLETED for collaboration in collaborations)
+        cancelled = sum(collaboration.status == CollaborationStatus.CANCELLED for collaboration in collaborations)
+        response_hours = []
+        for collaboration in collaborations:
+            request_at = self._parse_timestamp(getattr(collaboration, "proposed_at", None))
+            request_at = request_at or getattr(collaboration, "created_at", None)
+            if request_at is None:
+                continue
+            accepted_at = [
+                self._parse_timestamp(getattr(participant, "accepted_at", None))
+                for participant in getattr(collaboration, "participants", [])
+            ]
+            accepted_at = [timestamp for timestamp in accepted_at if timestamp is not None]
+            if accepted_at:
+                elapsed = (min(accepted_at) - request_at).total_seconds() / 3600
+                if elapsed >= 0:
+                    response_hours.append(elapsed)
+        average_response_hours = sum(response_hours) / len(response_hours) if response_hours else None
         return {
-            "total_collaboration_requests": pending + accepted + active + completed + cancelled + declined,
+            "total_collaboration_requests": len(collaborations),
             "pending_collaborations": pending,
             "accepted_collaborations": accepted,
+            "declined_collaborations": declined,
             "active_collaborations": active,
             "completed_collaborations": completed,
-            "collaboration_success_rate": completed / resolved * 100 if resolved else None,
+            "cancelled_collaborations": cancelled,
+            "collaboration_acceptance_rate": accepted / len(collaborations) * 100 if collaborations else None,
+            "collaboration_completion_rate": completed / accepted * 100 if accepted else None,
+            "collaboration_success_rate": completed / accepted * 100 if accepted else None,
+            "average_response_hours": average_response_hours,
         }
 
     async def overview(self, creator_id: uuid.UUID, start: datetime, end: datetime) -> dict:
@@ -118,7 +153,7 @@ class CreatorAnalyticsService:
         current = await self._period_totals(creator_id, start, end)
         period_length = end - start
         previous = await self._period_totals(creator_id, start - period_length, start)
-        collaborations = await self._collaboration_totals(creator_id)
+        collaborations = await self._collaboration_totals(creator_id, start, end)
 
         top_video_perf = await self.video_performance(creator_id, start, end)
         top_video_perf.sort(key=lambda item: item["engagement_rate"], reverse=True)
@@ -206,7 +241,34 @@ class CreatorAnalyticsService:
         rows = await self.analytics_repo.daily_signal_totals(
             creator_id=creator_id, start=start, end=end
         )
+        collaborations = await CollaborationRepository(self.db).get_for_user_in_period(
+            creator_id, start, end
+        )
         by_date = {row["date"]: row for row in rows}
+        accepted_statuses = {
+            CollaborationStatus.ACCEPTED,
+            CollaborationStatus.IN_PROGRESS,
+            CollaborationStatus.COMPLETED,
+        }
+        for collaboration in collaborations:
+            date_key = collaboration.created_at.date().isoformat()
+            point = by_date.setdefault(date_key, {})
+            point["collaborations_requested"] = point.get("collaborations_requested", 0) + 1
+            point["collaborations_pending"] = point.get("collaborations_pending", 0) + int(
+                collaboration.status == CollaborationStatus.PROPOSED
+            )
+            point["collaborations_accepted"] = point.get("collaborations_accepted", 0) + int(
+                collaboration.status in accepted_statuses
+            )
+            point["collaborations_declined"] = point.get("collaborations_declined", 0) + int(
+                collaboration.status == CollaborationStatus.DECLINED
+            )
+            point["collaborations_completed"] = point.get("collaborations_completed", 0) + int(
+                collaboration.status == CollaborationStatus.COMPLETED
+            )
+            point["collaborations_cancelled"] = point.get("collaborations_cancelled", 0) + int(
+                collaboration.status == CollaborationStatus.CANCELLED
+            )
         points = []
         current_day = start.date()
         end_day = end.date()
@@ -220,6 +282,12 @@ class CreatorAnalyticsService:
                 "shares": 0,
                 "saves": 0,
                 "followers_gained": 0,
+                "collaborations_requested": 0,
+                "collaborations_pending": 0,
+                "collaborations_accepted": 0,
+                "collaborations_declined": 0,
+                "collaborations_completed": 0,
+                "collaborations_cancelled": 0,
                 **by_date.get(date_key, {}),
             })
             current_day += timedelta(days=1)

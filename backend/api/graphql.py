@@ -840,6 +840,11 @@ class AnalyticsSummaryType:
     total_collaboration_requests: int = 0
     pending_collaborations: int = 0
     accepted_collaborations: int = 0
+    declined_collaborations: int = 0
+    cancelled_collaborations: int = 0
+    collaboration_acceptance_rate: Optional[float] = None
+    collaboration_completion_rate: Optional[float] = None
+    average_response_hours: Optional[float] = None
     collaboration_success_rate: Optional[float] = None
     total_earnings: Optional[float] = None
     earnings_currency: str = "USD"
@@ -863,6 +868,12 @@ class AnalyticsTrendPointType:
     shares: int = 0
     saves: int = 0
     followers_gained: int = 0
+    collaborations_requested: int = 0
+    collaborations_pending: int = 0
+    collaborations_accepted: int = 0
+    collaborations_declined: int = 0
+    collaborations_completed: int = 0
+    collaborations_cancelled: int = 0
 
 @strawberry.type
 class PlatformAnalyticsType:
@@ -3494,6 +3505,11 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
         total_collaboration_requests=values["total_collaboration_requests"],
         pending_collaborations=values["pending_collaborations"],
         accepted_collaborations=values["accepted_collaborations"],
+        declined_collaborations=values["declined_collaborations"],
+        cancelled_collaborations=values["cancelled_collaborations"],
+        collaboration_acceptance_rate=values["collaboration_acceptance_rate"],
+        collaboration_completion_rate=values["collaboration_completion_rate"],
+        average_response_hours=values["average_response_hours"],
         active_collaborations=values["active_collaborations"],
         completed_collaborations=values["completed_collaborations"],
         collaboration_success_rate=values["collaboration_success_rate"],

@@ -35,16 +35,24 @@ export interface CollabStats {
   totalRequests: number | null;
   pending: number | null;
   accepted: number | null;
+  declined: number | null;
+  cancelled: number | null;
   completed: number | null;
   active: number | null;
-  successRatePct: number | null;
+  acceptanceRatePct: number | null;
+  completionRatePct: number | null;
   avgResponseHours: number | null;
-  collabScore: number | null;
-  repeatCollaborators: number | null;
-  freelanceOpportunities: number | null;
-  jobOffers: number | null;
-  brandInvitations: number | null;
-  adOpportunities: number | null;
+  trends: CollaborationTrend[];
+}
+
+export interface CollaborationTrend {
+  date: string;
+  requested: number;
+  pending: number;
+  accepted: number;
+  declined: number;
+  completed: number;
+  cancelled: number;
 }
 
 /** A row in the content-management list. */
@@ -87,7 +95,9 @@ export interface CreatorAnalyticsResponse {
     lostFollowers: number; avgWatchTime: number | null; completionRate: number | null;
     engagementRate: number; totalPosts: number; activeCollaborations: number; completedCollaborations: number;
     totalCollaborationRequests: number; pendingCollaborations: number; acceptedCollaborations: number;
-    collaborationSuccessRate: number | null; viewsGrowthPct: number | null; likesGrowthPct: number | null;
+    declinedCollaborations: number; cancelledCollaborations: number; collaborationAcceptanceRate: number | null;
+    collaborationCompletionRate: number | null; averageResponseHours: number | null;
+    viewsGrowthPct: number | null; likesGrowthPct: number | null;
     commentsGrowthPct: number | null; sharesGrowthPct: number | null; followersGrowthPct: number | null;
   };
   creatorVideoAnalytics: {
@@ -100,7 +110,8 @@ export interface CreatorAnalyticsResponse {
   }[];
   creatorAnalyticsTrends: {
     date: string; views: number; likes: number; comments: number; shares: number;
-    saves: number; followersGained: number;
+    saves: number; followersGained: number; collaborationsRequested: number; collaborationsPending: number;
+    collaborationsAccepted: number; collaborationsDeclined: number; collaborationsCompleted: number; collaborationsCancelled: number;
   }[];
 }
 
@@ -111,7 +122,9 @@ export async function fetchCreatorAnalytics(range: Range): Promise<Result<Creato
         totalPosts totalViews uniqueViewers totalLikes totalComments totalShares totalSaves
         followerGrowth newFollowers lostFollowers avgWatchTime completionRate engagementRate
         activeCollaborations completedCollaborations
-        totalCollaborationRequests pendingCollaborations acceptedCollaborations collaborationSuccessRate
+        totalCollaborationRequests pendingCollaborations acceptedCollaborations declinedCollaborations cancelledCollaborations
+        collaborationAcceptanceRate collaborationCompletionRate averageResponseHours
+          creatorAnalyticsTrends(period) { date views likes comments shares saves followersGained collaborationsRequested collaborationsPending collaborationsAccepted collaborationsDeclined collaborationsCompleted collaborationsCancelled }
         viewsGrowthPct likesGrowthPct commentsGrowthPct sharesGrowthPct followersGrowthPct
       }
       creatorVideoAnalytics(period: $period, sortBy: "views") {
@@ -167,10 +180,22 @@ export async function fetchDashboard(range: Range): Promise<Result<DashboardData
     totalRequests: summary.totalCollaborationRequests,
     pending: summary.pendingCollaborations,
     accepted: summary.acceptedCollaborations,
-    completed: summary.completedCollaborations, active: summary.activeCollaborations,
-    successRatePct: summary.collaborationSuccessRate,
-    avgResponseHours: null, collabScore: null, repeatCollaborators: null,
-    freelanceOpportunities: null, jobOffers: null, brandInvitations: null, adOpportunities: null,
+    declined: summary.declinedCollaborations,
+    cancelled: summary.cancelledCollaborations,
+    completed: summary.completedCollaborations,
+    active: summary.activeCollaborations,
+    acceptanceRatePct: summary.collaborationAcceptanceRate,
+    completionRatePct: summary.collaborationCompletionRate,
+    avgResponseHours: summary.averageResponseHours,
+    trends: result.value.creatorAnalyticsTrends.map((point) => ({
+      date: point.date,
+      requested: point.collaborationsRequested,
+      pending: point.collaborationsPending,
+      accepted: point.collaborationsAccepted,
+      declined: point.collaborationsDeclined,
+      completed: point.collaborationsCompleted,
+      cancelled: point.collaborationsCancelled,
+    })),
   };
   return {
     ok: true,

@@ -12,6 +12,7 @@ from typing import Optional
 
 from sqlalchemy import func, select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.collaboration import (
     Collaboration, CollaborationParticipant, Milestone,
@@ -87,6 +88,29 @@ class CollaborationRepository(BaseRepository[Collaboration]):
             .group_by(Collaboration.status)
         )
         return {row.status: int(row.count or 0) for row in result.all()}
+
+    async def get_for_user_in_period(
+        self, user_id: uuid.UUID, start: datetime, end: datetime
+    ) -> list[Collaboration]:
+        """Return a user's non-deleted collaborations created in a period."""
+        participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
+            CollaborationParticipant.user_id == user_id
+        ).subquery()
+        result = await self.db.execute(
+            select(Collaboration)
+            .options(selectinload(Collaboration.participants))
+            .where(
+                Collaboration.deleted_at.is_(None),
+                Collaboration.created_at >= start,
+                Collaboration.created_at <= end,
+                or_(
+                    Collaboration.initiator_id == user_id,
+                    Collaboration.id.in_(participant_collab_ids),
+                ),
+            )
+            .order_by(Collaboration.created_at.asc(), Collaboration.id.asc())
+        )
+        return list(result.scalars().all())
 
     async def get_marketplace(
         self,

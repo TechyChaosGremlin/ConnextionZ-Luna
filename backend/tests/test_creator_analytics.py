@@ -16,7 +16,7 @@ monkeypatched so no real (Postgres-only) database is required.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -65,6 +65,57 @@ class TestCreatorAnalytics:
         period = SimpleNamespace(start=datetime.now(timezone.utc), end=datetime.now(timezone.utc))
         with pytest.raises(PermissionError):
             await _creator_analytics(ctx, period)
+
+    @pytest.mark.asyncio
+    async def test_creator_analytics_is_scoped_to_authenticated_creator(self, monkeypatch):
+        creator_id = uuid.uuid4()
+        ctx = AppContext(db=object(), current_user=SimpleNamespace(id=creator_id))
+        period = SimpleNamespace(
+            start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 1, 31, tzinfo=timezone.utc),
+        )
+        values = {
+            "total_posts": 0, "total_uploads": 0, "total_published_videos": 0,
+            "total_views": 0, "unique_viewers": 0, "total_likes": 0, "total_comments": 0,
+            "total_shares": 0, "total_saves": 0, "new_followers": 0, "lost_followers": 0,
+            "follower_growth": 0, "avg_watch_time": None, "completion_rate": None,
+            "engagement_rate": 0.0, "views_growth_pct": None, "likes_growth_pct": None,
+            "comments_growth_pct": None, "shares_growth_pct": None, "followers_growth_pct": None,
+            "top_posts": [], "total_collaboration_requests": 0,
+            "pending_collaborations": 0, "accepted_collaborations": 0,
+            "declined_collaborations": 0, "cancelled_collaborations": 0,
+            "active_collaborations": 0, "completed_collaborations": 0,
+            "collaboration_acceptance_rate": None, "collaboration_completion_rate": None,
+            "average_response_hours": None, "collaboration_success_rate": None,
+        }
+
+        async def fake_overview(self, requested_creator_id, start, end):
+            assert requested_creator_id == creator_id
+            assert start == period.start
+            assert end == period.end
+            return values
+
+        monkeypatch.setattr("services.creator_analytics_service.CreatorAnalyticsService.overview", fake_overview)
+        result = await _creator_analytics(ctx, period)
+        assert result.total_collaboration_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_collaboration_rates_are_none_with_zero_requests(self, monkeypatch):
+        service = CreatorAnalyticsService(AsyncMock())
+
+        async def fake_get_for_user_in_period(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            fake_get_for_user_in_period,
+        )
+        values = await service._collaboration_totals(
+            uuid.uuid4(), datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 2, tzinfo=timezone.utc)
+        )
+        assert values["collaboration_acceptance_rate"] is None
+        assert values["collaboration_completion_rate"] is None
+        assert values["average_response_hours"] is None
 
     @pytest.mark.asyncio
     async def test_aggregates_from_existing_data(self, monkeypatch):
@@ -347,30 +398,48 @@ class TestCreatorAnalytics:
     async def test_creator_service_collaboration_status_metrics(self, monkeypatch):
         creator_id = uuid.uuid4()
         service = CreatorAnalyticsService(AsyncMock())
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 31, tzinfo=timezone.utc)
+        request_at = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
 
-        async def fake_status_counts_for_user(self, user_id):
+        def collaboration(status, accepted_at=None, created_at=request_at):
+            return SimpleNamespace(
+                status=status,
+                created_at=created_at,
+                proposed_at=created_at.isoformat(),
+                participants=[SimpleNamespace(accepted_at=accepted_at)],
+            )
+
+        async def fake_get_for_user_in_period(self, user_id, period_start, period_end):
             assert user_id == creator_id
-            return {
-                CollaborationStatus.PROPOSED: 2,
-                CollaborationStatus.ACCEPTED: 1,
-                CollaborationStatus.IN_PROGRESS: 4,
-                CollaborationStatus.COMPLETED: 3,
-                CollaborationStatus.CANCELLED: 1,
-            }
+            assert period_start == start
+            assert period_end == end
+            return [
+                collaboration(CollaborationStatus.PROPOSED),
+                collaboration(CollaborationStatus.ACCEPTED, (request_at + timedelta(hours=2)).isoformat()),
+                collaboration(CollaborationStatus.IN_PROGRESS),
+                collaboration(CollaborationStatus.COMPLETED),
+                collaboration(CollaborationStatus.CANCELLED),
+                collaboration(CollaborationStatus.DECLINED),
+            ]
 
         monkeypatch.setattr(
-            "repositories.collaboration_repository.CollaborationRepository.status_counts_for_user",
-            fake_status_counts_for_user,
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            fake_get_for_user_in_period,
         )
 
-        values = await service._collaboration_totals(creator_id)
+        values = await service._collaboration_totals(creator_id, start, end)
 
-        assert values["total_collaboration_requests"] == 11
-        assert values["pending_collaborations"] == 2
-        assert values["accepted_collaborations"] == 1
-        assert values["active_collaborations"] == 4
-        assert values["completed_collaborations"] == 3
-        assert values["collaboration_success_rate"] == pytest.approx(75.0)
+        assert values["total_collaboration_requests"] == 6
+        assert values["pending_collaborations"] == 1
+        assert values["accepted_collaborations"] == 3
+        assert values["declined_collaborations"] == 1
+        assert values["cancelled_collaborations"] == 1
+        assert values["active_collaborations"] == 1
+        assert values["completed_collaborations"] == 1
+        assert values["collaboration_acceptance_rate"] == pytest.approx(50.0)
+        assert values["collaboration_completion_rate"] == pytest.approx(33.333333)
+        assert values["average_response_hours"] == pytest.approx(2.0)
 
     @pytest.mark.asyncio
     async def test_creator_trends_fill_missing_days(self, monkeypatch):
@@ -382,7 +451,14 @@ class TestCreatorAnalytics:
         async def fake_daily_signal_totals(*args, **kwargs):
             return [{"date": "2026-04-02", "views": 5, "likes": 1, "comments": 0, "shares": 0, "saves": 0, "followers_gained": 1}]
 
+        async def fake_get_for_user_in_period(*args, **kwargs):
+            return []
+
         monkeypatch.setattr(service.analytics_repo, "daily_signal_totals", fake_daily_signal_totals)
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            fake_get_for_user_in_period,
+        )
 
         rows = await service.daily_trends(creator_id, start, end)
 
@@ -390,6 +466,41 @@ class TestCreatorAnalytics:
         assert rows[0]["views"] == 0
         assert rows[1]["views"] == 5
         assert rows[2]["followers_gained"] == 0
+        assert rows[1]["collaborations_requested"] == 0
+
+    @pytest.mark.asyncio
+    async def test_creator_trends_include_period_collaboration_states(self, monkeypatch):
+        creator_id = uuid.uuid4()
+        service = CreatorAnalyticsService(AsyncMock())
+        start = datetime(2026, 4, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 4, 3, tzinfo=timezone.utc)
+
+        async def fake_daily_signal_totals(*args, **kwargs):
+            return []
+
+        collaborations = [
+            SimpleNamespace(created_at=datetime(2026, 4, 2, tzinfo=timezone.utc), status=CollaborationStatus.PROPOSED),
+            SimpleNamespace(created_at=datetime(2026, 4, 2, tzinfo=timezone.utc), status=CollaborationStatus.COMPLETED),
+            SimpleNamespace(created_at=datetime(2026, 4, 3, tzinfo=timezone.utc), status=CollaborationStatus.DECLINED),
+        ]
+
+        async def fake_get_for_user_in_period(self, user_id, period_start, period_end):
+            assert user_id == creator_id
+            assert period_start == start
+            assert period_end == end
+            return collaborations
+
+        monkeypatch.setattr(service.analytics_repo, "daily_signal_totals", fake_daily_signal_totals)
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            fake_get_for_user_in_period,
+        )
+        rows = await service.daily_trends(creator_id, start, end)
+        assert rows[1]["collaborations_requested"] == 2
+        assert rows[1]["collaborations_pending"] == 1
+        assert rows[1]["collaborations_accepted"] == 1
+        assert rows[1]["collaborations_completed"] == 1
+        assert rows[2]["collaborations_declined"] == 1
 
 
 class TestPostAnalytics:
