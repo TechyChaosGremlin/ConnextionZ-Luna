@@ -131,7 +131,7 @@ export async function fetchCreatorAnalytics(range: Range): Promise<Result<Creato
         post { id caption viewCount likeCount commentCount shareCount status scheduledAt createdAt media { thumbnailUrl url } }
         views likes comments shares saves
       }
-      creatorAnalyticsTrends(period: $period) { date views likes comments shares saves followersGained }
+      creatorAnalyticsTrends(period: $period) { date views likes comments shares saves followersGained collaborationsRequested collaborationsPending collaborationsAccepted collaborationsInProgress collaborationsDeclined collaborationsCompleted collaborationsCancelled }
     }
   `, { period: analyticsPeriod(range) });
 }
