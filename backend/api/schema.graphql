@@ -580,6 +580,7 @@ type AnalyticsTrendPoint {
   collaborationsRequested: Int!
   collaborationsPending: Int!
   collaborationsAccepted: Int!
+  collaborationsInProgress: Int!
   collaborationsDeclined: Int!
   collaborationsCompleted: Int!
   collaborationsCancelled: Int!

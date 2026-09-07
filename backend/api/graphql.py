@@ -871,6 +871,7 @@ class AnalyticsTrendPointType:
     collaborations_requested: int = 0
     collaborations_pending: int = 0
     collaborations_accepted: int = 0
+    collaborations_in_progress: int = 0
     collaborations_declined: int = 0
     collaborations_completed: int = 0
     collaborations_cancelled: int = 0

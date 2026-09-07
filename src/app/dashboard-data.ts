@@ -50,6 +50,7 @@ export interface CollaborationTrend {
   requested: number;
   pending: number;
   accepted: number;
+  active: number;
   declined: number;
   completed: number;
   cancelled: number;
@@ -111,7 +112,7 @@ export interface CreatorAnalyticsResponse {
   creatorAnalyticsTrends: {
     date: string; views: number; likes: number; comments: number; shares: number;
     saves: number; followersGained: number; collaborationsRequested: number; collaborationsPending: number;
-    collaborationsAccepted: number; collaborationsDeclined: number; collaborationsCompleted: number; collaborationsCancelled: number;
+    collaborationsAccepted: number; collaborationsInProgress: number; collaborationsDeclined: number; collaborationsCompleted: number; collaborationsCancelled: number;
   }[];
 }
 
@@ -124,7 +125,6 @@ export async function fetchCreatorAnalytics(range: Range): Promise<Result<Creato
         activeCollaborations completedCollaborations
         totalCollaborationRequests pendingCollaborations acceptedCollaborations declinedCollaborations cancelledCollaborations
         collaborationAcceptanceRate collaborationCompletionRate averageResponseHours
-          creatorAnalyticsTrends(period) { date views likes comments shares saves followersGained collaborationsRequested collaborationsPending collaborationsAccepted collaborationsDeclined collaborationsCompleted collaborationsCancelled }
         viewsGrowthPct likesGrowthPct commentsGrowthPct sharesGrowthPct followersGrowthPct
       }
       creatorVideoAnalytics(period: $period, sortBy: "views") {
@@ -192,6 +192,7 @@ export async function fetchDashboard(range: Range): Promise<Result<DashboardData
       requested: point.collaborationsRequested,
       pending: point.collaborationsPending,
       accepted: point.collaborationsAccepted,
+      active: point.collaborationsInProgress,
       declined: point.collaborationsDeclined,
       completed: point.collaborationsCompleted,
       cancelled: point.collaborationsCancelled,

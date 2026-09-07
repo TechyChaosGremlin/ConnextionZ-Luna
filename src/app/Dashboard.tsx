@@ -593,7 +593,7 @@ function Collabs({
           <div key={point.date} className="flex items-center justify-between px-4 py-3.5"
             style={{ borderBottom: i < rows.length - 1 ? `1px solid ${t.divider}` : "none" }}>
             <span className="text-[14px]" style={{ color: t.body }}>{point.date}</span>
-            <span className="text-[12px]" style={{ color: t.sub }}>{point.requested} requests · {point.accepted} accepted · {point.completed} completed</span>
+            <span className="text-[12px]" style={{ color: t.sub }}>{point.requested} requests · {point.accepted} accepted · {point.active} in progress · {point.completed} completed</span>
           </div>
         ))}
         {c.trends.every((point) => point.requested === 0 && point.accepted === 0 && point.completed === 0) && <p className="px-4 py-3.5 text-[13px]" style={{ color: t.sub }}>No collaboration activity in this period.</p>}

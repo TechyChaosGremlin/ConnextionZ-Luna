@@ -7,7 +7,7 @@ for engagement signals, complemented by ``Post`` and ``Comment`` queries.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,13 +93,18 @@ class CreatorAnalyticsService:
     @staticmethod
     def _parse_timestamp(value) -> datetime | None:
         if isinstance(value, datetime):
-            return value
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
         if not isinstance(value, str) or not value:
             return None
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         except ValueError:
             return None
+
+    @classmethod
+    def _collaboration_timestamp(cls, collaboration, field: str) -> datetime | None:
+        return cls._parse_timestamp(getattr(collaboration, field, None))
 
     async def _collaboration_totals(
         self, creator_id: uuid.UUID, start: datetime, end: datetime
@@ -120,17 +125,18 @@ class CreatorAnalyticsService:
         cancelled = sum(collaboration.status == CollaborationStatus.CANCELLED for collaboration in collaborations)
         response_hours = []
         for collaboration in collaborations:
-            request_at = self._parse_timestamp(getattr(collaboration, "proposed_at", None))
-            request_at = request_at or getattr(collaboration, "created_at", None)
+            request_at = self._collaboration_timestamp(collaboration, "created_at")
+            request_at = self._collaboration_timestamp(collaboration, "proposed_at") or request_at
             if request_at is None:
                 continue
-            accepted_at = [
+            accepted_timestamps = [self._parse_timestamp(getattr(collaboration, "accepted_at", None))]
+            accepted_timestamps.extend(
                 self._parse_timestamp(getattr(participant, "accepted_at", None))
                 for participant in getattr(collaboration, "participants", [])
-            ]
-            accepted_at = [timestamp for timestamp in accepted_at if timestamp is not None]
-            if accepted_at:
-                elapsed = (min(accepted_at) - request_at).total_seconds() / 3600
+            )
+            accepted_timestamps = [timestamp for timestamp in accepted_timestamps if timestamp is not None]
+            if accepted_timestamps:
+                elapsed = (min(accepted_timestamps) - request_at).total_seconds() / 3600
                 if elapsed >= 0:
                     response_hours.append(elapsed)
         average_response_hours = sum(response_hours) / len(response_hours) if response_hours else None
@@ -251,7 +257,10 @@ class CreatorAnalyticsService:
             CollaborationStatus.COMPLETED,
         }
         for collaboration in collaborations:
-            date_key = collaboration.created_at.date().isoformat()
+            created_at = self._collaboration_timestamp(collaboration, "created_at")
+            if created_at is None:
+                continue
+            date_key = created_at.date().isoformat()
             point = by_date.setdefault(date_key, {})
             point["collaborations_requested"] = point.get("collaborations_requested", 0) + 1
             point["collaborations_pending"] = point.get("collaborations_pending", 0) + int(
@@ -259,6 +268,9 @@ class CreatorAnalyticsService:
             )
             point["collaborations_accepted"] = point.get("collaborations_accepted", 0) + int(
                 collaboration.status in accepted_statuses
+            )
+            point["collaborations_in_progress"] = point.get("collaborations_in_progress", 0) + int(
+                collaboration.status == CollaborationStatus.IN_PROGRESS
             )
             point["collaborations_declined"] = point.get("collaborations_declined", 0) + int(
                 collaboration.status == CollaborationStatus.DECLINED
@@ -285,6 +297,7 @@ class CreatorAnalyticsService:
                 "collaborations_requested": 0,
                 "collaborations_pending": 0,
                 "collaborations_accepted": 0,
+                "collaborations_in_progress": 0,
                 "collaborations_declined": 0,
                 "collaborations_completed": 0,
                 "collaborations_cancelled": 0,
