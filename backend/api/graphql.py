@@ -504,6 +504,12 @@ class SaveResultType:
 
 
 @strawberry.type
+class NotInterestedResultType:
+    not_interested: bool
+    post_id: UUIDScalar
+
+
+@strawberry.type
 class ShareResultType:
     shares: int
     shared: bool
@@ -1869,6 +1875,15 @@ class Mutation:
         return await _track_post_watch(info.context, post_id, watched_seconds, completed)
 
     @strawberry.mutation
+    async def not_interested(
+        self, info: StrawberryInfo[AppContext, None], post_id: UUIDScalar
+    ) -> NotInterestedResultType:
+        """Explicit negative feedback: demote this post (and, via the shared
+        interest-signal log, reduce similar content) in the viewer's For You
+        feed. Idempotent per post/user."""
+        return await _not_interested(info.context, post_id)
+
+    @strawberry.mutation
     async def create_comment(
         self, info: StrawberryInfo[AppContext, None], input: CreateCommentInput
     ) -> CommentType:
@@ -2153,7 +2168,7 @@ def _milestone_to_gql(milestone) -> MilestoneType:
         title=milestone.title,
         description=milestone.description,
         status=MilestoneStatus(milestone.status.value) if milestone.status else MilestoneStatus.PENDING,
-        due_date=datetime.fromisoformat(milestone.due_at) if milestone.due_at else None,
+        due_at=datetime.fromisoformat(milestone.due_at) if milestone.due_at else None,
         completed_at=datetime.fromisoformat(milestone.completed_at) if milestone.completed_at else None,
         created_at=milestone.created_at,
         updated_at=milestone.updated_at,
@@ -2440,6 +2455,40 @@ def _feed_item_is_visible(
     return visibility != "followers" or post.user_id in following_ids
 
 
+_FOR_YOU_CURSOR_PREFIX = "fy1."
+
+
+def _encode_for_you_cursor(ranked_ids, last_id) -> str:
+    """Encode the full ranked order + last-served post id into an opaque cursor.
+
+    Format: ``fy1.<last_id>.<id1,id2,...>`` — the trailing list is the complete
+    ranked post-id order from the request that produced this cursor. Keeping the
+    snapshot in the cursor (rather than server-side session state) preserves the
+    existing stateless pagination architecture and works across app restarts.
+    """
+    joined = ",".join(str(pid) for pid in ranked_ids)
+    return f"{_FOR_YOU_CURSOR_PREFIX}{last_id}.{joined}"
+
+
+def _decode_for_you_cursor(cursor):
+    """Decode a snapshot cursor into (ranked_ids, last_id).
+
+    Returns ``(None, last_id)`` for a legacy plain post-id cursor, so older
+    clients keep working by falling back to locating ``last_id`` in the
+    freshly computed ranking. Raises ValueError for a malformed cursor.
+    """
+    from uuid import UUID as UUID_type
+
+    if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
+        # Legacy: the whole cursor is just the last post's id.
+        return None, UUID_type(cursor)
+    body = cursor[len(_FOR_YOU_CURSOR_PREFIX):]
+    last_str, _, snapshot_str = body.partition(".")
+    last_id = UUID_type(last_str)
+    ranked_ids = [UUID_type(part) for part in snapshot_str.split(",") if part]
+    return ranked_ids, last_id
+
+
 async def _feed(ctx, cursor, limit, following) -> FeedPageType:
     """Personalized feed for the authenticated user (legacy cursor-page shape)."""
     from uuid import UUID as UUID_type
@@ -2453,14 +2502,17 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
 
     before_id: Optional[uuid.UUID] = None
     if cursor:
-        try:
-            before_id = UUID_type(cursor)
-        except ValueError:
-            raise ValueError("Invalid feed cursor")
+        # Snapshot cursors (For You) are opaque strings, not bare UUIDs — skip
+        # UUID parsing for them and let the For You path decode the snapshot.
+        if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
+            try:
+                before_id = UUID_type(cursor)
+            except ValueError:
+                raise ValueError("Invalid feed cursor")
 
     if not following:
         followed_ids = await follow_repo.get_following_ids(user.id)
-        return await _for_you_feed(ctx, user, followed_ids, before_id, limit)
+        return await _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor)
 
     author_ids = await follow_repo.get_following_ids(user.id)
     if not author_ids:
@@ -2510,20 +2562,32 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
     return FeedPageType(items=items, next_cursor=next_cursor)
 
 
-async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageType:
+async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> FeedPageType:
     """Personalized "For You" feed: candidate generation + deterministic scoring.
 
-    Candidates = the viewer's own + followed creators' posts, unioned with a
-    recent public discovery pool (reach beyond the follow graph, and the
-    cold-start fallback for viewers with few/no follows or little history —
-    their affinity/follow-boost terms are simply zero, so ranking falls back
-    to engagement + freshness). Posts are scored from existing denormalized
-    engagement counters, follow status, per-creator affinity derived from
-    the unified interaction-signal log (likes/saves/shares/watch-time/
-    completion/rewatch/follows), and the viewer's own per-post history
-    (already-watched/completed/engaged posts are demoted, never excluded),
-    then lightly diversified by creator so one creator can't dominate a
-    page. See repositories/feed_ranking.py.
+    Candidate sources (bounded pools, unioned and deduped by post id):
+      1. Personal pool — the viewer's own + followed creators' recent posts.
+      2. Affinity pool — recent posts from creators the viewer has demonstrated
+         affinity for (real interaction history via the unified signal log)
+         but does not follow.
+      3. Interest pool — recent published posts whose tags overlap the viewer's
+         demonstrated interest topics (tags on posts they actively engaged
+         with), excluding their own/follow graph.
+      4. Discovery pool — recent public posts beyond the follow graph; the
+         controlled organic-discovery and cold-start source (no popularity,
+         follower-count, or verification requirement to enter).
+
+    Every candidate passes the shared ``_feed_item_is_visible`` safety check
+    (published, approved moderation, not blocked/muted, private-account and
+    per-post visibility). Scoring is the exact 100% weighted formula in
+    ``repositories/feed_ranking.py``: normalized watch quality, completion,
+    rewatch, share/save/like rates, capped creator affinity, and decaying
+    freshness — plus demotions (never exclusions) for the viewer's own
+    per-post history (seen/completed/engaged/rapid-skipped). The ranked list
+    is lightly diversified by creator so one creator can't dominate a page.
+    Cold start: with no follows/history, the affinity/interest/personal terms
+    are simply zero/empty and the feed falls back to engagement + freshness
+    over the discovery pool.
     """
     from datetime import timedelta, timezone
     from repositories.content_repository import PostRepository
@@ -2533,17 +2597,55 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
     from repositories import feed_ranking
 
     post_repo = PostRepository(ctx.db)
+    analytics_repo = AnalyticsRepository(ctx.db)
     own_and_followed_ids = list(followed_ids) + [user.id]
+    followed_creator_ids = set(followed_ids)
+    now = datetime.now(timezone.utc)
+    discovery_since = now - timedelta(days=feed_ranking.FOR_YOU_DISCOVERY_LOOKBACK_DAYS)
+
+    # One creator-affinity query feeds both the affinity candidate pool and
+    # the per-creator affinity scoring component (no per-post queries).
+    affinity_pairs = await analytics_repo.creator_affinity(user.id)
+    affinity = dict(affinity_pairs)
+    affinity_creator_ids = [
+        creator_id
+        for creator_id, _score in affinity_pairs
+        if creator_id not in followed_creator_ids and creator_id != user.id
+    ]
 
     personal_pool = await post_repo.get_feed(
         user_ids=own_and_followed_ids, limit=feed_ranking.FOR_YOU_PERSONAL_POOL_SIZE,
     )
+    affinity_pool = (
+        await post_repo.get_feed(
+            user_ids=affinity_creator_ids,
+            limit=feed_ranking.FOR_YOU_AFFINITY_POOL_SIZE,
+        )
+        if affinity_creator_ids
+        else []
+    )
+    interest_tags = await analytics_repo.user_interest_tags(user.id)
+    interest_pool = await post_repo.get_interest_pool(
+        interest_tags,
+        exclude_user_ids=own_and_followed_ids,
+        since=discovery_since,
+        limit=feed_ranking.FOR_YOU_INTEREST_POOL_SIZE,
+    )
     discovery_pool = await post_repo.get_discovery_pool(
         exclude_user_ids=own_and_followed_ids,
-        since=datetime.now(timezone.utc) - timedelta(days=feed_ranking.FOR_YOU_DISCOVERY_LOOKBACK_DAYS),
+        since=discovery_since,
         limit=feed_ranking.FOR_YOU_DISCOVERY_POOL_SIZE,
     )
-    candidates = list(personal_pool) + list(discovery_pool)
+
+    # Union the pools, deduped by post id (a post can surface in several
+    # pools); dict insertion order keeps higher-priority pools first.
+    candidates = list(
+        {
+            post.id: post
+            for pool in (personal_pool, affinity_pool, interest_pool, discovery_pool)
+            for post in pool
+        }.values()
+    )
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -2554,7 +2656,6 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
         profile.user_id: profile
         for profile in await profile_repo.get_multiple_by_user_ids(list(candidate_creator_ids))
     }
-    followed_creator_ids = set(followed_ids)
     following_ids = followed_creator_ids | {user.id}
 
     visible = [
@@ -2569,11 +2670,11 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
         )
     ]
 
-    affinity = dict(await AnalyticsRepository(ctx.db).creator_affinity(user.id))
-    viewer_history = await AnalyticsRepository(ctx.db).viewer_post_history(
-        user.id, [post.id for post in visible]
-    )
-    now = datetime.now(timezone.utc)
+    # One grouped query each for the viewer's own per-post history and the
+    # candidate pool's aggregate engagement rates — no N+1 in the rank loop.
+    visible_ids = [post.id for post in visible]
+    viewer_history = await analytics_repo.viewer_post_history(user.id, visible_ids)
+    engagement_rates = await analytics_repo.post_engagement_rates(visible_ids)
     scored = [
         (
             post,
@@ -2583,16 +2684,31 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
                 is_followed=post.user_id in followed_creator_ids,
                 creator_affinity=affinity.get(post.user_id, 0.0),
                 viewer_history=viewer_history.get(post.id),
+                engagement=feed_ranking.build_engagement(
+                    engagement_rates.get(post.id, {}), post
+                ),
             ),
         )
         for post in visible
     ]
     ranked = feed_ranking.diversify_by_creator(scored)
 
+    # ── Snapshot cursor pagination ────────────────────────────────────────────
+    # The cursor encodes the full ranked post-id order + the position of the
+    # last served post, so page 2+ replays page 1's exact ranking — no drift
+    # and no cross-page duplicates even if engagement changes mid-pagination.
+    # Backward-compatible: a legacy plain post-id cursor still works (we fall
+    # back to locating that post in the freshly computed ranking).
+    snapshot_ids: list | None = None
     start_index = 0
-    if before_id is not None:
+    if cursor is not None:
+        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
+        if snapshot_ids:
+            # Replay the snapshot: keep only posts still present/visible now.
+            ranked_by_id = {post.id: post for post in ranked}
+            ranked = [ranked_by_id[pid] for pid in snapshot_ids if pid in ranked_by_id]
         for i, post in enumerate(ranked):
-            if post.id == before_id:
+            if post.id == last_id:
                 start_index = i + 1
                 break
 
@@ -2602,7 +2718,11 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
         page = page[:limit]
 
     items = [await _post_to_feed_item(ctx, p) for p in page]
-    next_cursor = str(page[-1].id) if has_more and page else None
+    next_cursor = (
+        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        if has_more and page
+        else None
+    )
 
     from services.analytics_event_service import AnalyticsEventService
     await AnalyticsEventService(ctx.db).track_impressions_bulk(
@@ -2696,7 +2816,8 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
 async def _collaboration_marketplace(ctx, tags, content_type, first, after) -> CollaborationConnection:
     """Resolve collaborationMarketplace query."""
     from uuid import UUID as UUID_type
-    
+    from repositories.collaboration_repository import CollaborationRepository
+
     repo = CollaborationRepository(ctx.db)
     
     # Cursor contains the ordered timestamp and UUID tie-breaker.
@@ -2747,7 +2868,8 @@ async def _collaboration(ctx, id) -> Optional[CollaborationType]:
         raise ValueError("Authentication required")
     
     from uuid import UUID as UUID_type
-    
+    from repositories.collaboration_repository import CollaborationRepository
+
     try:
         collab_id = UUID_type(id)
     except ValueError:
@@ -4034,7 +4156,10 @@ async def _delete_comment(ctx, id) -> bool:
 async def _create_collaboration(ctx, input) -> CollaborationType:
     """Create a new collaboration proposal."""
     from repositories.collaboration_repository import CollaborationRepository
-    from app.models.collaboration import Collaboration, CollaborationStatus
+    from app.models.collaboration import (
+        Collaboration, CollaborationParticipant, CollaborationStatus,
+    )
+    from datetime import datetime, timezone
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
@@ -4093,6 +4218,7 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
     """Accept a collaboration invitation."""
     from repositories.collaboration_repository import CollaborationRepository
     from app.models.collaboration import CollaborationStatus
+    from datetime import datetime, timezone
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
@@ -4150,6 +4276,7 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
     """Update an existing collaboration."""
     from repositories.collaboration_repository import CollaborationRepository
     from uuid import UUID as UUID_type
+    from datetime import datetime, timezone
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
@@ -5579,6 +5706,49 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
         completed=watch.completed,
         rewatched=watch.rewatched,
     )
+
+
+async def _not_interested(ctx, post_id) -> NotInterestedResultType:
+    """Explicit "Not Interested" feedback on a post.
+
+    Records a real production signal (SignalType.NOT_INTERESTED) into the
+    unified interaction-signal log. The recommendation system reads it via
+    ``AnalyticsRepository.viewer_post_history`` to strongly demote this post
+    (demote, never hard-exclude) and — because the signal is creator-scoped —
+    to soften future recommendations from the same creator for this viewer.
+    Idempotent per (user, post): a repeat tap does not stack signals.
+    """
+    from repositories.content_repository import PostRepository
+    from repositories.analytics_repository import AnalyticsRepository
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
+
+    user = ctx.require_auth()
+    post_repo = PostRepository(ctx.db)
+
+    post = await post_repo.get_by_id(post_id)
+    if not post:
+        raise ValueError("Post not found")
+
+    analytics = AnalyticsRepository(ctx.db)
+    history = await analytics.viewer_post_history(user.id, [post_id])
+    already_flagged = bool(history.get(post_id) and history[post_id].not_interested)
+    if not already_flagged:
+        await analytics.record(
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=post_id,
+            signal_type=SignalType.NOT_INTERESTED,
+        )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.NOT_INTERESTED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+        )
+        await ctx.db.commit()
+
+    return NotInterestedResultType(not_interested=True, post_id=post_id)
 
 
 async def _add_comment(ctx, post_id, text) -> CommentGQLType:

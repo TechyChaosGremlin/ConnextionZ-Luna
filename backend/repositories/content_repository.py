@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import and_, case, desc, func, or_, select, String, cast
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.content import Post, Comment, Media, ContentType, ContentStatus
@@ -127,6 +128,40 @@ class PostRepository(BaseRepository[Post]):
         stmt = select(Post).where(
             Post.status == ContentStatus.PUBLISHED,
             Post.deleted_at.is_(None),
+        )
+        if exclude_user_ids:
+            stmt = stmt.where(~Post.user_id.in_(exclude_user_ids))
+        if since is not None:
+            stmt = stmt.where(Post.created_at >= since)
+        stmt = stmt.order_by(Post.created_at.desc()).limit(limit)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_interest_pool(
+        self,
+        interest_tags: list[str],
+        exclude_user_ids: Optional[list[uuid.UUID]] = None,
+        since: Optional[datetime] = None,
+        limit: int = 60,
+    ) -> list[Post]:
+        """Posts matching the viewer's demonstrated interest tags ("For You").
+
+        Supplements the follow/affinity pools with content the viewer has shown
+        interest in (by topic) but may not follow. Only content-status/
+        soft-delete filtering + tag overlap happens here; visibility,
+        moderation, and block/mute safety filtering happen downstream via the
+        same checks used for the rest of the feed.
+
+        ``Post.tags`` is a JSONB array of strings, so overlap uses Postgres'
+        jsonb ``?|`` operator (true when any of the given strings exists as an
+        array element) — semantically exact element matching, GIN-indexable.
+        """
+        if not interest_tags:
+            return []
+        stmt = select(Post).where(
+            Post.status == ContentStatus.PUBLISHED,
+            Post.deleted_at.is_(None),
+            Post.tags.op("?|")(cast(interest_tags, ARRAY(String))),
         )
         if exclude_user_ids:
             stmt = stmt.where(~Post.user_id.in_(exclude_user_ids))

@@ -240,6 +240,7 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
         net_likes: dict[uuid.UUID, int] = {}
         net_saves: dict[uuid.UUID, int] = {}
         shared: set[uuid.UUID] = set()
+        not_interested: set[uuid.UUID] = set()
         for post_id, signal_type, cnt, max_value in result.all():
             if signal_type == SignalType.WATCH_DURATION:
                 watched[post_id] = max(watched.get(post_id, 0.0), float(max_value or 0.0))
@@ -255,9 +256,11 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                 net_saves[post_id] = net_saves.get(post_id, 0) - cnt
             elif signal_type == SignalType.SHARE:
                 shared.add(post_id)
+            elif signal_type == SignalType.NOT_INTERESTED:
+                not_interested.add(post_id)
 
         post_ids_with_signals = (
-            set(watched) | completed | set(net_likes) | set(net_saves) | shared
+            set(watched) | completed | set(net_likes) | set(net_saves) | shared | not_interested
         )
         return {
             post_id: ViewerPostSignals(
@@ -268,6 +271,87 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                     or net_saves.get(post_id, 0) > 0
                     or post_id in shared
                 ),
+                not_interested=post_id in not_interested,
             )
             for post_id in post_ids_with_signals
         }
+
+    async def post_engagement_rates(
+        self, post_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, float]]:
+        """Aggregate production watch/completion/rewatch counts per post.
+
+        One grouped query over the unified ``InteractionSignal`` log for the
+        candidate pool — feeds ``feed_ranking.build_engagement`` which turns
+        these raw counts into bounded, normalized rates. Posts with no signals
+        (fresh content) are simply absent from the returned dict, so scoring
+        treats them as having zero watch history rather than fabricating any.
+        """
+        if not post_ids:
+            return {}
+
+        stmt = (
+            select(
+                InteractionSignal.post_id,
+                InteractionSignal.signal_type,
+                func.count().label("cnt"),
+                func.sum(InteractionSignal.value).label("total"),
+            )
+            .where(InteractionSignal.post_id.in_(post_ids))
+            .group_by(InteractionSignal.post_id, InteractionSignal.signal_type)
+        )
+        result = await self.db.execute(stmt)
+
+        out: dict[uuid.UUID, dict[str, float]] = {}
+        for post_id, signal_type, cnt, total in result.all():
+            bucket = out.setdefault(
+                post_id, {"views": 0.0, "watch_seconds": 0.0, "completions": 0.0, "rewatches": 0.0}
+            )
+            if signal_type == SignalType.VIEW:
+                bucket["views"] += float(cnt)
+            elif signal_type == SignalType.WATCH_DURATION:
+                bucket["watch_seconds"] += float(total or 0.0)
+            elif signal_type == SignalType.COMPLETION:
+                bucket["completions"] += float(cnt)
+            elif signal_type == SignalType.REWATCH:
+                bucket["rewatches"] += float(cnt)
+        return out
+
+    async def user_interest_tags(self, user_id: uuid.UUID, limit: int = 20) -> list[str]:
+        """The viewer's demonstrated interest topics.
+
+        Counts tags on posts the viewer actively engaged with (liked, saved,
+        shared, completed, or rewatched) via the production signal log. Used to
+        source the interest-matching candidate pool. Bounded query (at most 200
+        engaged posts inspected) and a bounded returned vocabulary.
+        """
+        from collections import Counter
+
+        from app.models.content import Post
+
+        active = [
+            SignalType.LIKE,
+            SignalType.SAVE,
+            SignalType.SHARE,
+            SignalType.COMPLETION,
+            SignalType.REWATCH,
+        ]
+        stmt = (
+            select(Post.tags)
+            .join(InteractionSignal, InteractionSignal.post_id == Post.id)
+            .where(
+                InteractionSignal.user_id == user_id,
+                InteractionSignal.post_id.is_not(None),
+                InteractionSignal.signal_type.in_(active),
+                Post.tags.is_not(None),
+            )
+            .limit(200)
+        )
+        result = await self.db.execute(stmt)
+
+        counts: Counter = Counter()
+        for (tags,) in result.all():
+            for tag in tags or []:
+                if isinstance(tag, str) and tag:
+                    counts[tag] += 1
+        return [tag for tag, _ in counts.most_common(limit)]

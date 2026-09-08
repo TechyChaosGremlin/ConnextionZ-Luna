@@ -69,6 +69,8 @@ def make_post(
     comment_count: int = 0,
     share_count: int = 0,
     save_count: int = 0,
+    duration_sec: float = 0.0,
+    tags: list | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=post_id,
@@ -80,11 +82,12 @@ def make_post(
         like_count=like_count,
         collab_with=None,
         hashtags=[],
+        tags=tags,
         audio="Original Sound",
         visibility="public",
         allow_comments=True,
         allow_collabs=True,
-        duration_sec=0.0,
+        duration_sec=duration_sec,
         comment_count=comment_count,
         share_count=share_count,
         save_count=save_count,
@@ -250,6 +253,31 @@ def stub_shared_dependencies(monkeypatch):
         "repositories.content_repository.PostRepository.get_discovery_pool", fake_get_discovery_pool
     )
 
+    async def fake_post_engagement_rates(self, post_ids):
+        return {}
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.post_engagement_rates",
+        fake_post_engagement_rates,
+    )
+
+    async def fake_user_interest_tags(self, user_id, limit=20):
+        return []
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.user_interest_tags",
+        fake_user_interest_tags,
+    )
+
+    async def fake_get_interest_pool(
+        self, interest_tags, exclude_user_ids=None, since=None, limit=60
+    ):
+        return []
+
+    monkeypatch.setattr(
+        "repositories.content_repository.PostRepository.get_interest_pool", fake_get_interest_pool
+    )
+
 
 def stub_feed_posts(monkeypatch, posts: list[SimpleNamespace]):
     """Patch PostRepository.get_feed to emulate DB filtering/ordering/pagination over `posts`."""
@@ -305,6 +333,51 @@ def stub_viewer_history(monkeypatch, history: dict):
     monkeypatch.setattr(
         "repositories.analytics_repository.AnalyticsRepository.viewer_post_history",
         fake_viewer_post_history,
+    )
+
+
+def stub_user_interest_tags(monkeypatch, tags: list[str]):
+    """Patch AnalyticsRepository.user_interest_tags to return demonstrated interest topics."""
+
+    async def fake_user_interest_tags(self, user_id, limit=20):
+        return list(tags)
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.user_interest_tags",
+        fake_user_interest_tags,
+    )
+
+
+def stub_interest_pool(monkeypatch, posts: list[SimpleNamespace]):
+    """Patch PostRepository.get_interest_pool to emulate tag-overlap filtering over `posts`."""
+
+    async def fake_get_interest_pool(
+        self, interest_tags, exclude_user_ids=None, since=None, limit=60
+    ):
+        if not interest_tags:
+            return []
+        excluded = set(exclude_user_ids or [])
+        wanted = set(interest_tags)
+        return [
+            p
+            for p in posts
+            if p.user_id not in excluded and wanted & set(p.tags or [])
+        ][:limit]
+
+    monkeypatch.setattr(
+        "repositories.content_repository.PostRepository.get_interest_pool", fake_get_interest_pool
+    )
+
+
+def stub_post_engagement_rates(monkeypatch, rates: dict):
+    """Patch AnalyticsRepository.post_engagement_rates to return raw aggregate counts per post."""
+
+    async def fake_post_engagement_rates(self, post_ids):
+        return {pid: r for pid, r in rates.items() if pid in set(post_ids)}
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.post_engagement_rates",
+        fake_post_engagement_rates,
     )
 
 
@@ -813,3 +886,330 @@ async def test_for_you_pagination_is_stable_across_pages(monkeypatch, follow_gra
     assert set(first_ids).isdisjoint(second_ids)
     # Ranked strictly by view_count desc here, so ids should appear in that order.
     assert first_ids + second_ids == post_ids[:4]
+
+
+@pytest.mark.asyncio
+async def test_for_you_pagination_snapshot_cursor_survives_mid_pagination_drift(
+    monkeypatch, follow_graph
+):
+    """The snapshot cursor replays page 1's exact ranked order, so mid-pagination
+    engagement changes neither duplicate nor reorder already-seen posts."""
+    viewer = make_user("viewer")
+    creator_a = make_user("creator_a")
+    creator_b = make_user("creator_b")
+    now = datetime.now(timezone.utc)
+    a1_id, a2_id, b1_id, b2_id = _ordered_post_ids(4)
+    # Page 1 ranking (by view count desc): a1, b1, a2, b2. No creator hits the
+    # 2-consecutive streak cap, so diversify keeps pure score order.
+    live_posts = {
+        a1_id: make_post(creator_a.id, a1_id, created_at=now, view_count=400),
+        b1_id: make_post(creator_b.id, b1_id, created_at=now, view_count=300),
+        a2_id: make_post(creator_a.id, a2_id, created_at=now, view_count=200),
+        b2_id: make_post(creator_b.id, b2_id, created_at=now, view_count=100),
+    }
+    stub_feed_posts(monkeypatch, [])
+    stub_hidden_creators(monkeypatch)
+
+    def restub_pool(posts_by_id):
+        stub_discovery_pool(monkeypatch, list(posts_by_id.values()))
+
+    restub_pool(live_posts)
+
+    first_page = await _feed(make_ctx(viewer), cursor=None, limit=2, following=False)
+    first_ids = [item.id for item in first_page.items]
+    assert len(first_ids) == 2
+    # Snapshot cursor embeds the full ranked order, not just the last id.
+    assert first_page.next_cursor.startswith("fy1.")
+
+    # Drift: b2's engagement jumps so it would now outrank the remaining posts,
+    # and a brand-new top post enters the pool. Page 2 must continue the page-1
+    # snapshot order — not re-rank b2 or inject the new post mid-feed.
+    remaining_after_page1 = [pid for pid in (a1_id, b1_id, a2_id, b2_id) if pid not in first_ids]
+    live_posts[b2_id].view_count = 999  # would now outrank a2 if re-ranked
+    new_id = _ordered_post_ids(1)[0]
+    live_posts[new_id] = make_post(creator_b.id, new_id, created_at=now, view_count=100000)
+    restub_pool(live_posts)
+
+    second_page = await _feed(
+        make_ctx(viewer), cursor=first_page.next_cursor, limit=2, following=False
+    )
+    second_ids = [item.id for item in second_page.items]
+
+    # Page 2 replays the snapshot's remaining posts in page-1 order, ignoring
+    # the mid-pagination engagement change and the brand-new top post.
+    assert second_ids == remaining_after_page1
+    assert set(first_ids).isdisjoint(second_ids)
+
+
+@pytest.mark.asyncio
+async def test_for_you_pagination_accepts_legacy_plain_post_id_cursor(
+    monkeypatch, follow_graph
+):
+    """Backward compatibility: a plain post-id cursor (pre-snapshot clients)
+    still resumes by locating that post in the freshly computed ranking."""
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    now = datetime.now(timezone.utc)
+    post_ids = _ordered_post_ids(3)
+    posts = [
+        make_post(creator.id, pid, created_at=now, view_count=(3 - i) * 100)
+        for i, pid in enumerate(post_ids)
+    ]
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, posts)
+    stub_hidden_creators(monkeypatch)
+
+    page = await _feed(
+        make_ctx(viewer), cursor=str(post_ids[0]), limit=2, following=False
+    )
+
+    assert [item.id for item in page.items] == post_ids[1:]
+    assert page.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_for_you_pagination_rejects_malformed_cursor(monkeypatch, follow_graph):
+    """A malformed cursor raises the same ValueError the Following feed raises."""
+    viewer = make_user("viewer")
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, [])
+    stub_hidden_creators(monkeypatch)
+
+    with pytest.raises(ValueError):
+        await _feed(make_ctx(viewer), cursor="not-a-uuid", limit=2, following=False)
+
+
+@pytest.mark.asyncio
+async def test_for_you_affinity_pool_includes_unfollowed_affinity_creator(
+    monkeypatch, follow_graph
+):
+    """A creator the viewer has demonstrated affinity for (per the unified
+    signal log) but does NOT follow should still enter the candidate pool via
+    the affinity pool."""
+    viewer = make_user("viewer")
+    affine_creator = make_user("affine")
+    now = datetime.now(timezone.utc)
+    affine_post_id = _ordered_post_ids(1)[0]
+    # get_feed is shared by the personal and affinity pools; the fake returns
+    # this post only when the affinity creator's id is queried.
+    stub_feed_posts(monkeypatch, [make_post(affine_creator.id, affine_post_id, created_at=now)])
+    stub_hidden_creators(monkeypatch)
+    stub_creator_affinity(monkeypatch, {affine_creator.id: 42.0})
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert affine_post_id in {item.id for item in page.items}
+
+
+@pytest.mark.asyncio
+async def test_for_you_interest_pool_includes_tag_matching_posts(monkeypatch, follow_graph):
+    """A stranger's post whose tags overlap the viewer's demonstrated interest
+    topics enters the candidate pool via the interest pool."""
+    viewer = make_user("viewer")
+    stranger = make_user("stranger")
+    other = make_user("other")
+    now = datetime.now(timezone.utc)
+    music_post_id, other_post_id = _ordered_post_ids(2)
+    stub_feed_posts(monkeypatch, [])
+    stub_interest_pool(
+        monkeypatch,
+        [
+            make_post(stranger.id, music_post_id, created_at=now, tags=["music"]),
+            make_post(other.id, other_post_id, created_at=now, tags=["sports"]),
+        ],
+    )
+    stub_user_interest_tags(monkeypatch, ["music"])
+    stub_hidden_creators(monkeypatch)
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert [item.id for item in page.items] == [music_post_id]
+
+
+@pytest.mark.asyncio
+async def test_for_you_dedupes_posts_appearing_in_multiple_pools(monkeypatch, follow_graph):
+    """A post surfaced by several candidate pools must appear exactly once."""
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    now = datetime.now(timezone.utc)
+    post_id = _ordered_post_ids(1)[0]
+    post = make_post(creator.id, post_id, created_at=now, tags=["music"])
+    stub_feed_posts(monkeypatch, [])
+    stub_interest_pool(monkeypatch, [post])
+    stub_user_interest_tags(monkeypatch, ["music"])
+    stub_discovery_pool(monkeypatch, [post])  # same post in both pools
+    stub_hidden_creators(monkeypatch)
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert [item.id for item in page.items] == [post_id]
+
+
+@pytest.mark.asyncio
+async def test_for_you_watch_quality_outranks_raw_popularity(monkeypatch, follow_graph):
+    """Normalized watch quality/completion/rewatch (65% of the score) must let
+    a genuinely well-watched small post outrank a raw-popularity post with no
+    watch history — popularity alone must not dominate ranking."""
+    viewer = make_user("viewer")
+    niche_creator = make_user("niche")
+    viral_creator = make_user("viral")
+    now = datetime.now(timezone.utc)
+    niche_id, viral_id = _ordered_post_ids(2)
+    niche_post = make_post(
+        niche_creator.id, niche_id, created_at=now, view_count=50, like_count=2,
+        duration_sec=60.0,
+    )
+    viral_post = make_post(
+        viral_creator.id, viral_id, created_at=now, view_count=100000,
+        like_count=50000, share_count=5000, save_count=5000, duration_sec=60.0,
+    )
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, [viral_post, niche_post])
+    stub_hidden_creators(monkeypatch)
+    # Real production signal aggregates: the niche post is watched ~90% through
+    # with strong completion; the viral post has no watch signals at all.
+    stub_post_engagement_rates(
+        monkeypatch,
+        {niche_id: {"views": 50.0, "watch_seconds": 2700.0, "completions": 40.0, "rewatches": 10.0}},
+    )
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert [item.id for item in page.items][0] == niche_id
+
+
+@pytest.mark.asyncio
+async def test_for_you_rapid_skip_demotes_below_partial_watch(monkeypatch, follow_graph):
+    """A rapid skip (very short watch relative to duration — a real production
+    WATCH_DURATION signal with no completion) demotes that post more than a
+    genuine partial watch; neither is hard-excluded."""
+    from repositories.feed_ranking import ViewerPostSignals
+
+    viewer = make_user("viewer")
+    creators = [make_user(f"creator_{c}") for c in "abc"]
+    now = datetime.now(timezone.utc)
+    skipped_id, seen_id, unseen_id = _ordered_post_ids(3)
+    posts = [
+        make_post(creators[0].id, skipped_id, created_at=now, duration_sec=40.0),
+        make_post(creators[1].id, seen_id, created_at=now, duration_sec=40.0),
+        make_post(creators[2].id, unseen_id, created_at=now, duration_sec=40.0),
+    ]
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, posts)
+    stub_hidden_creators(monkeypatch)
+    stub_viewer_history(
+        monkeypatch,
+        {
+            skipped_id: ViewerPostSignals(watched_seconds=5.0),   # 12.5% < 25% threshold
+            seen_id: ViewerPostSignals(watched_seconds=20.0),     # 50% — genuine partial watch
+        },
+    )
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert [item.id for item in page.items] == [unseen_id, seen_id, skipped_id]
+
+
+@pytest.mark.asyncio
+async def test_not_interested_mutation_records_signal_and_is_idempotent(monkeypatch, follow_graph):
+    """The not_interested mutation records a real NOT_INTERESTED signal once
+    per (user, post) — repeat taps don't stack — and returns the flagged state."""
+    from api.graphql import _not_interested
+
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    post_id = _ordered_post_ids(1)[0]
+    stub_feed_posts(monkeypatch, [make_post(creator.id, post_id)])
+
+    async def fake_get_by_id(self, entity_id, include_deleted=False):
+        return make_post(creator.id, post_id)
+
+    monkeypatch.setattr(
+        "repositories.content_repository.PostRepository.get_by_id", fake_get_by_id
+    )
+
+    recorded: list[dict] = []
+
+    async def fake_record(self, **kwargs):
+        recorded.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.record", fake_record
+    )
+
+    # viewer_post_history must reflect the NOT_INTERESTED signal after recording.
+    flagged: set = set()
+
+    async def fake_history(self, user_id, post_ids):
+        from repositories.feed_ranking import ViewerPostSignals
+
+        return {
+            pid: ViewerPostSignals(not_interested=True)
+            for pid in post_ids
+            if pid in flagged
+        }
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.viewer_post_history", fake_history
+    )
+
+    # Track the signal into our in-memory set when recorded.
+    from app.models.analytics import SignalType
+
+    async def record_and_flag(self, **kwargs):
+        recorded.append(kwargs)
+        if kwargs.get("signal_type") == SignalType.NOT_INTERESTED:
+            flagged.add(kwargs["post_id"])
+        return None
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.record", record_and_flag
+    )
+
+    ctx = make_ctx(viewer)
+    first = await _not_interested(ctx, post_id)
+    assert first.not_interested is True
+    assert str(first.post_id) == str(post_id)
+    ni_signals = [r for r in recorded if r.get("signal_type") == SignalType.NOT_INTERESTED]
+    assert len(ni_signals) == 1
+    assert ni_signals[0]["user_id"] == viewer.id
+    assert ni_signals[0]["creator_id"] == creator.id
+
+    # Repeat tap: no additional signal recorded (idempotent).
+    second = await _not_interested(ctx, post_id)
+    assert second.not_interested is True
+    assert len([r for r in recorded if r.get("signal_type") == SignalType.NOT_INTERESTED]) == 1
+
+
+@pytest.mark.asyncio
+async def test_for_you_not_interested_post_demoted_below_consumed_posts(
+    monkeypatch, follow_graph
+):
+    """A post the viewer marked 'Not Interested' ranks below even a completed
+    post; it is demoted, never hard-excluded."""
+    from repositories.feed_ranking import ViewerPostSignals
+
+    viewer = make_user("viewer")
+    creators = [make_user(f"creator_{c}") for c in "abc"]
+    now = datetime.now(timezone.utc)
+    flagged_id, completed_id, unseen_id = _ordered_post_ids(3)
+    posts = [
+        make_post(creators[0].id, flagged_id, created_at=now),
+        make_post(creators[1].id, completed_id, created_at=now, duration_sec=30.0),
+        make_post(creators[2].id, unseen_id, created_at=now),
+    ]
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, posts)
+    stub_hidden_creators(monkeypatch)
+    stub_viewer_history(
+        monkeypatch,
+        {
+            flagged_id: ViewerPostSignals(not_interested=True),
+            completed_id: ViewerPostSignals(watched_seconds=30.0, completed=True),
+        },
+    )
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert [item.id for item in page.items] == [unseen_id, completed_id, flagged_id]

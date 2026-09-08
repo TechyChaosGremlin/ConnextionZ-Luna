@@ -126,7 +126,7 @@ class TestAnalyticsEventModel:
 
     def test_all_event_types_have_unique_string_values(self):
         values = [e.value for e in EventType]
-        assert len(values) == len(set(values)) == 19
+        assert len(values) == len(set(values)) == 20
 
 
 # ── Service: validation, nullability, metadata, failure isolation ───────

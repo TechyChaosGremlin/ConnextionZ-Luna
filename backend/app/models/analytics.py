@@ -37,6 +37,9 @@ class SignalType(str, enum.Enum):
     SHARE = "share"
     FOLLOW = "follow"
     UNFOLLOW = "unfollow"
+    # Explicit negative feedback: the viewer chose "Not Interested" on a post.
+    # Real production signal emitted by the not_interested mutation.
+    NOT_INTERESTED = "not_interested"
 
 
 class InteractionSignal(Base, TimestampMixin):
@@ -66,7 +69,12 @@ class InteractionSignal(Base, TimestampMixin):
     creator_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    signal_type: Mapped[SignalType] = mapped_column(Enum(SignalType, name="signal_type"), nullable=False)
+    signal_type: Mapped[SignalType] = mapped_column(
+        # values_callable persists the enum values ("view", ...) rather than
+        # member names ("VIEW", ...), matching migration 004's DB enum labels.
+        Enum(SignalType, name="signal_type", values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+    )
     value: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
 
 
@@ -107,6 +115,7 @@ class EventType(str, enum.Enum):
     SEARCH_PERFORMED = "search_performed"
     COLLAB_CREATED = "collab_created"
     NOTIFICATION_OPENED = "notification_opened"
+    NOT_INTERESTED = "not_interested"
 
 
 class AnalyticsEvent(Base, TimestampMixin):
@@ -128,7 +137,10 @@ class AnalyticsEvent(Base, TimestampMixin):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     event_type: Mapped[EventType] = mapped_column(
-        Enum(EventType, name="analytics_event_type"), nullable=False, index=True
+        # Persist lowercase enum values, matching migration 008's DB labels.
+        Enum(EventType, name="analytics_event_type", values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+        index=True,
     )
     post_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("posts.id", ondelete="SET NULL"), nullable=True, index=True
