@@ -97,7 +97,9 @@ def _uuid(value):
     return uuid.UUID(str(value))
 
 
-def patch_collab_repo(monkeypatch, *, collab=None, milestone=None, participant_user_id=None):
+def patch_collab_repo(
+    monkeypatch, *, collab=None, milestone=None, participant_user_id=None, participant_accepted=True
+):
     """Patch collaboration repository accessors with deterministic doubles."""
     repo_path = "repositories.collaboration_repository.CollaborationRepository"
 
@@ -108,7 +110,7 @@ def patch_collab_repo(monkeypatch, *, collab=None, milestone=None, participant_u
 
     async def fake_get_participant(self, collab_id, user_id):
         if participant_user_id is not None and user_id == participant_user_id:
-            return SimpleNamespace(id=uuid.uuid4(), user_id=user_id)
+            return SimpleNamespace(id=uuid.uuid4(), user_id=user_id, accepted=participant_accepted)
         return None
 
     async def fake_get_milestone_by_id(self, milestone_id):
@@ -159,6 +161,19 @@ async def test_detail_allows_participant(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_detail_allows_pending_invitee_while_proposed(monkeypatch):
+    """An invited recipient who hasn't responded yet can still view the invite."""
+    owner = make_user(username="owner")
+    invitee = make_user(username="invitee")
+    collab = make_collab(owner.id, status=CollaborationStatus.PROPOSED)
+    patch_collab_repo(monkeypatch, collab=collab, participant_user_id=invitee.id, participant_accepted=False)
+
+    result = await _collaboration(make_ctx(invitee), str(collab.id))
+
+    assert result is not None
+
+
+@pytest.mark.asyncio
 async def test_detail_denies_unrelated_user(monkeypatch):
     owner = make_user(username="owner")
     outsider = make_user(username="outsider")
@@ -204,6 +219,20 @@ async def test_update_denies_participant(monkeypatch):
     with pytest.raises(PermissionError, match="initiator"):
         await _update_collaboration(
             make_ctx(participant), str(collab.id), SimpleNamespace(title="Hijack")
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_denies_unrelated_user_guessing_id(monkeypatch):
+    """Merely knowing a valid collaboration ID must not grant update access."""
+    owner = make_user(username="owner")
+    outsider = make_user(username="outsider")
+    collab = make_collab(owner.id)
+    patch_collab_repo(monkeypatch, collab=collab)  # outsider has no participant row
+
+    with pytest.raises(PermissionError, match="initiator"):
+        await _update_collaboration(
+            make_ctx(outsider), str(collab.id), SimpleNamespace(title="Hijack")
         )
 
 
@@ -268,6 +297,20 @@ async def test_add_milestone_denies_unrelated_user(monkeypatch):
 
     with pytest.raises(PermissionError, match="Not a participant"):
         await _add_milestone(make_ctx(outsider), _milestone_input(collab.id))
+
+
+@pytest.mark.asyncio
+async def test_add_milestone_denies_pending_invitee(monkeypatch):
+    """An invited recipient who hasn't accepted yet has no collaborator access."""
+    owner = make_user(username="owner")
+    invitee = make_user(username="invitee")
+    collab = make_collab(owner.id)
+    patch_collab_repo(
+        monkeypatch, collab=collab, participant_user_id=invitee.id, participant_accepted=False
+    )
+
+    with pytest.raises(PermissionError, match="Not a participant"):
+        await _add_milestone(make_ctx(invitee), _milestone_input(collab.id))
 # ── Update milestone (_update_milestone) ──────────────────────────────────────
 
 
@@ -324,3 +367,21 @@ async def test_update_milestone_requires_auth(monkeypatch):
 
     with pytest.raises(PermissionError):
         await _update_milestone(make_ctx(None), str(milestone.id), _milestone_update_input())
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_denies_pending_invitee(monkeypatch):
+    owner = make_user(username="owner")
+    invitee = make_user(username="invitee")
+    collab = make_collab(owner.id)
+    milestone = make_milestone(collab.id)
+    patch_collab_repo(
+        monkeypatch,
+        collab=collab,
+        milestone=milestone,
+        participant_user_id=invitee.id,
+        participant_accepted=False,
+    )
+
+    with pytest.raises(PermissionError, match="Not a participant"):
+        await _update_milestone(make_ctx(invitee), str(milestone.id), _milestone_update_input())

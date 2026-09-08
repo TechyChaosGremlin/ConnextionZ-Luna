@@ -11,8 +11,10 @@ required.
 Covers:
 - Accepting an invitation marks the participant accepted and the collaboration accepted
 - Declining an invitation removes the participant and marks the collaboration declined
+- The sender (initiator) cannot accept or decline their own request
 - A user who is not a participant cannot accept or decline
-- Invalid state transitions are rejected (already accepted / not pending)
+- Invalid state transitions are rejected (already accepted / already declined / not pending)
+- A second Accept call cannot create a duplicate collaboration/participant record
 """
 
 from __future__ import annotations
@@ -49,24 +51,28 @@ def make_ctx(user: User | None) -> AppContext:
     return AppContext(db=AsyncMock(), current_user=user, session_id="sess-test")
 
 
-def make_participant(user_id, *, accepted=False, accepted_at=None) -> SimpleNamespace:
+def make_participant(user_id, *, accepted=False, accepted_at=None, role="participant") -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid.uuid4(),
         collaboration_id=uuid.uuid4(),
         user_id=user_id,
-        role="participant",
+        role=role,
         accepted=accepted,
         accepted_at=accepted_at,
     )
 
 
-def make_collab(status=CollaborationStatus.PROPOSED) -> SimpleNamespace:
-    return SimpleNamespace(id=uuid.uuid4(), status=status)
+def make_collab(initiator_id=None, status=CollaborationStatus.PROPOSED) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        initiator_id=initiator_id if initiator_id is not None else uuid.uuid4(),
+        status=status,
+    )
 
 
 def patch_repo(monkeypatch, participant, collab):
     """Patch the collaboration repository with deterministic doubles."""
-    state = {"collab": collab, "removed": False}
+    state = {"collab": collab, "removed": False, "add_participant_calls": 0}
 
     async def fake_get_participant(self, collab_id, user_id):
         if participant is None:
@@ -85,12 +91,22 @@ def patch_repo(monkeypatch, participant, collab):
     async def fake_remove_participant(self, p):
         state["removed"] = True
 
+    async def fake_add_participant(self, p):
+        # Accept/decline must never create new participant rows; only
+        # `_create_collaboration` should call this.
+        state["add_participant_calls"] += 1
+        return p
+
     monkeypatch.setattr(
         "repositories.collaboration_repository.CollaborationRepository.get_participant",
         fake_get_participant,
     )
     monkeypatch.setattr(
         "repositories.collaboration_repository.CollaborationRepository.get_by_id",
+        fake_get_by_id,
+    )
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_by_id_for_update",
         fake_get_by_id,
     )
     monkeypatch.setattr(
@@ -105,7 +121,13 @@ def patch_repo(monkeypatch, participant, collab):
         "repositories.collaboration_repository.CollaborationRepository.remove_participant",
         fake_remove_participant,
     )
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.add_participant",
+        fake_add_participant,
+    )
     return state
+
+
 # ── Accept ───────────────────────────────────────────────────────────────────
 
 
@@ -125,6 +147,9 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     assert participant.accepted_at is not None
     assert collab.status == CollaborationStatus.ACCEPTED
     assert state["removed"] is False
+    # Accepting activates the existing participant row; it never inserts a
+    # brand-new collaboration/participant record.
+    assert state["add_participant_calls"] == 0
 
 
 # ── Decline ──────────────────────────────────────────────────────────────────
@@ -144,7 +169,41 @@ async def test_decline_collaboration_removes_participant_and_marks_declined(monk
     assert state["removed"] is True
     assert collab.status == CollaborationStatus.DECLINED
     assert participant.accepted is False
-# ── Unauthorized user ────────────────────────────────────────────────────────
+
+
+# ── Sender cannot act on their own request ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration_rejects_sender(monkeypatch):
+    sender = make_user(username="sender")
+    # The initiator's own participant row (created at proposal time).
+    sender_participant = make_participant(sender.id, accepted=True, role="initiator")
+    collab = make_collab(initiator_id=sender.id)
+    patch_repo(monkeypatch, sender_participant, collab)
+    ctx = make_ctx(sender)
+
+    with pytest.raises(PermissionError, match="sender"):
+        await _accept_collaboration(ctx, collab.id)
+
+    assert collab.status == CollaborationStatus.PROPOSED
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration_rejects_sender(monkeypatch):
+    sender = make_user(username="sender")
+    sender_participant = make_participant(sender.id, accepted=True, role="initiator")
+    collab = make_collab(initiator_id=sender.id)
+    patch_repo(monkeypatch, sender_participant, collab)
+    ctx = make_ctx(sender)
+
+    with pytest.raises(PermissionError, match="sender"):
+        await _decline_collaboration(ctx, collab.id)
+
+    assert collab.status == CollaborationStatus.PROPOSED
+
+
+# ── Unauthorized / unrelated user ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -156,7 +215,7 @@ async def test_accept_collaboration_rejects_non_participant(monkeypatch):
     patch_repo(monkeypatch, other_participant, collab)
     ctx = make_ctx(user)
 
-    with pytest.raises(ValueError, match="not a participant"):
+    with pytest.raises(PermissionError, match="not a participant"):
         await _accept_collaboration(ctx, collab.id)
 
 
@@ -167,7 +226,7 @@ async def test_decline_collaboration_rejects_non_participant(monkeypatch):
     patch_repo(monkeypatch, None, collab)  # no participant row for this user
     ctx = make_ctx(user)
 
-    with pytest.raises(ValueError, match="not a participant"):
+    with pytest.raises(PermissionError, match="not a participant"):
         await _decline_collaboration(ctx, collab.id)
 
 
@@ -177,6 +236,25 @@ async def test_accept_collaboration_requires_auth(monkeypatch):
     ctx = make_ctx(None)
 
     with pytest.raises(PermissionError):
+        await _accept_collaboration(ctx, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration_requires_auth(monkeypatch):
+    patch_repo(monkeypatch, None, make_collab())
+    ctx = make_ctx(None)
+
+    with pytest.raises(PermissionError):
+        await _decline_collaboration(ctx, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration_rejects_missing_collaboration(monkeypatch):
+    user = make_user()
+    patch_repo(monkeypatch, None, None)  # collaboration does not exist
+    ctx = make_ctx(user)
+
+    with pytest.raises(ValueError, match="not found"):
         await _accept_collaboration(ctx, uuid.uuid4())
 
 
@@ -229,3 +307,54 @@ async def test_decline_collaboration_rejects_non_proposed_collaboration(monkeypa
 
     with pytest.raises(ValueError, match="no longer pending"):
         await _decline_collaboration(ctx, collab.id)
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration_rejects_already_declined_collaboration(monkeypatch):
+    # After a real decline, the recipient's participant row is removed and
+    # the collaboration status is DECLINED — resubmitting Accept must fail.
+    user = make_user()
+    collab = make_collab(status=CollaborationStatus.DECLINED)
+    patch_repo(monkeypatch, None, collab)
+    ctx = make_ctx(user)
+
+    with pytest.raises(PermissionError, match="not a participant"):
+        await _accept_collaboration(ctx, collab.id)
+
+    assert collab.status == CollaborationStatus.DECLINED
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration_rejects_already_declined_collaboration(monkeypatch):
+    user = make_user()
+    collab = make_collab(status=CollaborationStatus.DECLINED)
+    patch_repo(monkeypatch, None, collab)
+    ctx = make_ctx(user)
+
+    with pytest.raises(PermissionError, match="not a participant"):
+        await _decline_collaboration(ctx, collab.id)
+
+    assert collab.status == CollaborationStatus.DECLINED
+
+
+# ── Duplicate Accept cannot create duplicate collaboration state ─────────────
+
+
+@pytest.mark.asyncio
+async def test_duplicate_accept_requests_cannot_double_process(monkeypatch):
+    """Simulates two sequential acceptCollaboration calls for the same request."""
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab()
+    state = patch_repo(monkeypatch, participant, collab)
+    ctx = make_ctx(user)
+
+    first = await _accept_collaboration(ctx, collab.id)
+    assert first.accepted is True
+    assert collab.status == CollaborationStatus.ACCEPTED
+
+    with pytest.raises(ValueError, match="already been accepted"):
+        await _accept_collaboration(ctx, collab.id)
+
+    # No extra participant/collaboration rows were ever created.
+    assert state["add_participant_calls"] == 0

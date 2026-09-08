@@ -2815,6 +2815,8 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
 
 async def _collaboration_marketplace(ctx, tags, content_type, first, after) -> CollaborationConnection:
     """Resolve collaborationMarketplace query."""
+    ctx.require_auth()
+
     from uuid import UUID as UUID_type
     from repositories.collaboration_repository import CollaborationRepository
 
@@ -2869,6 +2871,7 @@ async def _collaboration(ctx, id) -> Optional[CollaborationType]:
     
     from uuid import UUID as UUID_type
     from repositories.collaboration_repository import CollaborationRepository
+    from app.models.collaboration import CollaborationStatus as ModelCollaborationStatus
 
     try:
         collab_id = UUID_type(id)
@@ -2881,13 +2884,15 @@ async def _collaboration(ctx, id) -> Optional[CollaborationType]:
     if not collab:
         return None
     
-    # Check if user has access (initiator or participant)
+    # Check if user has access (initiator, an accepted collaborator, or an
+    # invited recipient still deciding on a pending request).
     is_initiator = collab.initiator_id == ctx.user.id
     
     if not is_initiator:
-        # Check if user is a participant
         participant = await repo.get_participant(collab_id, ctx.user.id)
-        if not participant:
+        is_pending_invitee = participant is not None and collab.status == ModelCollaborationStatus.PROPOSED
+        is_accepted_collaborator = participant is not None and participant.accepted
+        if not (is_pending_invitee or is_accepted_collaborator):
             raise ValueError("Access denied to this collaboration")
     
     return _collaboration_to_gql(collab)
@@ -4215,7 +4220,13 @@ async def _create_collaboration(ctx, input) -> CollaborationType:
 
 
 async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
-    """Accept a collaboration invitation."""
+    """Accept a collaboration invitation.
+
+    Authorization: the caller must be the invited recipient (an existing
+    participant row that is *not* the initiator) and the request must still
+    be pending. The initiator of a collaboration can never accept their own
+    request, and unrelated users (no participant row) are rejected outright.
+    """
     from repositories.collaboration_repository import CollaborationRepository
     from app.models.collaboration import CollaborationStatus
     from datetime import datetime, timezone
@@ -4223,52 +4234,80 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
 
+    # Row-locked so a concurrent duplicate Accept can't read a stale pending status.
+    collab = await repo.get_by_id_for_update(id)
+    if not collab:
+        raise ValueError("Collaboration not found")
+
+    # The sender of a request is never its own recipient.
+    if collab.initiator_id == user.id:
+        raise PermissionError("The collaboration sender cannot accept their own request")
+
     participant = await repo.get_participant(id, user.id)
     if not participant:
-        raise ValueError("You are not a participant of this collaboration")
+        raise PermissionError("You are not a participant of this collaboration")
     if participant.accepted:
         raise ValueError("Collaboration invitation has already been accepted")
 
-    collab = await repo.get_by_id(id)
-    if not collab:
-        raise ValueError("Collaboration not found")
+    # Single source of truth for the request lifecycle: pending -> accepted/declined only.
     if collab.status != CollaborationStatus.PROPOSED:
         raise ValueError("Collaboration invitation is no longer pending")
 
-    participant.accepted = True
-    participant.accepted_at = datetime.now(timezone.utc).isoformat()
-    await repo.update_participant(participant)
-    collab.status = CollaborationStatus.ACCEPTED
-    await repo.update(collab)
-    await ctx.db.commit()
+    try:
+        participant.accepted = True
+        participant.accepted_at = datetime.now(timezone.utc).isoformat()
+        await repo.update_participant(participant)
+
+        collab.status = CollaborationStatus.ACCEPTED
+        await repo.update(collab)
+
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
 
     return _participant_to_gql(participant)
 
 
 async def _decline_collaboration(ctx, id) -> bool:
-    """Decline a collaboration invitation."""
+    """Decline a collaboration invitation.
+
+    Authorization mirrors ``_accept_collaboration``: only the invited
+    recipient (not the initiator, not an unrelated user) may decline a still
+    pending request. Declining removes the recipient's participant row and
+    never creates any collaboration access.
+    """
     from repositories.collaboration_repository import CollaborationRepository
     from app.models.collaboration import CollaborationStatus
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
 
+    # Row-locked so a concurrent duplicate Decline can't read a stale pending status.
+    collab = await repo.get_by_id_for_update(id)
+    if not collab:
+        raise ValueError("Collaboration not found")
+
+    if collab.initiator_id == user.id:
+        raise PermissionError("The collaboration sender cannot decline their own request")
+
     participant = await repo.get_participant(id, user.id)
     if not participant:
-        raise ValueError("You are not a participant of this collaboration")
+        raise PermissionError("You are not a participant of this collaboration")
     if participant.accepted:
         raise ValueError("An accepted collaboration cannot be declined")
 
-    collab = await repo.get_by_id(id)
-    if not collab:
-        raise ValueError("Collaboration not found")
     if collab.status != CollaborationStatus.PROPOSED:
         raise ValueError("Collaboration invitation is no longer pending")
 
-    await repo.remove_participant(participant)
-    collab.status = CollaborationStatus.DECLINED
-    await repo.update(collab)
-    await ctx.db.commit()
+    try:
+        await repo.remove_participant(participant)
+        collab.status = CollaborationStatus.DECLINED
+        await repo.update(collab)
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
     return True
 
 
@@ -4315,13 +4354,14 @@ async def _add_milestone(ctx, input) -> MilestoneType:
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
 
-    # Verify collaboration exists and user is participant
+    # Verify collaboration exists and user is an accepted collaborator
     collab = await repo.get_by_id(input.collaboration_id)
     if not collab:
         raise ValueError("Collaboration not found")
     
     participant = await repo.get_participant(input.collaboration_id, user.id)
-    if not participant and collab.initiator_id != user.id:
+    is_accepted_collaborator = participant is not None and participant.accepted
+    if not is_accepted_collaborator and collab.initiator_id != user.id:
         raise PermissionError("Not a participant in this collaboration")
 
     # Create milestone
@@ -4358,13 +4398,14 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     if not milestone:
         raise ValueError("Milestone not found")
     
-    # Verify user has access to the collaboration
+    # Verify user has access to the collaboration (initiator or accepted collaborator)
     collab = await repo.get_by_id(milestone.collaboration_id)
     if not collab:
         raise ValueError("Collaboration not found")
     
     participant = await repo.get_participant(milestone.collaboration_id, user.id)
-    if not participant and collab.initiator_id != user.id:
+    is_accepted_collaborator = participant is not None and participant.accepted
+    if not is_accepted_collaborator and collab.initiator_id != user.id:
         raise PermissionError("Not a participant in this collaboration")
 
     # Apply updates

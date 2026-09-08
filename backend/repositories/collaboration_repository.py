@@ -32,6 +32,18 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         """Initialize with database session."""
         super().__init__(db, Collaboration)
 
+    async def get_by_id_for_update(self, entity_id: uuid.UUID) -> Optional[Collaboration]:
+        """Get a collaboration and lock its row for the transaction.
+
+        Serializes concurrent Accept/Decline calls on the same collaboration
+        so a duplicate request can't slip past the pending-state check before
+        the first request commits.
+        """
+        result = await self.db.execute(
+            select(Collaboration).where(Collaboration.id == entity_id).with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def get_for_user(
         self,
         user_id: uuid.UUID,
