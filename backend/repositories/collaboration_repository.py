@@ -202,6 +202,13 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         return list(result.scalars().all())
 
+    async def get_milestone_by_id(self, milestone_id: uuid.UUID) -> Optional[Milestone]:
+        """Get a single milestone by its id."""
+        result = await self.db.execute(
+            select(Milestone).where(Milestone.id == milestone_id)
+        )
+        return result.scalar_one_or_none()
+
     async def update_milestone(self, milestone: Milestone) -> Milestone:
         """Update a milestone."""
         await self.db.flush()
