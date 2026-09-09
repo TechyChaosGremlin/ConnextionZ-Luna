@@ -111,11 +111,27 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
         except ValueError as exc:
             raise ValueError(f"Invalid status: {new_status}") from exc
 
-        if next_status == CollaborationStatus.IN_PROGRESS:
-            if self.status != CollaborationStatus.ACCEPTED:
-                raise ValueError(
-                    "Cannot transition to IN_PROGRESS from non-ACCEPTED status"
-                )
+        allowed_transitions = {
+            CollaborationStatus.PROPOSED: {
+                CollaborationStatus.ACCEPTED,
+                CollaborationStatus.DECLINED,
+                CollaborationStatus.CANCELLED,
+            },
+            CollaborationStatus.ACCEPTED: {
+                CollaborationStatus.IN_PROGRESS,
+                CollaborationStatus.COMPLETED,
+                CollaborationStatus.CANCELLED,
+            },
+            CollaborationStatus.IN_PROGRESS: {
+                CollaborationStatus.COMPLETED,
+                CollaborationStatus.CANCELLED,
+            },
+        }
+
+        if next_status not in allowed_transitions.get(self.status, set()):
+            raise ValueError(
+                f"Invalid status transition from current status: {self.status.value}"
+            )
 
         self.status = next_status
 

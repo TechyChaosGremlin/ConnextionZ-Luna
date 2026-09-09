@@ -1,0 +1,79 @@
+"""Unit tests for collaboration acceptance and decline workflows."""
+
+from __future__ import annotations
+
+import uuid
+from typing import cast
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app.models.collaboration import (
+    Collaboration,
+    CollaborationParticipant,
+    CollaborationStatus,
+)
+from repositories.collaboration_repository import CollaborationRepository
+from services.collaboration_service import CollaborationService
+
+
+def make_collaboration(
+    status: CollaborationStatus = CollaborationStatus.PROPOSED,
+) -> Collaboration:
+    return Collaboration(
+        id=uuid.uuid4(),
+        initiator_id=uuid.uuid4(),
+        title="Test collaboration",
+        status=status,
+    )
+
+
+def make_service() -> tuple[CollaborationService, AsyncMock]:
+    mock_repository = AsyncMock(spec=CollaborationRepository)
+    repository = cast(CollaborationRepository, mock_repository)
+    return CollaborationService(repository), mock_repository
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration():
+    collaboration = make_collaboration()
+    user_id = uuid.uuid4()
+    participant = CollaborationParticipant(
+        collaboration_id=collaboration.id,
+        user_id=user_id,
+    )
+    service, repository = make_service()
+    repository.get_by_id.return_value = collaboration
+    repository.get_participant.return_value = participant
+
+    result = await service.accept_collaboration(collaboration.id, user_id)
+
+    assert result == "Collaboration accepted"
+    assert collaboration.status == CollaborationStatus.ACCEPTED
+    repository.update.assert_awaited_once_with(collaboration)
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration():
+    collaboration = make_collaboration()
+    user_id = uuid.uuid4()
+    participant = CollaborationParticipant(
+        collaboration_id=collaboration.id,
+        user_id=user_id,
+    )
+    service, repository = make_service()
+    repository.get_by_id.return_value = collaboration
+    repository.get_participant.return_value = participant
+
+    result = await service.decline_collaboration(collaboration.id, user_id)
+
+    assert result == "Collaboration declined"
+    assert collaboration.status == CollaborationStatus.DECLINED
+    repository.update.assert_awaited_once_with(collaboration)
+
+
+def test_invalid_status_transition():
+    collaboration = make_collaboration(CollaborationStatus.ACCEPTED)
+
+    with pytest.raises(ValueError, match="Invalid status transition"):
+        collaboration._update_collaboration(CollaborationStatus.PROPOSED)

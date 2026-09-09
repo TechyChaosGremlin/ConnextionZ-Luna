@@ -191,6 +191,16 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         return result.scalar_one_or_none()
 
+    async def get_participants(self, collaboration_id: uuid.UUID) -> list[uuid.UUID]:
+        """Return accepted participant user IDs for a collaboration."""
+        result = await self.db.execute(
+            select(CollaborationParticipant.user_id).where(
+                CollaborationParticipant.collaboration_id == collaboration_id,
+                CollaborationParticipant.accepted.is_(True),
+            )
+        )
+        return list(result.scalars().all())
+
     async def update_participant(
         self, participant: CollaborationParticipant
     ) -> CollaborationParticipant:
