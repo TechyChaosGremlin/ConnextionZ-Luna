@@ -258,6 +258,16 @@ async def test_accept_collaboration_rejects_missing_collaboration(monkeypatch):
         await _accept_collaboration(ctx, uuid.uuid4())
 
 
+@pytest.mark.asyncio
+async def test_decline_collaboration_rejects_missing_collaboration(monkeypatch):
+    user = make_user()
+    patch_repo(monkeypatch, None, None)  # collaboration does not exist
+    ctx = make_ctx(user)
+
+    with pytest.raises(ValueError, match="not found"):
+        await _decline_collaboration(ctx, uuid.uuid4())
+
+
 # ── Invalid state transitions ────────────────────────────────────────────────
 
 

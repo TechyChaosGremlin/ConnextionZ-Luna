@@ -174,6 +174,22 @@ async def test_detail_allows_pending_invitee_while_proposed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_detail_denies_unaccepted_invitee_after_collaboration_is_resolved(monkeypatch):
+    owner = make_user(username="owner")
+    invitee = make_user(username="invitee")
+    collab = make_collab(owner.id, status=CollaborationStatus.ACCEPTED)
+    patch_collab_repo(
+        monkeypatch,
+        collab=collab,
+        participant_user_id=invitee.id,
+        participant_accepted=False,
+    )
+
+    with pytest.raises(ValueError, match="Access denied"):
+        await _collaboration(make_ctx(invitee), str(collab.id))
+
+
+@pytest.mark.asyncio
 async def test_detail_denies_unrelated_user(monkeypatch):
     owner = make_user(username="owner")
     outsider = make_user(username="outsider")
@@ -311,6 +327,15 @@ async def test_add_milestone_denies_pending_invitee(monkeypatch):
 
     with pytest.raises(PermissionError, match="Not a participant"):
         await _add_milestone(make_ctx(invitee), _milestone_input(collab.id))
+
+
+@pytest.mark.asyncio
+async def test_add_milestone_requires_auth(monkeypatch):
+    collab = make_collab(uuid.uuid4())
+    patch_collab_repo(monkeypatch, collab=collab)
+
+    with pytest.raises(PermissionError):
+        await _add_milestone(make_ctx(None), _milestone_input(collab.id))
 # ── Update milestone (_update_milestone) ──────────────────────────────────────
 
 

@@ -258,12 +258,3 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         return list(result.scalars().all())
 
-    async def get_declined_participants(self, collaboration: Collaboration) -> list[CollaborationParticipant]:
-        declined = getattr(CollaborationParticipant, "declined")
-        result = await self.db.execute(
-            select(CollaborationParticipant).where(
-                CollaborationParticipant.collaboration_id == collaboration.id,
-                declined.is_(True),
-            )
-        )
-        return list(result.scalars().all())

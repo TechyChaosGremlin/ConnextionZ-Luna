@@ -1,4 +1,4 @@
-"""Unit tests for collaboration acceptance and decline workflows."""
+"""Unit tests for collaboration participant workflows."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def make_service() -> tuple[CollaborationService, AsyncMock]:
 
 
 @pytest.mark.asyncio
-async def test_accept_collaboration():
+async def test_accept_participant():
     collaboration = make_collaboration()
     user_id = uuid.uuid4()
     participant = CollaborationParticipant(
@@ -43,18 +43,18 @@ async def test_accept_collaboration():
         user_id=user_id,
     )
     service, repository = make_service()
-    repository.get_by_id.return_value = collaboration
-    repository.get_participant.return_value = participant
+    result = await service.accept_participant(collaboration, participant)
 
-    result = await service.accept_collaboration(collaboration.id, user_id)
-
-    assert result == "Collaboration accepted"
+    assert result is participant
+    assert participant.accepted is True
+    assert participant.accepted_at is not None
     assert collaboration.status == CollaborationStatus.ACCEPTED
+    repository.update_participant.assert_awaited_once_with(participant)
     repository.update.assert_awaited_once_with(collaboration)
 
 
 @pytest.mark.asyncio
-async def test_decline_collaboration():
+async def test_decline_participant():
     collaboration = make_collaboration()
     user_id = uuid.uuid4()
     participant = CollaborationParticipant(
@@ -62,13 +62,11 @@ async def test_decline_collaboration():
         user_id=user_id,
     )
     service, repository = make_service()
-    repository.get_by_id.return_value = collaboration
-    repository.get_participant.return_value = participant
+    result = await service.decline_participant(collaboration, participant)
 
-    result = await service.decline_collaboration(collaboration.id, user_id)
-
-    assert result == "Collaboration declined"
+    assert result is True
     assert collaboration.status == CollaborationStatus.DECLINED
+    repository.remove_participant.assert_awaited_once_with(participant)
     repository.update.assert_awaited_once_with(collaboration)
 
 

@@ -72,19 +72,52 @@ async def test_update_status_requires_accepted_before_in_progress():
     collaboration = make_collaboration()
     service, repository = make_service()
 
-    with pytest.raises(ValueError, match="non-ACCEPTED"):
+    with pytest.raises(ValueError, match="Invalid status transition"):
         await service.update_status(collaboration, CollaborationStatus.IN_PROGRESS)
 
     repository.update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_update_status_moves_accepted_to_in_progress():
-    collaboration = make_collaboration(CollaborationStatus.ACCEPTED)
+@pytest.mark.parametrize(
+    ("current_status", "next_status"),
+    [
+        (CollaborationStatus.PROPOSED, CollaborationStatus.CANCELLED),
+        (CollaborationStatus.ACCEPTED, CollaborationStatus.IN_PROGRESS),
+        (CollaborationStatus.ACCEPTED, CollaborationStatus.COMPLETED),
+        (CollaborationStatus.ACCEPTED, CollaborationStatus.CANCELLED),
+        (CollaborationStatus.IN_PROGRESS, CollaborationStatus.COMPLETED),
+        (CollaborationStatus.IN_PROGRESS, CollaborationStatus.CANCELLED),
+    ],
+)
+async def test_update_status_allows_each_valid_lifecycle_transition(
+    current_status, next_status
+):
+    collaboration = make_collaboration(current_status)
     service, repository = make_service()
 
-    result = await service.update_status(collaboration, CollaborationStatus.IN_PROGRESS)
+    result = await service.update_status(collaboration, next_status)
 
     assert result is collaboration
-    assert collaboration.status == CollaborationStatus.IN_PROGRESS
+    assert collaboration.status == next_status
     repository.update.assert_awaited_once_with(collaboration)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        CollaborationStatus.DECLINED,
+        CollaborationStatus.COMPLETED,
+        CollaborationStatus.CANCELLED,
+    ],
+)
+async def test_update_status_rejects_transitions_from_terminal_statuses(terminal_status):
+    collaboration = make_collaboration(terminal_status)
+    service, repository = make_service()
+
+    with pytest.raises(ValueError, match="Invalid status transition"):
+        await service.update_status(collaboration, CollaborationStatus.IN_PROGRESS)
+
+    assert collaboration.status == terminal_status
+    repository.update.assert_not_awaited()

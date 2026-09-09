@@ -14,30 +14,6 @@ class CollaborationService:
     def __init__(self, repository: CollaborationRepository):
         self.repository = repository
 
-    async def accept_collaboration(self, collaboration_id, user_id):
-        collaboration = await self.repository.get_by_id(collaboration_id)
-        if collaboration is None:
-            raise ValueError("Collaboration not found")
-        participant = await self.repository.get_participant(collaboration_id, user_id)
-        if collaboration.status == 'PROPOSED' and participant is not None:
-            collaboration._update_collaboration('ACCEPTED')
-            await self.repository.update(collaboration)
-            return "Collaboration accepted"
-        else:
-            raise ValueError("Invalid action for this user")
-
-    async def decline_collaboration(self, collaboration_id, user_id):
-        collaboration = await self.repository.get_by_id(collaboration_id)
-        if collaboration is None:
-            raise ValueError("Collaboration not found")
-        participant = await self.repository.get_participant(collaboration_id, user_id)
-        if collaboration.status == 'PROPOSED' and participant is not None:
-            collaboration._update_collaboration('DECLINED')
-            await self.repository.update(collaboration)
-            return "Collaboration declined"
-        else:
-            raise ValueError("Invalid action for this user")
-
     async def accept_participant(
         self,
         collaboration: Collaboration,
