@@ -55,7 +55,7 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         # Subquery to find collaboration IDs where user is a participant
         participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
             CollaborationParticipant.user_id == user_id
-        ).subquery()
+        ).scalar_subquery()
 
         stmt = select(Collaboration).where(
             or_(
@@ -86,10 +86,10 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         """Count collaborations for a user grouped by status."""
         participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
             CollaborationParticipant.user_id == user_id
-        ).subquery()
+        ).scalar_subquery()
 
         result = await self.db.execute(
-            select(Collaboration.status, func.count().label("count"))
+            select(Collaboration.status, func.count().label("collaboration_count"))
             .where(
                 Collaboration.deleted_at.is_(None),
                 or_(
@@ -99,7 +99,10 @@ class CollaborationRepository(BaseRepository[Collaboration]):
             )
             .group_by(Collaboration.status)
         )
-        return {row.status: int(row.count or 0) for row in result.all()}
+        return {
+            row.status: int(row.collaboration_count if row.collaboration_count is not None else 0)
+            for row in result.all()
+        }
 
     async def get_for_user_in_period(
         self, user_id: uuid.UUID, start: datetime, end: datetime
@@ -107,7 +110,7 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         """Return a user's non-deleted collaborations created in a period."""
         participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
             CollaborationParticipant.user_id == user_id
-        ).subquery()
+        ).scalar_subquery()
         result = await self.db.execute(
             select(Collaboration)
             .options(selectinload(Collaboration.participants))
@@ -226,3 +229,31 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         await self.db.flush()
         await self.db.refresh(milestone)
         return milestone
+    
+    async def get_pending_participants(self, collaboration: Collaboration) -> list[CollaborationParticipant]:
+        result = await self.db.execute(
+            select(CollaborationParticipant).where(
+                CollaborationParticipant.collaboration_id == collaboration.id,
+                CollaborationParticipant.accepted.is_(False),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def get_accepted_participants(self, collaboration: Collaboration) -> list[CollaborationParticipant]:
+        result = await self.db.execute(
+            select(CollaborationParticipant).where(
+                CollaborationParticipant.collaboration_id == collaboration.id,
+                CollaborationParticipant.accepted.is_(True),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def get_declined_participants(self, collaboration: Collaboration) -> list[CollaborationParticipant]:
+        declined = getattr(CollaborationParticipant, "declined")
+        result = await self.db.execute(
+            select(CollaborationParticipant).where(
+                CollaborationParticipant.collaboration_id == collaboration.id,
+                declined.is_(True),
+            )
+        )
+        return list(result.scalars().all())

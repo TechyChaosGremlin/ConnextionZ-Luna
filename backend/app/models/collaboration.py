@@ -46,11 +46,11 @@ class MilestoneStatus(str, enum.Enum):
 
 # ── Collaboration ────────────────────────────────────────────────
 
-
 class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
     """A collaboration between two or more creators."""
 
     __tablename__ = "collaborations"
+    status_choices = tuple(status.value for status in CollaborationStatus)
 
     # Initiator
     initiator_id: Mapped[uuid.UUID] = mapped_column(
@@ -103,6 +103,21 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
         lazy="selectin",
         cascade="all, delete-orphan",
     )
+
+    def _update_collaboration(self, new_status: CollaborationStatus | str) -> None:
+        """Validate and apply a collaboration status transition."""
+        try:
+            next_status = CollaborationStatus(new_status)
+        except ValueError as exc:
+            raise ValueError(f"Invalid status: {new_status}") from exc
+
+        if next_status == CollaborationStatus.IN_PROGRESS:
+            if self.status != CollaborationStatus.ACCEPTED:
+                raise ValueError(
+                    "Cannot transition to IN_PROGRESS from non-ACCEPTED status"
+                )
+
+        self.status = next_status
 
     def __repr__(self) -> str:
         return f"<Collaboration id={self.id!r} title={self.title!r} status={self.status.value!r}>"

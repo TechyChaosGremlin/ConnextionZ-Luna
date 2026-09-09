@@ -3981,26 +3981,6 @@ async def _update_post(ctx, id, input) -> PostType:
     if post.user_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the post author can update this post")
 
-    if input.status is not None:
-        requested_status = CollaborationStatus(input.status.value)
-        allowed_statuses = {
-            CollaborationStatus.PROPOSED: {CollaborationStatus.CANCELLED},
-            CollaborationStatus.ACCEPTED: {
-                CollaborationStatus.IN_PROGRESS,
-                CollaborationStatus.CANCELLED,
-            },
-            CollaborationStatus.IN_PROGRESS: {
-                CollaborationStatus.COMPLETED,
-                CollaborationStatus.CANCELLED,
-            },
-        }
-        if requested_status not in allowed_statuses.get(collab.status, set()):
-            raise ValueError(
-                "Invalid collaboration status transition: "
-                f"{collab.status.value} -> {requested_status.value}"
-            )
-        collab.status = requested_status
-
     # Apply updates from input
     for field in ("title", "body", "caption", "tags", "sound_track", "scheduled_at"):
         value = getattr(input, field, None)
@@ -4338,6 +4318,10 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
         value = getattr(input, field, None)
         if value is not None:
             setattr(collab, field, value)
+
+    status = getattr(input, "status", None)
+    if status is not None:
+        collab._update_collaboration(status.value)
 
     collab.updated_at = datetime.now(timezone.utc)
     await repo.update(collab)
