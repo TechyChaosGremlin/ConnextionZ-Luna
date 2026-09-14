@@ -9,7 +9,7 @@ from __future__ import annotations
 import enum
 import uuid
 
-from sqlalchemy import Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -95,6 +95,41 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
         cascade="all, delete-orphan",
     )
 
+    def _update_collaboration(
+        self,
+        new_status: CollaborationStatus | str,
+    ) -> None:
+        """Validate and apply a collaboration status transition."""
+        try:
+            next_status = CollaborationStatus(new_status)
+        except ValueError as exc:
+            raise ValueError(f"Invalid status: {new_status}") from exc
+
+        allowed_transitions = {
+            CollaborationStatus.PROPOSED: {
+                CollaborationStatus.ACCEPTED,
+                CollaborationStatus.DECLINED,
+                CollaborationStatus.CANCELLED,
+            },
+            CollaborationStatus.ACCEPTED: {
+                CollaborationStatus.IN_PROGRESS,
+                CollaborationStatus.COMPLETED,
+                CollaborationStatus.CANCELLED,
+            },
+            CollaborationStatus.IN_PROGRESS: {
+                CollaborationStatus.COMPLETED,
+                CollaborationStatus.CANCELLED,
+            },
+        }
+
+        if next_status not in allowed_transitions.get(self.status, set()):
+            raise ValueError(
+                f"Invalid status transition from current status: "
+                f"{self.status.value}"
+            )
+
+        self.status = next_status
+
     def __repr__(self) -> str:
         return f"<Collaboration id={self.id!r} title={self.title!r} status={self.status.value!r}>"
 
@@ -106,6 +141,13 @@ class CollaborationParticipant(Base, TimestampMixin):
     """Join table linking users to collaborations with a role."""
 
     __tablename__ = "collaboration_participants"
+    __table_args__ = (
+        UniqueConstraint(
+            "collaboration_id",
+            "user_id",
+            name="uq_collaboration_participant",
+        ),
+    )
 
     collaboration_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True),
