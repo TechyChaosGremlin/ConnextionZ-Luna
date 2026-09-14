@@ -179,6 +179,19 @@ async def test_create_collaboration_tracks_collab_created_event(repo_participant
 
 
 @pytest.mark.asyncio
+async def test_create_collaboration_commits_rows_and_refreshes_collaboration(
+    repo_participants,
+):
+    owner = make_user()
+    ctx = make_ctx(owner)
+
+    await _create_collaboration(ctx, make_input())
+
+    assert ctx.db.commit.await_count == 2
+    ctx.db.refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_create_collaboration_requires_auth(repo_participants):
     ctx = make_ctx(None)
 

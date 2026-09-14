@@ -75,3 +75,46 @@ def test_invalid_status_transition():
 
     with pytest.raises(ValueError, match="Invalid status transition"):
         collaboration._update_collaboration(CollaborationStatus.PROPOSED)
+
+
+@pytest.mark.parametrize(
+    ("current_status", "next_status"),
+    [
+        (CollaborationStatus.PROPOSED, CollaborationStatus.ACCEPTED),
+        (CollaborationStatus.PROPOSED, CollaborationStatus.DECLINED),
+        (CollaborationStatus.PROPOSED, CollaborationStatus.CANCELLED),
+        (CollaborationStatus.ACCEPTED, CollaborationStatus.IN_PROGRESS),
+        (CollaborationStatus.ACCEPTED, CollaborationStatus.COMPLETED),
+        (CollaborationStatus.ACCEPTED, CollaborationStatus.CANCELLED),
+        (CollaborationStatus.IN_PROGRESS, CollaborationStatus.COMPLETED),
+        (CollaborationStatus.IN_PROGRESS, CollaborationStatus.CANCELLED),
+    ],
+)
+def test_valid_status_transitions_are_applied(current_status, next_status):
+    collaboration = make_collaboration(current_status)
+
+    collaboration._update_collaboration(next_status)
+
+    assert collaboration.status == next_status
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        CollaborationStatus.DECLINED,
+        CollaborationStatus.COMPLETED,
+        CollaborationStatus.CANCELLED,
+    ],
+)
+def test_terminal_statuses_reject_all_transitions(terminal_status):
+    collaboration = make_collaboration(terminal_status)
+
+    with pytest.raises(ValueError, match="Invalid status transition"):
+        collaboration._update_collaboration(CollaborationStatus.ACCEPTED)
+
+
+def test_invalid_status_value_is_rejected():
+    collaboration = make_collaboration()
+
+    with pytest.raises(ValueError, match="Invalid status"):
+        collaboration._update_collaboration("not-a-status")

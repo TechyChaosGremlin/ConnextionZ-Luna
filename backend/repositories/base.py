@@ -68,9 +68,9 @@ class BaseRepository(Generic[T]):
         Returns:
             Entity instance or None if not found
         """
-        result = await self.db.execute(
-            select(self.model_class).where(self.model_class.id == entity_id)
-        )
+        stmt = select(self.model_class).where(self.model_class.id == entity_id)
+        stmt = self._apply_soft_delete_filter(stmt)
+        result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_all(
@@ -185,11 +185,9 @@ class BaseRepository(Generic[T]):
         Returns:
             True if entity exists, False otherwise
         """
-        result = await self.db.execute(
-            select(func.count())
-            .select_from(self.model_class)
-            .where(self.model_class.id == entity_id)
-        )
+        stmt = select(func.count()).select_from(self.model_class).where(self.model_class.id == entity_id)
+        stmt = self._apply_soft_delete_filter(stmt)
+        result = await self.db.execute(stmt)
         return result.scalar_one() > 0
 
     def _apply_soft_delete_filter(self, stmt: Select) -> Select:

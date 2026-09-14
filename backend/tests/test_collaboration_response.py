@@ -62,11 +62,12 @@ def make_participant(user_id, *, accepted=False, accepted_at=None, role="partici
     )
 
 
-def make_collab(initiator_id=None, status=CollaborationStatus.PROPOSED) -> SimpleNamespace:
+def make_collab(initiator_id=None, status=CollaborationStatus.PROPOSED, deleted_at=None) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid.uuid4(),
         initiator_id=initiator_id if initiator_id is not None else uuid.uuid4(),
         status=status,
+        deleted_at=deleted_at,
     )
 
 
@@ -147,6 +148,7 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     assert participant.accepted_at is not None
     assert collab.status == CollaborationStatus.ACCEPTED
     assert state["removed"] is False
+    ctx.db.commit.assert_awaited_once_with()
     # Accepting activates the existing participant row; it never inserts a
     # brand-new collaboration/participant record.
     assert state["add_participant_calls"] == 0
@@ -169,6 +171,55 @@ async def test_decline_collaboration_removes_participant_and_marks_declined(monk
     assert state["removed"] is True
     assert collab.status == CollaborationStatus.DECLINED
     assert participant.accepted is False
+    ctx.db.commit.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration_rolls_back_when_participant_update_fails(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab()
+    patch_repo(monkeypatch, participant, collab)
+
+    async def fail_update_participant(self, p):
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.update_participant",
+        fail_update_participant,
+    )
+    ctx = make_ctx(user)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        await _accept_collaboration(ctx, collab.id)
+
+    ctx.db.rollback.assert_awaited_once_with()
+    ctx.db.commit.assert_not_awaited()
+    assert collab.status == CollaborationStatus.PROPOSED
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration_rolls_back_when_remove_fails(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab()
+    patch_repo(monkeypatch, participant, collab)
+
+    async def fail_remove_participant(self, p):
+        raise RuntimeError("delete failed")
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.remove_participant",
+        fail_remove_participant,
+    )
+    ctx = make_ctx(user)
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await _decline_collaboration(ctx, collab.id)
+
+    ctx.db.rollback.assert_awaited_once_with()
+    ctx.db.commit.assert_not_awaited()
+    assert collab.status == CollaborationStatus.PROPOSED
 
 
 # ── Sender cannot act on their own request ────────────────────────────────────
@@ -231,12 +282,36 @@ async def test_decline_collaboration_rejects_non_participant(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_accept_collaboration_rejects_soft_deleted_collaboration(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab(status=CollaborationStatus.PROPOSED, deleted_at="2024-01-01T00:00:00+00:00")
+    patch_repo(monkeypatch, participant, collab)
+    ctx = make_ctx(user)
+
+    with pytest.raises(ValueError, match="not found"):
+        await _accept_collaboration(ctx, collab.id)
+
+
+@pytest.mark.asyncio
 async def test_accept_collaboration_requires_auth(monkeypatch):
     patch_repo(monkeypatch, None, make_collab())
     ctx = make_ctx(None)
 
     with pytest.raises(PermissionError):
         await _accept_collaboration(ctx, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration_rejects_soft_deleted_collaboration(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab(status=CollaborationStatus.PROPOSED, deleted_at="2024-01-01T00:00:00+00:00")
+    patch_repo(monkeypatch, participant, collab)
+    ctx = make_ctx(user)
+
+    with pytest.raises(ValueError, match="not found"):
+        await _decline_collaboration(ctx, collab.id)
 
 
 @pytest.mark.asyncio

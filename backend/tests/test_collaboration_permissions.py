@@ -55,7 +55,7 @@ def make_ctx(user: User | None) -> AppContext:
     return AppContext(db=AsyncMock(), current_user=user, session_id="sess-test")
 
 
-def make_collab(initiator_id, status=CollaborationStatus.PROPOSED) -> SimpleNamespace:
+def make_collab(initiator_id, status=CollaborationStatus.PROPOSED, deleted_at=None) -> SimpleNamespace:
     collab = SimpleNamespace(
         id=uuid.uuid4(),
         initiator_id=initiator_id,
@@ -73,6 +73,7 @@ def make_collab(initiator_id, status=CollaborationStatus.PROPOSED) -> SimpleName
         proposed_at=None,
         started_at=None,
         completed_at=None,
+        deleted_at=deleted_at,
     )
     return collab
 
@@ -201,6 +202,15 @@ async def test_detail_denies_unrelated_user(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_detail_denies_soft_deleted_collaboration(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, deleted_at="2024-01-01T00:00:00+00:00")
+    patch_collab_repo(monkeypatch, collab=collab)
+
+    assert await _collaboration(make_ctx(owner), str(collab.id)) is None
+
+
+@pytest.mark.asyncio
 async def test_detail_requires_auth(monkeypatch):
     collab = make_collab(uuid.uuid4())
     patch_collab_repo(monkeypatch, collab=collab)
@@ -266,12 +276,40 @@ async def test_update_allows_admin(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_update_denies_soft_deleted_collaboration(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, deleted_at="2024-01-01T00:00:00+00:00")
+    patch_collab_repo(monkeypatch, collab=collab)
+
+    with pytest.raises(ValueError, match="Collaboration not found"):
+        await _update_collaboration(make_ctx(owner), str(collab.id), SimpleNamespace(title="Hijack"))
+
+
+@pytest.mark.asyncio
 async def test_update_requires_auth(monkeypatch):
     collab = make_collab(uuid.uuid4())
     patch_collab_repo(monkeypatch, collab=collab)
 
     with pytest.raises(PermissionError):
         await _update_collaboration(make_ctx(None), str(collab.id), SimpleNamespace())
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_invalid_collaboration_id(monkeypatch):
+    user = make_user()
+    patch_collab_repo(monkeypatch)
+
+    with pytest.raises(ValueError, match="Invalid collaboration ID"):
+        await _update_collaboration(make_ctx(user), "not-a-uuid", SimpleNamespace())
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_missing_collaboration(monkeypatch):
+    user = make_user()
+    patch_collab_repo(monkeypatch)
+
+    with pytest.raises(ValueError, match="Collaboration not found"):
+        await _update_collaboration(make_ctx(user), str(uuid.uuid4()), SimpleNamespace())
 # ── Add milestone (_add_milestone) ────────────────────────────────────────────
 
 
@@ -330,12 +368,31 @@ async def test_add_milestone_denies_pending_invitee(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_add_milestone_denies_soft_deleted_collaboration(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, deleted_at="2024-01-01T00:00:00+00:00")
+    patch_collab_repo(monkeypatch, collab=collab)
+
+    with pytest.raises(ValueError, match="Collaboration not found"):
+        await _add_milestone(make_ctx(owner), _milestone_input(collab.id))
+
+
+@pytest.mark.asyncio
 async def test_add_milestone_requires_auth(monkeypatch):
     collab = make_collab(uuid.uuid4())
     patch_collab_repo(monkeypatch, collab=collab)
 
     with pytest.raises(PermissionError):
         await _add_milestone(make_ctx(None), _milestone_input(collab.id))
+
+
+@pytest.mark.asyncio
+async def test_add_milestone_rejects_missing_collaboration(monkeypatch):
+    owner = make_user(username="owner")
+    patch_collab_repo(monkeypatch)
+
+    with pytest.raises(ValueError, match="Collaboration not found"):
+        await _add_milestone(make_ctx(owner), _milestone_input(uuid.uuid4()))
 # ── Update milestone (_update_milestone) ──────────────────────────────────────
 
 
@@ -385,6 +442,17 @@ async def test_update_milestone_denies_unrelated_user(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_update_milestone_denies_soft_deleted_collaboration(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, deleted_at="2024-01-01T00:00:00+00:00")
+    milestone = make_milestone(collab.id)
+    patch_collab_repo(monkeypatch, collab=collab, milestone=milestone)
+
+    with pytest.raises(ValueError, match="Collaboration not found"):
+        await _update_milestone(make_ctx(owner), str(milestone.id), _milestone_update_input())
+
+
+@pytest.mark.asyncio
 async def test_update_milestone_requires_auth(monkeypatch):
     collab = make_collab(uuid.uuid4())
     milestone = make_milestone(collab.id)
@@ -392,6 +460,38 @@ async def test_update_milestone_requires_auth(monkeypatch):
 
     with pytest.raises(PermissionError):
         await _update_milestone(make_ctx(None), str(milestone.id), _milestone_update_input())
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_rejects_invalid_id(monkeypatch):
+    user = make_user()
+    patch_collab_repo(monkeypatch)
+
+    with pytest.raises(ValueError, match="Invalid milestone ID"):
+        await _update_milestone(make_ctx(user), "not-a-uuid", _milestone_update_input())
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_rejects_missing_milestone(monkeypatch):
+    user = make_user()
+    patch_collab_repo(monkeypatch)
+
+    with pytest.raises(ValueError, match="Milestone not found"):
+        await _update_milestone(
+            make_ctx(user), str(uuid.uuid4()), _milestone_update_input()
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_rejects_missing_collaboration(monkeypatch):
+    user = make_user()
+    milestone = make_milestone(uuid.uuid4())
+    patch_collab_repo(monkeypatch, milestone=milestone)
+
+    with pytest.raises(ValueError, match="Collaboration not found"):
+        await _update_milestone(
+            make_ctx(user), str(milestone.id), _milestone_update_input()
+        )
 
 
 @pytest.mark.asyncio

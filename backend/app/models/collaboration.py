@@ -63,8 +63,15 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
     # Details
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # values_callable persists the enum *values* ("proposed", "accepted", ...)
+    # rather than the member *names*, matching the lowercase labels migration
+    # 001 created in the DB enum.
     status: Mapped[CollaborationStatus] = mapped_column(
-        Enum(CollaborationStatus, name="collaboration_status"),
+        Enum(
+            CollaborationStatus,
+            name="collaboration_status",
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
         default=CollaborationStatus.PROPOSED,
     )
@@ -197,8 +204,14 @@ class Milestone(Base, TimestampMixin):
 
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # values_callable persists the enum *values* ("pending", "in_progress",
+    # ...) rather than the member *names*, matching migration 001's DB enum.
     status: Mapped[MilestoneStatus] = mapped_column(
-        Enum(MilestoneStatus, name="milestone_status"),
+        Enum(
+            MilestoneStatus,
+            name="milestone_status",
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
         default=MilestoneStatus.PENDING,
     )

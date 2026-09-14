@@ -2880,10 +2880,10 @@ async def _collaboration(ctx, id) -> Optional[CollaborationType]:
     
     repo = CollaborationRepository(ctx.db)
     collab = await repo.get_by_id(collab_id)
-    
-    if not collab:
+
+    if not collab or getattr(collab, "deleted_at", None) is not None:
         return None
-    
+
     # Check if user has access (initiator, an accepted collaborator, or an
     # invited recipient still deciding on a pending request).
     is_initiator = collab.initiator_id == ctx.user.id
@@ -4216,7 +4216,7 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
 
     # Row-locked so a concurrent duplicate Accept can't read a stale pending status.
     collab = await repo.get_by_id_for_update(id)
-    if not collab:
+    if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
 
     # The sender of a request is never its own recipient.
@@ -4265,7 +4265,7 @@ async def _decline_collaboration(ctx, id) -> bool:
 
     # Row-locked so a concurrent duplicate Decline can't read a stale pending status.
     collab = await repo.get_by_id_for_update(id)
-    if not collab:
+    if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
 
     if collab.initiator_id == user.id:
@@ -4306,9 +4306,9 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
         raise ValueError("Invalid collaboration ID")
 
     collab = await repo.get_by_id(collab_id)
-    if not collab:
+    if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
-    
+
     # Check ownership (only initiator can update)
     if collab.initiator_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the collaboration initiator can update it")
@@ -4340,9 +4340,9 @@ async def _add_milestone(ctx, input) -> MilestoneType:
 
     # Verify collaboration exists and user is an accepted collaborator
     collab = await repo.get_by_id(input.collaboration_id)
-    if not collab:
+    if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
-    
+
     participant = await repo.get_participant(input.collaboration_id, user.id)
     is_accepted_collaborator = participant is not None and participant.accepted
     if not is_accepted_collaborator and collab.initiator_id != user.id:
@@ -4384,9 +4384,9 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     
     # Verify user has access to the collaboration (initiator or accepted collaborator)
     collab = await repo.get_by_id(milestone.collaboration_id)
-    if not collab:
+    if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
-    
+
     participant = await repo.get_participant(milestone.collaboration_id, user.id)
     is_accepted_collaborator = participant is not None and participant.accepted
     if not is_accepted_collaborator and collab.initiator_id != user.id:

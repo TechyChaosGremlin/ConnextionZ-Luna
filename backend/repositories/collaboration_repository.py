@@ -10,7 +10,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select, and_, or_
+from sqlalchemy import func, select, and_, or_, String, cast
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -33,14 +34,16 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         super().__init__(db, Collaboration)
 
     async def get_by_id_for_update(self, entity_id: uuid.UUID) -> Optional[Collaboration]:
-        """Get a collaboration and lock its row for the transaction.
+        """Get a non-deleted collaboration and lock its row for the transaction.
 
         Serializes concurrent Accept/Decline calls on the same collaboration
         so a duplicate request can't slip past the pending-state check before
         the first request commits.
         """
         result = await self.db.execute(
-            select(Collaboration).where(Collaboration.id == entity_id).with_for_update()
+            select(Collaboration)
+            .where(Collaboration.id == entity_id, Collaboration.deleted_at.is_(None))
+            .with_for_update()
         )
         return result.scalar_one_or_none()
 
@@ -58,6 +61,7 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         ).scalar_subquery()
 
         stmt = select(Collaboration).where(
+            Collaboration.deleted_at.is_(None),
             or_(
                 Collaboration.initiator_id == user_id,
                 Collaboration.id.in_(participant_collab_ids),
@@ -136,14 +140,14 @@ class CollaborationRepository(BaseRepository[Collaboration]):
     ) -> list[Collaboration]:
         """Get public collaboration marketplace listings."""
         stmt = select(Collaboration).where(
-            Collaboration.status == CollaborationStatus.PROPOSED
+            Collaboration.deleted_at.is_(None),
+            Collaboration.status == CollaborationStatus.PROPOSED,
         )
         if content_type:
             stmt = stmt.where(Collaboration.content_type == content_type)
         if tags:
-            # Filter by tags (JSONB contains any of the provided tags)
-            for tag in tags:
-                stmt = stmt.where(Collaboration.tags.contains([tag]))
+            # ANY-tag match: jsonb ?| operator, true if any element overlaps
+            stmt = stmt.where(Collaboration.tags.op("?|")(cast(tags, ARRAY(String))))
         if before:
             before_time, before_id = before
             stmt = stmt.where(
