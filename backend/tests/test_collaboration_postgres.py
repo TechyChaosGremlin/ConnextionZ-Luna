@@ -18,9 +18,12 @@ Covers the CollaborationRepository against real PostgreSQL:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import AsyncGenerator
 
 import pytest
@@ -28,6 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.graphql import AppContext, _accept_collaboration, _decline_collaboration
 from app.db.session import async_session_factory
 from app.models.collaboration import (
     Collaboration,
@@ -69,6 +73,58 @@ async def create_test_user(session: AsyncSession, prefix: str = "collab_user") -
     session.add(user)
     await session.flush()
     return user
+
+
+async def create_and_commit_user(prefix: str) -> User:
+    """Create and commit a User in its own session (visible to other sessions)."""
+    uid = uuid.uuid4().hex[:10]
+    user = User(
+        email=f"{prefix}_{uid}@example.test",
+        username=f"{prefix}_{uid}",
+        hashed_password="hashed_test_password",
+        role=UserRole.USER,
+        status=AccountStatus.ACTIVE,
+        email_verified=True,
+        mfa_enabled=False,
+    )
+    async with async_session_factory() as session:
+        session.add(user)
+        await session.commit()
+    return user
+
+
+async def create_and_commit_pending_collaboration(
+    initiator_id: uuid.UUID, participant_id: uuid.UUID
+) -> uuid.UUID:
+    """Create+commit a PROPOSED collaboration with one pending participant."""
+    collab = Collaboration(
+        initiator_id=initiator_id,
+        title="Concurrency Test Collab",
+        status=CollaborationStatus.PROPOSED,
+    )
+    async with async_session_factory() as session:
+        session.add(collab)
+        await session.flush()
+        session.add(
+            CollaborationParticipant(
+                collaboration_id=collab.id,
+                user_id=participant_id,
+                role="participant",
+                accepted=False,
+            )
+        )
+        await session.commit()
+    return collab.id
+
+
+async def cleanup_users(*user_ids: uuid.UUID) -> None:
+    """Delete users (cascades to their collaborations/participants) after a test."""
+    async with async_session_factory() as session:
+        for uid_ in user_ids:
+            user = await session.get(User, uid_)
+            if user is not None:
+                await session.delete(user)
+        await session.commit()
 
 
 # ── Tests ────────────────────────────────────────────────────────────
@@ -654,4 +710,464 @@ async def test_soft_deleted_collaboration_filtering():
         # status_counts_for_user should not count soft-deleted
         counts = await repo.status_counts_for_user(user.id)
         assert counts.get(CollaborationStatus.PROPOSED) == 1
+
+
+# ── Concurrency Tests (Step 7) ──────────────────────────────────────
+#
+# These tests use separate, independently-committing AsyncSessions (not the
+# rolled-back `transactional_session` helper above) so that two "requests"
+# genuinely race against real PostgreSQL row locks/unique constraints instead
+# of sharing one transaction's uncommitted state.
+
+
+@pytest.mark.asyncio
+async def test_concurrent_accept_accept_same_invite_exactly_one_wins():
+    """13. Two concurrent Accept calls on the same pending invite: exactly one wins."""
+    initiator = await create_and_commit_user("race_init")
+    participant_user = await create_and_commit_user("race_accept")
+    collab_id = await create_and_commit_pending_collaboration(
+        initiator.id, participant_user.id
+    )
+
+    async def do_accept():
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=participant_user)
+            return await _accept_collaboration(ctx, collab_id)
+
+    try:
+        results = await asyncio.gather(do_accept(), do_accept(), return_exceptions=True)
+
+        successes = [r for r in results if not isinstance(r, BaseException)]
+        failures = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1, f"expected exactly one winner, got: {results}"
+        assert len(failures) == 1
+        assert isinstance(failures[0], ValueError)
+
+        # Final state, observed from a fresh session: ACCEPTED, one accepted participant.
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            collab = await repo.get_by_id(collab_id)
+            assert collab.status == CollaborationStatus.ACCEPTED
+
+            participant = await repo.get_participant(collab_id, participant_user.id)
+            assert participant is not None
+            assert participant.accepted is True
+    finally:
+        await cleanup_users(initiator.id, participant_user.id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_accept_decline_race_exactly_one_wins():
+    """14. Concurrent Accept/Decline race on the same pending invite: one wins, state is consistent."""
+    initiator = await create_and_commit_user("race_init2")
+    participant_user = await create_and_commit_user("race_ad")
+    collab_id = await create_and_commit_pending_collaboration(
+        initiator.id, participant_user.id
+    )
+
+    async def do_accept():
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=participant_user)
+            return await _accept_collaboration(ctx, collab_id)
+
+    async def do_decline():
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=participant_user)
+            return await _decline_collaboration(ctx, collab_id)
+
+    try:
+        accept_result, decline_result = await asyncio.gather(
+            do_accept(), do_decline(), return_exceptions=True
+        )
+
+        outcomes = [accept_result, decline_result]
+        successes = [r for r in outcomes if not isinstance(r, BaseException)]
+        failures = [r for r in outcomes if isinstance(r, BaseException)]
+        assert len(successes) == 1, f"expected exactly one winner, got: {outcomes}"
+        assert len(failures) == 1
+        # The loser observes committed state and rejects — never a generic crash.
+        assert isinstance(failures[0], (ValueError, PermissionError))
+
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            collab = await repo.get_by_id(collab_id)
+            participant = await repo.get_participant(collab_id, participant_user.id)
+
+            assert collab.status in (
+                CollaborationStatus.ACCEPTED,
+                CollaborationStatus.DECLINED,
+            )
+            if collab.status == CollaborationStatus.ACCEPTED:
+                # Accept won: participant row still exists and is accepted.
+                assert participant is not None
+                assert participant.accepted is True
+            else:
+                # Decline won: recipient's participant row is removed (documented behavior).
+                assert participant is None
+    finally:
+        await cleanup_users(initiator.id, participant_user.id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_participant_insert_integrity_error():
+    """15. Two sessions inserting the same (collaboration_id, user_id) pair: only one row survives."""
+    initiator = await create_and_commit_user("race_dup_init")
+    target_user = await create_and_commit_user("race_dup_user")
+
+    collab = Collaboration(
+        initiator_id=initiator.id,
+        title="Duplicate Participant Race Collab",
+        status=CollaborationStatus.PROPOSED,
+    )
+    async with async_session_factory() as session:
+        session.add(collab)
+        await session.commit()
+    collab_id = collab.id
+
+    start = asyncio.Event()
+
+    async def do_insert(role: str):
+        async with async_session_factory() as session:
+            participant = CollaborationParticipant(
+                collaboration_id=collab_id,
+                user_id=target_user.id,
+                role=role,
+                accepted=False,
+            )
+            session.add(participant)
+            await start.wait()
+            await session.commit()
+
+    try:
+        task_a = asyncio.create_task(do_insert("participant"))
+        task_b = asyncio.create_task(do_insert("editor"))
+        # Give both tasks a moment to reach `await start.wait()` before releasing
+        # them together, maximizing the chance they commit around the same time.
+        await asyncio.sleep(0.05)
+        start.set()
+        results = await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        successes = [r for r in results if not isinstance(r, BaseException)]
+        failures = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1, f"expected exactly one insert to survive, got: {results}"
+        assert len(failures) == 1
+        assert isinstance(failures[0], IntegrityError)
+
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            result = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM collaboration_participants "
+                    "WHERE collaboration_id = :cid AND user_id = :uid"
+                ),
+                {"cid": str(collab_id), "uid": str(target_user.id)},
+            )
+            assert result.scalar_one() == 1
+    finally:
+        await cleanup_users(initiator.id, target_user.id)
+
+
+@pytest.mark.asyncio
+async def test_explicit_row_lock_blocks_concurrent_transaction():
+    """16. FOR UPDATE row lock: session B blocks until session A commits, then sees committed state."""
+    initiator = await create_and_commit_user("lock_init")
+    collab = Collaboration(
+        initiator_id=initiator.id,
+        title="Original Title",
+        status=CollaborationStatus.PROPOSED,
+    )
+    async with async_session_factory() as session:
+        session.add(collab)
+        await session.commit()
+    collab_id = collab.id
+
+    a_locked = asyncio.Event()
+    b_attempted = asyncio.Event()
+    timestamps: dict[str, float] = {}
+
+    async def session_a():
+        async with async_session_factory() as session:
+            async with session.begin():
+                repo = CollaborationRepository(session)
+                locked = await repo.get_by_id_for_update(collab_id)
+                a_locked.set()
+                # Wait until B has issued its own FOR UPDATE request (it will block
+                # in Postgres until this transaction commits/releases the lock).
+                await b_attempted.wait()
+                await asyncio.sleep(0.3)
+                locked.title = "Updated by A while holding the lock"
+                await CollaborationRepository(session).update(locked)
+            timestamps["a_committed"] = time.monotonic()
+
+    async def session_b() -> str:
+        await a_locked.wait()
+        async with async_session_factory() as session:
+            async with session.begin():
+                repo = CollaborationRepository(session)
+                b_attempted.set()
+                # This blocks at the PostgreSQL level until session A commits.
+                locked = await repo.get_by_id_for_update(collab_id)
+                timestamps["b_locked"] = time.monotonic()
+                return locked.title
+
+    try:
+        _, observed_title = await asyncio.gather(session_a(), session_b())
+
+        assert observed_title == "Updated by A while holding the lock"
+        assert timestamps["b_locked"] >= timestamps["a_committed"], (
+            "session B observed the lock before session A committed — "
+            "row lock did not actually block"
+        )
+    finally:
+        await cleanup_users(initiator.id)
+
+
+# ── Transaction Safety Tests (Step 8) ────────────────────────────────
+#
+# These tests exercise the real GraphQL resolvers (`_create_collaboration`,
+# `_add_milestone`, `_update_milestone`, `_accept_collaboration`,
+# `_decline_collaboration`) against a live PostgreSQL connection using the
+# same per-request session lifecycle as production (a single AsyncSession
+# per resolver call, not the auto-rolled-back `transactional_session`
+# helper), so a mid-transaction failure has to be rolled back by the
+# resolver itself for the database to stay consistent. State is verified
+# from an independent, freshly-opened session after each resolver call.
+
+
+@pytest.mark.asyncio
+async def test_create_collaboration_failure_leaves_no_partial_collaboration_or_participants(
+    monkeypatch,
+):
+    """3 / 6. A failed collaboration creation leaves no collaboration or participant rows."""
+    from api.graphql import _create_collaboration
+
+    owner = await create_and_commit_user("txn_create_owner")
+    invited = await create_and_commit_user("txn_create_invited")
+
+    call_count = {"n": 0}
+    real_add_participant = CollaborationRepository.add_participant
+
+    async def flaky_add_participant(self, participant):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated participant insert failure")
+        return await real_add_participant(self, participant)
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.add_participant",
+        flaky_add_participant,
+    )
+
+    input_ = SimpleNamespace(
+        title="Txn Safety Collab",
+        description="Should not survive a failed insert",
+        content_type="video",
+        platform="youtube",
+        tags=["test"],
+        participant_ids=[invited.id],
+        budget_min=None,
+        budget_max=None,
+        budget_currency=None,
+    )
+
+    try:
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=owner, session_id="txn-test")
+            with pytest.raises(RuntimeError, match="simulated participant insert failure"):
+                await _create_collaboration(ctx, input_)
+
+        # Verify from an independent session: no partial collaboration/participant state.
+        async with async_session_factory() as session:
+            result = await session.execute(
+                text("SELECT COUNT(*) FROM collaborations WHERE title = :t"),
+                {"t": "Txn Safety Collab"},
+            )
+            assert result.scalar_one() == 0
+
+            result = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM collaboration_participants "
+                    "WHERE user_id = :uid"
+                ),
+                {"uid": str(owner.id)},
+            )
+            assert result.scalar_one() == 0
+    finally:
+        await cleanup_users(owner.id, invited.id)
+
+
+@pytest.mark.asyncio
+async def test_add_milestone_failure_rolls_back_milestone_insert(monkeypatch):
+    """4. Milestone creation failure rolls back the milestone."""
+    from api.graphql import _add_milestone
+
+    owner = await create_and_commit_user("txn_milestone_owner")
+    collab = Collaboration(
+        initiator_id=owner.id,
+        title="Milestone Txn Collab",
+        status=CollaborationStatus.PROPOSED,
+    )
+    async with async_session_factory() as session:
+        session.add(collab)
+        await session.commit()
+    collab_id = collab.id
+
+    async def fail_add_milestone(self, milestone):
+        raise RuntimeError("simulated milestone insert failure")
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.add_milestone",
+        fail_add_milestone,
+    )
+
+    input_ = SimpleNamespace(
+        collaboration_id=collab_id,
+        title="Doomed Milestone",
+        description="Should not persist",
+        due_date=None,
+    )
+
+    try:
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=owner, session_id="txn-test")
+            with pytest.raises(RuntimeError, match="simulated milestone insert failure"):
+                await _add_milestone(ctx, input_)
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                text("SELECT COUNT(*) FROM milestones WHERE collaboration_id = :cid"),
+                {"cid": str(collab_id)},
+            )
+            assert result.scalar_one() == 0
+    finally:
+        await cleanup_users(owner.id)
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_failure_leaves_prior_state_intact(monkeypatch):
+    """5. Milestone update failure leaves the prior milestone state intact."""
+    from api.graphql import _update_milestone
+
+    owner = await create_and_commit_user("txn_mstone_upd_owner")
+    collab = Collaboration(
+        initiator_id=owner.id,
+        title="Milestone Update Txn Collab",
+        status=CollaborationStatus.PROPOSED,
+    )
+    async with async_session_factory() as session:
+        session.add(collab)
+        await session.flush()
+        milestone = Milestone(
+            collaboration_id=collab.id,
+            title="Original Title",
+            description="Original description",
+            status=MilestoneStatus.PENDING,
+            sort_order=0,
+        )
+        session.add(milestone)
+        await session.commit()
+        milestone_id = milestone.id
+
+    async def fail_update_milestone(self, m):
+        raise RuntimeError("simulated milestone update failure")
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.update_milestone",
+        fail_update_milestone,
+    )
+
+    update_input = SimpleNamespace(
+        title="Changed Title", description=None, status=None, due_date=None
+    )
+
+    try:
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=owner, session_id="txn-test")
+            with pytest.raises(RuntimeError, match="simulated milestone update failure"):
+                await _update_milestone(ctx, str(milestone_id), update_input)
+
+        # Verify from an independent session: the prior title/description survived.
+        async with async_session_factory() as session:
+            result = await session.execute(
+                text("SELECT title, description, status FROM milestones WHERE id = :id"),
+                {"id": str(milestone_id)},
+            )
+            row = result.one()
+            assert row.title == "Original Title"
+            assert row.description == "Original description"
+            assert row.status == MilestoneStatus.PENDING.value
+    finally:
+        await cleanup_users(owner.id)
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration_failure_leaves_database_consistent():
+    """1 / 7. Accept failure rolls back participant/collaboration changes; DB stays consistent."""
+    initiator = await create_and_commit_user("txn_accept_init")
+    participant_user = await create_and_commit_user("txn_accept_part")
+    collab_id = await create_and_commit_pending_collaboration(
+        initiator.id, participant_user.id
+    )
+
+    async def fail_update_participant(self, participant):
+        raise RuntimeError("simulated participant update failure")
+
+    try:
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=participant_user, session_id="txn-test")
+            monkeypatch_target = CollaborationRepository.update_participant
+            CollaborationRepository.update_participant = fail_update_participant
+            try:
+                with pytest.raises(RuntimeError, match="simulated participant update failure"):
+                    await _accept_collaboration(ctx, collab_id)
+            finally:
+                CollaborationRepository.update_participant = monkeypatch_target
+
+        # Verify from an independent session: still PROPOSED, participant still pending.
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            collab = await repo.get_by_id(collab_id)
+            assert collab.status == CollaborationStatus.PROPOSED
+
+            participant = await repo.get_participant(collab_id, participant_user.id)
+            assert participant is not None
+            assert participant.accepted is False
+    finally:
+        await cleanup_users(initiator.id, participant_user.id)
+
+
+@pytest.mark.asyncio
+async def test_decline_collaboration_failure_leaves_database_consistent():
+    """2 / 7. Decline failure rolls back participant deletion/status changes."""
+    initiator = await create_and_commit_user("txn_decline_init")
+    participant_user = await create_and_commit_user("txn_decline_part")
+    collab_id = await create_and_commit_pending_collaboration(
+        initiator.id, participant_user.id
+    )
+
+    async def fail_remove_participant(self, participant):
+        raise RuntimeError("simulated participant delete failure")
+
+    try:
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=participant_user, session_id="txn-test")
+            monkeypatch_target = CollaborationRepository.remove_participant
+            CollaborationRepository.remove_participant = fail_remove_participant
+            try:
+                with pytest.raises(RuntimeError, match="simulated participant delete failure"):
+                    await _decline_collaboration(ctx, collab_id)
+            finally:
+                CollaborationRepository.remove_participant = monkeypatch_target
+
+        # Verify from an independent session: still PROPOSED, participant row survives.
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            collab = await repo.get_by_id(collab_id)
+            assert collab.status == CollaborationStatus.PROPOSED
+
+            participant = await repo.get_participant(collab_id, participant_user.id)
+            assert participant is not None
+            assert participant.accepted is False
+    finally:
+        await cleanup_users(initiator.id, participant_user.id)
 

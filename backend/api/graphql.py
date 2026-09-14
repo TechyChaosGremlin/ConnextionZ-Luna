@@ -4160,41 +4160,49 @@ async def _create_collaboration(ctx, input) -> CollaborationType:
         budget_max=input.budget_max,
         budget_currency=input.budget_currency or "USD",
     )
-    await repo.create(collab)
+    try:
+        await repo.create(collab)
 
-    # Add participants
-    for pid in input.participant_ids:
-        if pid != user.id:
-            participant = CollaborationParticipant(
-                collaboration_id=collab.id,
-                user_id=pid,
-                role="participant",
-            )
-            await repo.add_participant(participant)
+        # Add participants
+        for pid in input.participant_ids:
+            if pid != user.id:
+                participant = CollaborationParticipant(
+                    collaboration_id=collab.id,
+                    user_id=pid,
+                    role="participant",
+                )
+                await repo.add_participant(participant)
 
-    # Add initiator as accepted participant
-    initiator_participant = CollaborationParticipant(
-        collaboration_id=collab.id,
-        user_id=user.id,
-        role="initiator",
-        accepted=True,
-        accepted_at=datetime.now(timezone.utc).isoformat(),
-    )
-    await repo.add_participant(initiator_participant)
+        # Add initiator as accepted participant
+        initiator_participant = CollaborationParticipant(
+            collaboration_id=collab.id,
+            user_id=user.id,
+            role="initiator",
+            accepted=True,
+            accepted_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await repo.add_participant(initiator_participant)
 
-    await ctx.db.commit()
-    await ctx.db.refresh(collab)
+        await ctx.db.commit()
+        await ctx.db.refresh(collab)
+    except Exception:
+        await ctx.db.rollback()
+        raise
 
     from app.models.analytics import EventType
     from services.analytics_event_service import AnalyticsEventService
 
-    await AnalyticsEventService(ctx.db).track_event(
-        event_type=EventType.COLLAB_CREATED,
-        user=user,
-        session_id=ctx.session_id,
-        metadata={"collaboration_id": str(collab.id), "participant_count": len(input.participant_ids)},
-    )
-    await ctx.db.commit()
+    try:
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.COLLAB_CREATED,
+            user=user,
+            session_id=ctx.session_id,
+            metadata={"collaboration_id": str(collab.id), "participant_count": len(input.participant_ids)},
+        )
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
 
     return _collaboration_to_gql(collab)
 
@@ -4357,9 +4365,13 @@ async def _add_milestone(ctx, input) -> MilestoneType:
         status=MilestoneStatus.PENDING,
         due_at=input.due_date.isoformat() if input.due_date else None,
     )
-    
-    await repo.add_milestone(milestone)
-    await ctx.db.commit()
+
+    try:
+        await repo.add_milestone(milestone)
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
     return _milestone_to_gql(milestone)
 
 
@@ -4402,8 +4414,12 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     if input.due_date is not None:
         milestone.due_at = input.due_date.isoformat()
 
-    await repo.update_milestone(milestone)
-    await ctx.db.commit()
+    try:
+        await repo.update_milestone(milestone)
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
     return _milestone_to_gql(milestone)
 
 def _messaging_write(handler):
