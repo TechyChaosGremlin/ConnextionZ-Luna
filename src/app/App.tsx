@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { TrendingSounds } from "./TrendingSounds";
 import { AuthFlow } from "./Auth";
 import { SettingsScreen, DeleteProfileModal } from "./Settings";
+import { UploadScreen } from "./Upload";
 import { type Account, getSession, endSession } from "./auth-store";
 import { GoLiveSetup, CreatorLiveView, ViewerLiveView, LiveBannerStrip } from "./LiveStream";
 import { InboxScreen } from "./Inbox";
@@ -9,10 +10,11 @@ import { ThemeContext, useTheme } from "./ThemeContext";
 import { creatorById, type FeedVideo } from "./creators";
 import { useFeed } from "./feed-store";
 import { addComment, deleteComment, editComment, fetchComments, likeComment, reportComment, type GraphQLComment, trackPostWatch, unlikeComment } from "./profile-graphql";
-import { activateFollowGraph } from "./follow-store";
+import { activateFollowGraph, useFollow } from "./follow-store";
 import { activateLikeGraph, useLike } from "./like-store";
 import { activateSaveGraph, useSave } from "./save-store";
 import { activateShareGraph, useShare } from "./share-store";
+import { activatePosts } from "./posts-store";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Heart, MessageCircle, Bookmark, Music,
@@ -557,12 +559,33 @@ function ActionRail({
   video: DisplayVideo; liked: boolean; likeCount: number; saved: boolean; saveCount: number; commentCount: number; shareCount: number;
   onLike: () => void; onSave: () => void; onCollab: () => void; onComment: () => void; onShare: () => void;
 }) {
+  const followState = useFollow(video.creatorId);
+
   return (
-    <div className="flex flex-col items-center gap-5 lg:gap-6 absolute right-6 lg:right-8 top-1/2 -translate-y-1/2 z-10">
+    <div
+      className="flex flex-col items-center gap-5 lg:gap-6 absolute right-6 lg:right-8 top-1/2 -translate-y-1/2 z-10"
+      onClick={(event) => event.stopPropagation()}
+    >
       <div className="relative mb-1">
-        <img src={video.avatarUrl} alt={video.username} className="w-11 h-11 rounded-full object-cover border-2 border-white" />
-        <div className="absolute -bottom-2 left-1/2 -translate-x-1/2 w-5 h-5 rounded-full flex items-center justify-center text-white text-xs font-bold"
-          style={{ background: "#00AEEF", boxShadow: "0 2px 8px rgba(0,174,239,0.5)" }}>+</div>
+        <button
+          type="button"
+          onClick={() => { void followState.toggle(); }}
+          disabled={followState.pending}
+          aria-label={followState.following ? `Unfollow @${video.username}` : `Follow @${video.username}`}
+          className="block rounded-full"
+        >
+          <img src={video.avatarUrl} alt={video.username} className="w-11 h-11 rounded-full object-cover border-2 border-white" />
+        </button>
+        <button
+          type="button"
+          onClick={() => { void followState.toggle(); }}
+          disabled={followState.pending}
+          aria-label={followState.following ? `Unfollow @${video.username}` : `Follow @${video.username}`}
+          className="absolute -bottom-2 left-1/2 -translate-x-1/2 w-5 h-5 rounded-full flex items-center justify-center text-white text-xs font-bold"
+          style={{ background: followState.following ? "#18b981" : "#00AEEF", boxShadow: "0 2px 8px rgba(0,174,239,0.5)" }}
+        >
+          {followState.following ? "✓" : "+"}
+        </button>
       </div>
       <motion.button whileTap={{ scale: 0.85 }} onClick={onLike} className="flex flex-col items-center gap-1">
         <motion.div animate={liked ? { scale: [1, 1.35, 1] } : {}} transition={{ duration: 0.25 }}>
@@ -808,7 +831,7 @@ export default function App() {
   const [screen, setScreen] = useState<"feed" | "discover" | "profile" | "inbox">("feed");
   const [feedTab, setFeedTab] = useState<"forYou" | "following">("forYou");
   const [showDeleteModal, setShowDeleteModal] = useState(false);
-  const [liveMode, setLiveMode] = useState<"off" | "setup" | "creator" | "viewer">("off");
+  const [liveMode, setLiveMode] = useState<"off" | "setup" | "creator" | "viewer" | "upload">("off");
   const [liveTitle, setLiveTitle] = useState("");
   const [idx, setIdx] = useState(0);
   const [dir, setDir] = useState(1);
@@ -823,11 +846,12 @@ export default function App() {
   const { items: feedItems, status: feedStatus, error: feedError, loadMore, reachedEnd, reload } = useFeed(feedTab === "following");
 
   useEffect(() => {
-    activateFollowGraph(account.email);
-    activateLikeGraph(account.email);
-    activateSaveGraph(account.email);
-    activateShareGraph(account.email);
-  }, [account.email]);
+    activatePosts(account?.email ?? null);
+    activateFollowGraph(account?.email ?? null);
+    activateLikeGraph(account?.email ?? null);
+    activateSaveGraph(account?.email ?? null);
+    activateShareGraph(account?.email ?? null);
+  }, [account?.email]);
 
   // The two top-bar tabs are the same feed filtered, so switching them restarts
   // at the first video rather than leaving `idx` past the end of a shorter list.
@@ -1048,7 +1072,7 @@ export default function App() {
               if (id === "search") setScreen("discover");
               else if (id === "profile") setScreen("profile");
               else if (id === "inbox") setScreen("inbox");
-              else if (id === "create") setLiveMode("setup");
+              else if (id === "create") setLiveMode("upload");
               else setScreen("feed");
             }}
           />
@@ -1142,6 +1166,12 @@ export default function App() {
           {screen === "feed" && liveMode === "off" && (
             <LiveBannerStrip onCreate={() => setLiveMode("setup")} onWatch={() => setLiveMode("viewer")} />
           )}
+
+          <AnimatePresence>
+            {liveMode === "upload" && (
+              <UploadScreen key="upload" onClose={() => setLiveMode("off")} />
+            )}
+          </AnimatePresence>
 
           <AnimatePresence>
             {liveMode === "setup" && (

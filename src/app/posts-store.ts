@@ -250,18 +250,11 @@ export async function publishPost(
   // for the decode. A clip that refuses to give up a frame still posts.
   const poster = await capturePoster(media, Math.min(1, media.durationSec / 3));
 
-  const uploadedMedia = await fetch(media.url)
-    .then((response) => response.blob())
-    .then((blob) => uploadPostMediaFile(blob, media.name));
-  const uploadedPoster = poster
-    ? await fetch(poster).then((response) => response.blob()).then((blob) => uploadPostMediaFile(blob, "poster.jpg"))
-    : null;
-
   const post: OwnPost = {
     id: uid(),
     kind: media.kind,
     createdAt: Date.now(),
-    thumbnail: uploadedPoster?.url ?? poster ?? "",
+    thumbnail: poster ?? "",
     caption: draft.caption.trim(),
     hashtags: draft.hashtags,
     audio: draft.audio.trim() || "Original Sound",
@@ -274,14 +267,17 @@ export async function publishPost(
     comments: 0,
     shares: 0,
     saves: 0,
-    mediaUrl: uploadedMedia?.url ?? uploaded.value,
+    mediaUrl: uploaded.value,
     ...(draft.scheduledAt ? { status: "scheduled", scheduledAt: draft.scheduledAt } : {}),
     ...(draft.collabWith ? { collabWith: draft.collabWith } : {}),
   };
 
-  const backendPost = uploadedMedia && uploadedPoster ? await createBackendPost({
-    mediaId: uploadedMedia.id,
-    thumbnailMediaId: uploadedPoster.id,
+  const backendPost = await createBackendPost({
+    // The current backend creates the post before associating uploaded media.
+    // These IDs remain required by the legacy GraphQL input but are ignored by
+    // its resolver until media is attached through /media/posts/{postId}.
+    mediaId: crypto.randomUUID(),
+    thumbnailMediaId: crypto.randomUUID(),
     caption: post.caption,
     hashtags: post.hashtags,
     audio: post.audio,
@@ -292,11 +288,20 @@ export async function publishPost(
     ...(post.status ? { status: post.status } : {}),
     ...(post.scheduledAt ? { scheduledAt: post.scheduledAt } : {}),
     ...(post.collabWith ? { collabWith: post.collabWith } : {}),
-  }) : null;
+  });
   if (backendPost) {
     post.id = backendPost.id;
     post.views = backendPost.views;
     post.likes = backendPost.likes;
+
+    const uploadedMedia = await fetch(media.url)
+      .then((response) => response.blob())
+      .then((blob) => uploadPostMediaFile(blob, media.name, backendPost.id));
+    const uploadedPoster = poster
+      ? await fetch(poster).then((response) => response.blob()).then((blob) => uploadPostMediaFile(blob, "poster.jpg", backendPost.id))
+      : null;
+    if (uploadedMedia) post.mediaUrl = uploadedMedia.url;
+    if (uploadedPoster) post.thumbnail = uploadedPoster.url;
   }
 
   const previous = posts;

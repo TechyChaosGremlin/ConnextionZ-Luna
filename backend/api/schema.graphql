@@ -516,6 +516,12 @@ type AnalyticsSummary {
   totalLikes: Int!
   totalComments: Int!
   totalShares: Int!
+  totalSaves: Int!
+  uniqueViewers: Int!
+  totalUploads: Int!
+  totalPublishedVideos: Int!
+  avgWatchTime: Float
+  completionRate: Float
 
   # Audience
   followerGrowth: Int!
@@ -525,11 +531,25 @@ type AnalyticsSummary {
   # Earnings / Collaboration
   activeCollaborations: Int!
   completedCollaborations: Int!
+  totalCollaborationRequests: Int!
+  pendingCollaborations: Int!
+  acceptedCollaborations: Int!
+  declinedCollaborations: Int!
+  cancelledCollaborations: Int!
+  collaborationAcceptanceRate: Float
+  collaborationCompletionRate: Float
+  averageResponseHours: Float
+  collaborationSuccessRate: Float
   totalEarnings: Float
   earningsCurrency: String!
 
   # Engagement rate
   engagementRate: Float!
+  viewsGrowthPct: Float
+  likesGrowthPct: Float
+  commentsGrowthPct: Float
+  sharesGrowthPct: Float
+  followersGrowthPct: Float
 
   # Per-post analytics
   topPosts: [PostAnalytics!]
@@ -541,8 +561,125 @@ type PostAnalytics {
   likes: Int!
   comments: Int!
   shares: Int!
+  uniqueViewers: Int!
+  saves: Int!
   avgWatchTime: Float
   completionRate: Float
+  engagementRate: Float!
+  followersGenerated: Int
+}
+
+type AnalyticsTrendPoint {
+  date: String!
+  views: Int!
+  likes: Int!
+  comments: Int!
+  shares: Int!
+  saves: Int!
+  followersGained: Int!
+  collaborationsRequested: Int!
+  collaborationsPending: Int!
+  collaborationsAccepted: Int!
+  collaborationsInProgress: Int!
+  collaborationsDeclined: Int!
+  collaborationsCompleted: Int!
+  collaborationsCancelled: Int!
+}
+
+type PlatformAnalytics {
+  periodStart: DateTime!
+  periodEnd: DateTime!
+  totalUsers: Int!
+  newUsers: Int!
+  totalCreators: Int!
+  newCreators: Int!
+  activeUsers: Int!
+  activeCreators: Int!
+  dailyActiveUsers: Int
+  weeklyActiveUsers: Int
+  monthlyActiveUsers: Int
+  totalUploads: Int!
+  totalPublishedVideos: Int!
+  totalViews: Int!
+  uniqueViewers: Int!
+  totalLikes: Int!
+  totalComments: Int!
+  totalShares: Int!
+  totalSaves: Int!
+  profileViews: Int!
+  soundsUsed: Int!
+  collabsCreated: Int!
+  followsCreated: Int!
+  followsRemoved: Int!
+  netFollowers: Int!
+  averageViewsPerPublishedVideo: Float
+  engagementRate: Float!
+  averageWatchTime: Float
+  completionRate: Float
+  feedImpressions: Int!
+  videoCompletions: Int!
+  videoSkips: Int!
+  searches: Int!
+  searchers: Int!
+  notificationsGenerated: Int
+  notificationsOpened: Int!
+  notificationOpenRate: Float
+  approvedContent: Int!
+  flaggedContent: Int!
+  removedContent: Int!
+  comparison: PlatformAnalyticsComparison
+}
+
+type PlatformAnalyticsComparison {
+  userGrowthPct: Float
+  creatorGrowthPct: Float
+  contentGrowthPct: Float
+  viewsGrowthPct: Float
+  engagementGrowthPct: Float
+  activeUsersGrowthPct: Float
+}
+
+type PlatformAnalyticsTrend {
+  date: String!
+  uploads: Int!
+  publishedVideos: Int!
+  views: Int!
+  completedViews: Int!
+  engagement: Int!
+  likes: Int!
+  comments: Int!
+  shares: Int!
+  saves: Int!
+  follows: Int!
+  followsRemoved: Int!
+  netFollows: Int!
+  profileViews: Int!
+  collabs: Int!
+  impressions: Int!
+  searches: Int!
+  notificationsOpened: Int!
+}
+
+type PlatformContentAnalytics {
+  post: PlatformContentPost!
+  views: Int!
+  uniqueViewers: Int!
+  likes: Int!
+  comments: Int!
+  shares: Int!
+  saves: Int!
+  averageWatchTime: Float
+  completionRate: Float
+  engagementRate: Float!
+}
+
+type PlatformContentPost {
+  id: UUID!
+  title: String
+  caption: String
+  thumbnail: String
+  mediaUrl: String
+  publishedAt: DateTime
 }
 
 # ---- Auth Payload (Feature: Auth) ----
@@ -1023,6 +1160,28 @@ type Query {
   creatorAnalytics(
     period: AnalyticsPeriod!
   ): AnalyticsSummary!
+
+  creatorVideoAnalytics(
+    period: AnalyticsPeriod!
+    sortBy: String = "recent"
+  ): [PostAnalytics!]!
+
+  creatorAnalyticsTrends(
+    period: AnalyticsPeriod!
+  ): [AnalyticsTrendPoint!]!
+
+  platformAnalytics(
+    period: AnalyticsPeriod!
+  ): PlatformAnalytics!
+
+  platformAnalyticsTrends(
+    period: AnalyticsPeriod!
+  ): [PlatformAnalyticsTrend!]!
+
+  platformTopContent(
+    period: AnalyticsPeriod!
+    sortBy: String = "views"
+  ): [PlatformContentAnalytics!]!
 
   """
   Get analytics for a specific post.

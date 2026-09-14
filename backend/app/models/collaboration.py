@@ -9,7 +9,16 @@ from __future__ import annotations
 import enum
 import uuid
 
-from sqlalchemy import Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -37,11 +46,11 @@ class MilestoneStatus(str, enum.Enum):
 
 # ── Collaboration ────────────────────────────────────────────────
 
-
 class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
     """A collaboration between two or more creators."""
 
     __tablename__ = "collaborations"
+    status_choices = tuple(status.value for status in CollaborationStatus)
 
     # Initiator
     initiator_id: Mapped[uuid.UUID] = mapped_column(
@@ -95,10 +104,7 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
         cascade="all, delete-orphan",
     )
 
-    def _update_collaboration(
-        self,
-        new_status: CollaborationStatus | str,
-    ) -> None:
+    def _update_collaboration(self, new_status: CollaborationStatus | str) -> None:
         """Validate and apply a collaboration status transition."""
         try:
             next_status = CollaborationStatus(new_status)
@@ -124,8 +130,7 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
 
         if next_status not in allowed_transitions.get(self.status, set()):
             raise ValueError(
-                f"Invalid status transition from current status: "
-                f"{self.status.value}"
+                f"Invalid status transition from current status: {self.status.value}"
             )
 
         self.status = next_status
@@ -143,9 +148,7 @@ class CollaborationParticipant(Base, TimestampMixin):
     __tablename__ = "collaboration_participants"
     __table_args__ = (
         UniqueConstraint(
-            "collaboration_id",
-            "user_id",
-            name="uq_collaboration_participant",
+            "collaboration_id", "user_id", name="uq_collaboration_participant"
         ),
     )
 
@@ -165,7 +168,7 @@ class CollaborationParticipant(Base, TimestampMixin):
     role: Mapped[str] = mapped_column(
         String(64), default="participant", nullable=False
     )  # "initiator", "participant", "sponsor"
-    accepted: Mapped[bool] = mapped_column(default=False, nullable=False)
+    accepted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     accepted_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Relationships

@@ -36,7 +36,12 @@ class Permission(str, Enum):
     MODERATE_CONTENT = "moderate_content"
 
     # Collaboration
+    VIEW_COLLABORATION = "view_collaboration"
+    READ_COLLABORATION = "view_collaboration"  # Alias for partner apps using read semantics
     CREATE_COLLABORATION = "create_collaboration"
+    JOIN_COLLABORATION = "join_collaboration"
+    UPDATE_COLLABORATION = "update_collaboration"
+    DELETE_COLLABORATION = "delete_collaboration"
     MANAGE_COLLABORATION = "manage_collaboration"
 
     # Reputation
@@ -53,6 +58,7 @@ ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
     UserRole.GUEST: {
         Permission.READ_CONTENT,
         Permission.READ_USER,
+        Permission.VIEW_COLLABORATION,
     },
     UserRole.USER: {
         Permission.READ_CONTENT,
@@ -60,7 +66,9 @@ ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
         Permission.CREATE_CONTENT,
         Permission.UPDATE_CONTENT,  # Own content only
         Permission.DELETE_CONTENT,  # Own content only
+        Permission.VIEW_COLLABORATION,
         Permission.CREATE_COLLABORATION,
+        Permission.JOIN_COLLABORATION,
         Permission.VIEW_REPUTATION,
     },
     UserRole.CREATOR: {
@@ -69,7 +77,11 @@ ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
         Permission.CREATE_CONTENT,
         Permission.UPDATE_CONTENT,
         Permission.DELETE_CONTENT,
+        Permission.VIEW_COLLABORATION,
         Permission.CREATE_COLLABORATION,
+        Permission.JOIN_COLLABORATION,
+        Permission.UPDATE_COLLABORATION,
+        Permission.DELETE_COLLABORATION,
         Permission.MANAGE_COLLABORATION,
         Permission.VIEW_REPUTATION,
         Permission.MODERATE_CONTENT,  # Own content

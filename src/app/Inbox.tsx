@@ -23,7 +23,7 @@ export function InboxScreen({ onBack }: { onBack: () => void }) {
     setCelebratingUser(req.username);
   };
 
-  const ignoreRequest = (id: string) => {
+  const declineRequest = (id: string) => {
     setRequests((prev) => prev.filter((r) => r.id !== id));
   };
 
@@ -101,7 +101,7 @@ export function InboxScreen({ onBack }: { onBack: () => void }) {
                   <p className="text-[12px] font-semibold uppercase tracking-widest" style={{ color: D.sectionLabel }}>{requests.length} pending request{requests.length !== 1 ? "s" : ""}</p>
                   <AnimatePresence>
                     {requests.map((req) => (
-                      <RequestCard key={req.id} req={req} onAccept={() => acceptRequest(req)} onIgnore={() => ignoreRequest(req.id)} />
+                      <RequestCard key={req.id} req={req} onAccept={() => acceptRequest(req)} onDecline={() => declineRequest(req.id)} />
                     ))}
                   </AnimatePresence>
                 </>

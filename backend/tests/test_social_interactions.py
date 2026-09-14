@@ -63,6 +63,7 @@ def _stub_analytics(monkeypatch):
         return None
 
     monkeypatch.setattr("repositories.analytics_repository.AnalyticsRepository.record", noop_record)
+    monkeypatch.setattr("services.analytics_event_service.AnalyticsEventService.track_event", noop_record)
 
 
 class ContentionSession:

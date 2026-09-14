@@ -7,10 +7,10 @@ import type { CollabRequest } from "../seed/types";
 interface RequestCardProps {
   req: CollabRequest;
   onAccept: () => void;
-  onIgnore: () => void;
+  onDecline: () => void;
 }
 
-export function RequestCard({ req, onAccept, onIgnore }: RequestCardProps) {
+export function RequestCard({ req, onAccept, onDecline }: RequestCardProps) {
   const isDark = useTheme();
   const [expanded, setExpanded] = useState(false);
 
@@ -20,9 +20,9 @@ export function RequestCard({ req, onAccept, onIgnore }: RequestCardProps) {
   const metaBg =        isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.04)";
   const metaBorder =    isDark ? "1px solid rgba(255,255,255,0.1)" : "1px solid rgba(0,0,0,0.08)";
   const metaColor =     isDark ? "rgba(255,255,255,0.6)" : "rgba(10,14,26,0.55)";
-  const ignoreBg =      isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)";
-  const ignoreBorder =  isDark ? "1px solid rgba(255,255,255,0.08)" : "1px solid rgba(0,0,0,0.08)";
-  const ignoreColor =   isDark ? "rgba(255,255,255,0.5)" : "rgba(10,14,26,0.4)";
+  const declineBg =     isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)";
+  const declineBorder = isDark ? "1px solid rgba(255,255,255,0.08)" : "1px solid rgba(0,0,0,0.08)";
+  const declineColor =  isDark ? "rgba(255,255,255,0.5)" : "rgba(10,14,26,0.4)";
   const mutualColor =   isDark ? "rgba(255,255,255,0.4)" : "rgba(10,14,26,0.4)";
   const timeColor =     isDark ? "rgba(255,255,255,0.35)" : "rgba(10,14,26,0.35)";
 
@@ -86,10 +86,10 @@ export function RequestCard({ req, onAccept, onIgnore }: RequestCardProps) {
         </div>
 
         <div className="flex gap-2">
-          <motion.button whileTap={{ scale: 0.96 }} onClick={onIgnore}
+          <motion.button whileTap={{ scale: 0.96 }} onClick={onDecline}
             className="flex-1 py-3 rounded-2xl font-semibold text-[14px] flex items-center justify-center gap-1.5"
-            style={{ background: ignoreBg, border: ignoreBorder, color: ignoreColor }}>
-            <X className="w-4 h-4" /> Ignore
+            style={{ background: declineBg, border: declineBorder, color: declineColor }}>
+            <X className="w-4 h-4" /> Decline
           </motion.button>
           <motion.button whileTap={{ scale: 0.96 }} onClick={onAccept}
             className="flex-[2] py-3 rounded-2xl font-bold text-[14px] text-white flex items-center justify-center gap-1.5"

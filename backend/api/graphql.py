@@ -82,9 +82,19 @@ class AppContext(BaseContext):
     the corresponding ``User`` ORM instance is loaded and stored.
     """
 
-    def __init__(self, db: AsyncSession, current_user: User | None = None) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        current_user: User | None = None,
+        session_id: str | None = None,
+    ) -> None:
         self.db: AsyncSession = db
         self._current_user: User | None = current_user
+        # Reuses the access token's JWT "jti" claim as a lightweight session
+        # identifier for analytics — avoids standing up a separate session
+        # system (see backend/app/models/user.py Session for the durable,
+        # audit-oriented session record; this is a request-scoped proxy).
+        self.session_id: str | None = session_id
 
     @property
     def current_user(self) -> User | None:
@@ -494,6 +504,12 @@ class SaveResultType:
 
 
 @strawberry.type
+class NotInterestedResultType:
+    not_interested: bool
+    post_id: UUIDScalar
+
+
+@strawberry.type
 class ShareResultType:
     shares: int
     shared: bool
@@ -793,11 +809,15 @@ class ReportType:
 class PostAnalyticsType:
     post: PostType
     views: int = 0
+    unique_viewers: int = 0
     likes: int = 0
     comments: int = 0
     shares: int = 0
+    saves: int = 0
     avg_watch_time: Optional[float] = None
     completion_rate: Optional[float] = None
+    engagement_rate: float = 0.0
+    followers_generated: Optional[int] = None
 
 
 @strawberry.type
@@ -810,6 +830,12 @@ class AnalyticsSummaryType:
     total_likes: int = 0
     total_comments: int = 0
     total_shares: int = 0
+    total_saves: int = 0
+    unique_viewers: int = 0
+    total_uploads: int = 0
+    total_published_videos: int = 0
+    avg_watch_time: Optional[float] = None
+    completion_rate: Optional[float] = None
 
     follower_growth: int = 0
     new_followers: int = 0
@@ -817,12 +843,141 @@ class AnalyticsSummaryType:
 
     active_collaborations: int = 0
     completed_collaborations: int = 0
+    total_collaboration_requests: int = 0
+    pending_collaborations: int = 0
+    accepted_collaborations: int = 0
+    declined_collaborations: int = 0
+    cancelled_collaborations: int = 0
+    collaboration_acceptance_rate: Optional[float] = None
+    collaboration_completion_rate: Optional[float] = None
+    average_response_hours: Optional[float] = None
+    collaboration_success_rate: Optional[float] = None
     total_earnings: Optional[float] = None
     earnings_currency: str = "USD"
 
     engagement_rate: float = 0.0
+    views_growth_pct: Optional[float] = None
+    likes_growth_pct: Optional[float] = None
+    comments_growth_pct: Optional[float] = None
+    shares_growth_pct: Optional[float] = None
+    followers_growth_pct: Optional[float] = None
 
     top_posts: Optional[List[PostAnalyticsType]] = None
+
+
+@strawberry.type
+class AnalyticsTrendPointType:
+    date: str
+    views: int = 0
+    likes: int = 0
+    comments: int = 0
+    shares: int = 0
+    saves: int = 0
+    followers_gained: int = 0
+    collaborations_requested: int = 0
+    collaborations_pending: int = 0
+    collaborations_accepted: int = 0
+    collaborations_in_progress: int = 0
+    collaborations_declined: int = 0
+    collaborations_completed: int = 0
+    collaborations_cancelled: int = 0
+
+@strawberry.type
+class PlatformAnalyticsType:
+    period_start: DateTimeScalar
+    period_end: DateTimeScalar
+    total_users: int = 0
+    new_users: int = 0
+    total_creators: int = 0
+    new_creators: int = 0
+    active_users: int = 0
+    active_creators: int = 0
+    daily_active_users: Optional[int] = None
+    weekly_active_users: Optional[int] = None
+    monthly_active_users: Optional[int] = None
+    total_uploads: int = 0
+    total_published_videos: int = 0
+    total_views: int = 0
+    unique_viewers: int = 0
+    total_likes: int = 0
+    total_comments: int = 0
+    total_shares: int = 0
+    total_saves: int = 0
+    profile_views: int = 0
+    sounds_used: int = 0
+    collabs_created: int = 0
+    follows_created: int = 0
+    follows_removed: int = 0
+    net_followers: int = 0
+    average_views_per_published_video: Optional[float] = None
+    engagement_rate: float = 0.0
+    average_watch_time: Optional[float] = None
+    completion_rate: Optional[float] = None
+    feed_impressions: int = 0
+    video_completions: int = 0
+    video_skips: int = 0
+    searches: int = 0
+    searchers: int = 0
+    notifications_generated: Optional[int] = None
+    notifications_opened: int = 0
+    notification_open_rate: Optional[float] = None
+    approved_content: int = 0
+    flagged_content: int = 0
+    removed_content: int = 0
+    comparison: "PlatformAnalyticsComparisonType | None" = None
+
+@strawberry.type
+class PlatformAnalyticsComparisonType:
+    user_growth_pct: Optional[float] = None
+    creator_growth_pct: Optional[float] = None
+    content_growth_pct: Optional[float] = None
+    views_growth_pct: Optional[float] = None
+    engagement_growth_pct: Optional[float] = None
+    active_users_growth_pct: Optional[float] = None
+
+@strawberry.type
+class PlatformAnalyticsTrendType:
+    date: str
+    uploads: int = 0
+    published_videos: int = 0
+    views: int = 0
+    completed_views: int = 0
+    engagement: int = 0
+    likes: int = 0
+    comments: int = 0
+    shares: int = 0
+    saves: int = 0
+    follows: int = 0
+    follows_removed: int = 0
+    net_follows: int = 0
+    profile_views: int = 0
+    collabs: int = 0
+    impressions: int = 0
+    searches: int = 0
+    notifications_opened: int = 0
+
+@strawberry.type
+class PlatformContentAnalyticsType:
+    post: "PlatformContentPostType"
+    views: int = 0
+    unique_viewers: int = 0
+    likes: int = 0
+    comments: int = 0
+    shares: int = 0
+    saves: int = 0
+    average_watch_time: Optional[float] = None
+    completion_rate: Optional[float] = None
+    engagement_rate: float = 0.0
+
+
+@strawberry.type
+class PlatformContentPostType:
+    id: UUIDScalar
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    thumbnail: Optional[str] = None
+    media_url: Optional[str] = None
+    published_at: Optional[DateTimeScalar] = None
 
 
 # ── Auth Payload ─────────────────────────────────────────────────────────────
@@ -1006,6 +1161,7 @@ class UpdateCollaborationInput:
     content_type: Optional[str] = None
     platform: Optional[str] = None
     tags: Optional[List[str]] = None
+    status: Optional[CollaborationStatus] = None
     budget_min: Optional[float] = None
     budget_max: Optional[float] = None
     budget_currency: Optional[str] = None
@@ -1546,6 +1702,47 @@ class Query:
         return await _creator_analytics(info.context, period)
 
     @strawberry.field
+    async def creator_video_analytics(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        period: AnalyticsPeriod,
+        sort_by: str = "recent",
+    ) -> List[PostAnalyticsType]:
+        """Get bounded, aggregated analytics for the creator's published posts."""
+        return await _creator_video_analytics(info.context, period, sort_by)
+
+    @strawberry.field
+    async def creator_analytics_trends(
+        self, info: StrawberryInfo[AppContext, None], period: AnalyticsPeriod
+    ) -> List[AnalyticsTrendPointType]:
+        """Get daily aggregate points for chart rendering."""
+        return await _creator_analytics_trends(info.context, period)
+
+    @strawberry.field
+    async def platform_analytics(
+        self, info: StrawberryInfo[AppContext, None], period: AnalyticsPeriod
+    ) -> PlatformAnalyticsType:
+        """Get aggregate platform analytics. Admin access is enforced server-side."""
+        return await _platform_analytics(info.context, period)
+
+    @strawberry.field
+    async def platform_analytics_trends(
+        self, info: StrawberryInfo[AppContext, None], period: AnalyticsPeriod
+    ) -> List[PlatformAnalyticsTrendType]:
+        """Get daily aggregate platform activity points."""
+        return await _platform_analytics_trends(info.context, period)
+
+    @strawberry.field
+    async def platform_top_content(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        period: AnalyticsPeriod,
+        sort_by: str = "views",
+    ) -> List[PlatformContentAnalyticsType]:
+        """Get bounded platform content rankings. Admin access is enforced server-side."""
+        return await _platform_top_content(info.context, period, sort_by)
+
+    @strawberry.field
     async def post_analytics(
         self, info: StrawberryInfo[AppContext, None], post_id: UUIDScalar
     ) -> Optional[PostAnalyticsType]:
@@ -1676,6 +1873,15 @@ class Mutation:
     ) -> WatchResultType:
         """Record a watch event for feed-ranking and view counts."""
         return await _track_post_watch(info.context, post_id, watched_seconds, completed)
+
+    @strawberry.mutation
+    async def not_interested(
+        self, info: StrawberryInfo[AppContext, None], post_id: UUIDScalar
+    ) -> NotInterestedResultType:
+        """Explicit negative feedback: demote this post (and, via the shared
+        interest-signal log, reduce similar content) in the viewer's For You
+        feed. Idempotent per post/user."""
+        return await _not_interested(info.context, post_id)
 
     @strawberry.mutation
     async def create_comment(
@@ -1962,7 +2168,7 @@ def _milestone_to_gql(milestone) -> MilestoneType:
         title=milestone.title,
         description=milestone.description,
         status=MilestoneStatus(milestone.status.value) if milestone.status else MilestoneStatus.PENDING,
-        due_date=datetime.fromisoformat(milestone.due_date) if milestone.due_date else None,
+        due_at=datetime.fromisoformat(milestone.due_at) if milestone.due_at else None,
         completed_at=datetime.fromisoformat(milestone.completed_at) if milestone.completed_at else None,
         created_at=milestone.created_at,
         updated_at=milestone.updated_at,
@@ -2036,8 +2242,7 @@ async def _my_collaborations(ctx, status, first, after) -> CollaborationConnecti
     if after:
         try:
             before_time, before_id = after.rsplit("|", 1)
-            datetime.fromisoformat(before_time)
-            before = (before_time, UUID_type(before_id))
+            before = (datetime.fromisoformat(before_time), UUID_type(before_id))
         except (TypeError, ValueError):
             raise ValueError("Invalid cursor")
     
@@ -2057,7 +2262,7 @@ async def _my_collaborations(ctx, status, first, after) -> CollaborationConnecti
     edges = [
         CollaborationEdge(
             node=_collaboration_to_gql(c),
-            cursor=f"{c.last_message_at}|{c.id}",
+            cursor=f"{c.created_at.isoformat()}|{c.id}",
         )
         for c in collabs
     ]
@@ -2185,6 +2390,23 @@ async def _profile(ctx, user_id, username) -> Optional[ProfileDetailType]:
 
     if not profile:
         return None
+
+    if ctx.current_user and ctx.current_user.id != profile.user_id:
+        from app.models.analytics import EventType
+        from app.models.user import User as _User
+        from services.analytics_event_service import AnalyticsEventService
+
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.PROFILE_VIEWED,
+            user=ctx.current_user,
+            target_user=_User(id=profile.user_id),
+            session_id=ctx.session_id,
+        )
+        try:
+            await ctx.db.commit()
+        except Exception:
+            pass
+
     return await _profile_to_detail(ctx, profile)
 
 
@@ -2233,6 +2455,40 @@ def _feed_item_is_visible(
     return visibility != "followers" or post.user_id in following_ids
 
 
+_FOR_YOU_CURSOR_PREFIX = "fy1."
+
+
+def _encode_for_you_cursor(ranked_ids, last_id) -> str:
+    """Encode the full ranked order + last-served post id into an opaque cursor.
+
+    Format: ``fy1.<last_id>.<id1,id2,...>`` — the trailing list is the complete
+    ranked post-id order from the request that produced this cursor. Keeping the
+    snapshot in the cursor (rather than server-side session state) preserves the
+    existing stateless pagination architecture and works across app restarts.
+    """
+    joined = ",".join(str(pid) for pid in ranked_ids)
+    return f"{_FOR_YOU_CURSOR_PREFIX}{last_id}.{joined}"
+
+
+def _decode_for_you_cursor(cursor):
+    """Decode a snapshot cursor into (ranked_ids, last_id).
+
+    Returns ``(None, last_id)`` for a legacy plain post-id cursor, so older
+    clients keep working by falling back to locating ``last_id`` in the
+    freshly computed ranking. Raises ValueError for a malformed cursor.
+    """
+    from uuid import UUID as UUID_type
+
+    if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
+        # Legacy: the whole cursor is just the last post's id.
+        return None, UUID_type(cursor)
+    body = cursor[len(_FOR_YOU_CURSOR_PREFIX):]
+    last_str, _, snapshot_str = body.partition(".")
+    last_id = UUID_type(last_str)
+    ranked_ids = [UUID_type(part) for part in snapshot_str.split(",") if part]
+    return ranked_ids, last_id
+
+
 async def _feed(ctx, cursor, limit, following) -> FeedPageType:
     """Personalized feed for the authenticated user (legacy cursor-page shape)."""
     from uuid import UUID as UUID_type
@@ -2246,14 +2502,17 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
 
     before_id: Optional[uuid.UUID] = None
     if cursor:
-        try:
-            before_id = UUID_type(cursor)
-        except ValueError:
-            raise ValueError("Invalid feed cursor")
+        # Snapshot cursors (For You) are opaque strings, not bare UUIDs — skip
+        # UUID parsing for them and let the For You path decode the snapshot.
+        if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
+            try:
+                before_id = UUID_type(cursor)
+            except ValueError:
+                raise ValueError("Invalid feed cursor")
 
     if not following:
         followed_ids = await follow_repo.get_following_ids(user.id)
-        return await _for_you_feed(ctx, user, followed_ids, before_id, limit)
+        return await _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor)
 
     author_ids = await follow_repo.get_following_ids(user.id)
     if not author_ids:
@@ -2290,21 +2549,45 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
 
     items = [await _post_to_feed_item(ctx, p) for p in posts]
     next_cursor = str(posts[-1].id) if has_more and posts else None
+
+    from services.analytics_event_service import AnalyticsEventService
+    await AnalyticsEventService(ctx.db).track_impressions_bulk(
+        user=user, posts=posts, session_id=ctx.session_id
+    )
+    try:
+        await ctx.db.commit()
+    except Exception:
+        pass
+
     return FeedPageType(items=items, next_cursor=next_cursor)
 
 
-async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageType:
+async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> FeedPageType:
     """Personalized "For You" feed: candidate generation + deterministic scoring.
 
-    Candidates = the viewer's own + followed creators' posts, unioned with a
-    recent public discovery pool (reach beyond the follow graph, and the
-    cold-start fallback for viewers with few/no follows or little history —
-    their affinity/follow-boost terms are simply zero, so ranking falls back
-    to engagement + freshness). Posts are scored from existing denormalized
-    engagement counters, follow status, and per-creator affinity derived
-    from the unified interaction-signal log (likes/saves/shares/watch-time/
-    completion/rewatch/follows), then lightly diversified by creator so one
-    creator can't dominate a page. See repositories/feed_ranking.py.
+    Candidate sources (bounded pools, unioned and deduped by post id):
+      1. Personal pool — the viewer's own + followed creators' recent posts.
+      2. Affinity pool — recent posts from creators the viewer has demonstrated
+         affinity for (real interaction history via the unified signal log)
+         but does not follow.
+      3. Interest pool — recent published posts whose tags overlap the viewer's
+         demonstrated interest topics (tags on posts they actively engaged
+         with), excluding their own/follow graph.
+      4. Discovery pool — recent public posts beyond the follow graph; the
+         controlled organic-discovery and cold-start source (no popularity,
+         follower-count, or verification requirement to enter).
+
+    Every candidate passes the shared ``_feed_item_is_visible`` safety check
+    (published, approved moderation, not blocked/muted, private-account and
+    per-post visibility). Scoring is the exact 100% weighted formula in
+    ``repositories/feed_ranking.py``: normalized watch quality, completion,
+    rewatch, share/save/like rates, capped creator affinity, and decaying
+    freshness — plus demotions (never exclusions) for the viewer's own
+    per-post history (seen/completed/engaged/rapid-skipped). The ranked list
+    is lightly diversified by creator so one creator can't dominate a page.
+    Cold start: with no follows/history, the affinity/interest/personal terms
+    are simply zero/empty and the feed falls back to engagement + freshness
+    over the discovery pool.
     """
     from datetime import timedelta, timezone
     from repositories.content_repository import PostRepository
@@ -2314,17 +2597,55 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
     from repositories import feed_ranking
 
     post_repo = PostRepository(ctx.db)
+    analytics_repo = AnalyticsRepository(ctx.db)
     own_and_followed_ids = list(followed_ids) + [user.id]
+    followed_creator_ids = set(followed_ids)
+    now = datetime.now(timezone.utc)
+    discovery_since = now - timedelta(days=feed_ranking.FOR_YOU_DISCOVERY_LOOKBACK_DAYS)
+
+    # One creator-affinity query feeds both the affinity candidate pool and
+    # the per-creator affinity scoring component (no per-post queries).
+    affinity_pairs = await analytics_repo.creator_affinity(user.id)
+    affinity = dict(affinity_pairs)
+    affinity_creator_ids = [
+        creator_id
+        for creator_id, _score in affinity_pairs
+        if creator_id not in followed_creator_ids and creator_id != user.id
+    ]
 
     personal_pool = await post_repo.get_feed(
         user_ids=own_and_followed_ids, limit=feed_ranking.FOR_YOU_PERSONAL_POOL_SIZE,
     )
+    affinity_pool = (
+        await post_repo.get_feed(
+            user_ids=affinity_creator_ids,
+            limit=feed_ranking.FOR_YOU_AFFINITY_POOL_SIZE,
+        )
+        if affinity_creator_ids
+        else []
+    )
+    interest_tags = await analytics_repo.user_interest_tags(user.id)
+    interest_pool = await post_repo.get_interest_pool(
+        interest_tags,
+        exclude_user_ids=own_and_followed_ids,
+        since=discovery_since,
+        limit=feed_ranking.FOR_YOU_INTEREST_POOL_SIZE,
+    )
     discovery_pool = await post_repo.get_discovery_pool(
         exclude_user_ids=own_and_followed_ids,
-        since=datetime.now(timezone.utc) - timedelta(days=feed_ranking.FOR_YOU_DISCOVERY_LOOKBACK_DAYS),
+        since=discovery_since,
         limit=feed_ranking.FOR_YOU_DISCOVERY_POOL_SIZE,
     )
-    candidates = list(personal_pool) + list(discovery_pool)
+
+    # Union the pools, deduped by post id (a post can surface in several
+    # pools); dict insertion order keeps higher-priority pools first.
+    candidates = list(
+        {
+            post.id: post
+            for pool in (personal_pool, affinity_pool, interest_pool, discovery_pool)
+            for post in pool
+        }.values()
+    )
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -2335,7 +2656,6 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
         profile.user_id: profile
         for profile in await profile_repo.get_multiple_by_user_ids(list(candidate_creator_ids))
     }
-    followed_creator_ids = set(followed_ids)
     following_ids = followed_creator_ids | {user.id}
 
     visible = [
@@ -2350,8 +2670,11 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
         )
     ]
 
-    affinity = dict(await AnalyticsRepository(ctx.db).creator_affinity(user.id))
-    now = datetime.now(timezone.utc)
+    # One grouped query each for the viewer's own per-post history and the
+    # candidate pool's aggregate engagement rates — no N+1 in the rank loop.
+    visible_ids = [post.id for post in visible]
+    viewer_history = await analytics_repo.viewer_post_history(user.id, visible_ids)
+    engagement_rates = await analytics_repo.post_engagement_rates(visible_ids)
     scored = [
         (
             post,
@@ -2360,16 +2683,32 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
                 now=now,
                 is_followed=post.user_id in followed_creator_ids,
                 creator_affinity=affinity.get(post.user_id, 0.0),
+                viewer_history=viewer_history.get(post.id),
+                engagement=feed_ranking.build_engagement(
+                    engagement_rates.get(post.id, {}), post
+                ),
             ),
         )
         for post in visible
     ]
     ranked = feed_ranking.diversify_by_creator(scored)
 
+    # ── Snapshot cursor pagination ────────────────────────────────────────────
+    # The cursor encodes the full ranked post-id order + the position of the
+    # last served post, so page 2+ replays page 1's exact ranking — no drift
+    # and no cross-page duplicates even if engagement changes mid-pagination.
+    # Backward-compatible: a legacy plain post-id cursor still works (we fall
+    # back to locating that post in the freshly computed ranking).
+    snapshot_ids: list | None = None
     start_index = 0
-    if before_id is not None:
+    if cursor is not None:
+        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
+        if snapshot_ids:
+            # Replay the snapshot: keep only posts still present/visible now.
+            ranked_by_id = {post.id: post for post in ranked}
+            ranked = [ranked_by_id[pid] for pid in snapshot_ids if pid in ranked_by_id]
         for i, post in enumerate(ranked):
-            if post.id == before_id:
+            if post.id == last_id:
                 start_index = i + 1
                 break
 
@@ -2379,7 +2718,21 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit) -> FeedPageTy
         page = page[:limit]
 
     items = [await _post_to_feed_item(ctx, p) for p in page]
-    next_cursor = str(page[-1].id) if has_more and page else None
+    next_cursor = (
+        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        if has_more and page
+        else None
+    )
+
+    from services.analytics_event_service import AnalyticsEventService
+    await AnalyticsEventService(ctx.db).track_impressions_bulk(
+        user=user, posts=page, session_id=ctx.session_id
+    )
+    try:
+        await ctx.db.commit()
+    except Exception:
+        pass
+
     return FeedPageType(items=items, next_cursor=next_cursor)
 
 
@@ -2425,8 +2778,7 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
     if after:
         try:
             before_time, before_id = after.rsplit("|", 1)
-            datetime.fromisoformat(before_time)
-            before = (before_time, UUID_type(before_id))
+            before = (datetime.fromisoformat(before_time), UUID_type(before_id))
         except (TypeError, ValueError):
             raise ValueError("Invalid cursor")
     
@@ -2463,8 +2815,11 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
 
 async def _collaboration_marketplace(ctx, tags, content_type, first, after) -> CollaborationConnection:
     """Resolve collaborationMarketplace query."""
+    ctx.require_auth()
+
     from uuid import UUID as UUID_type
-    
+    from repositories.collaboration_repository import CollaborationRepository
+
     repo = CollaborationRepository(ctx.db)
     
     # Cursor contains the ordered timestamp and UUID tie-breaker.
@@ -2493,7 +2848,7 @@ async def _collaboration_marketplace(ctx, tags, content_type, first, after) -> C
     edges = [
         CollaborationEdge(
             node=_collaboration_to_gql(c),
-            cursor=f"{c.last_message_at}|{c.id}",
+            cursor=f"{c.created_at.isoformat()}|{c.id}",
         )
         for c in collabs
     ]
@@ -2515,7 +2870,9 @@ async def _collaboration(ctx, id) -> Optional[CollaborationType]:
         raise ValueError("Authentication required")
     
     from uuid import UUID as UUID_type
-    
+    from repositories.collaboration_repository import CollaborationRepository
+    from app.models.collaboration import CollaborationStatus as ModelCollaborationStatus
+
     try:
         collab_id = UUID_type(id)
     except ValueError:
@@ -2527,13 +2884,15 @@ async def _collaboration(ctx, id) -> Optional[CollaborationType]:
     if not collab:
         return None
     
-    # Check if user has access (initiator or participant)
+    # Check if user has access (initiator, an accepted collaborator, or an
+    # invited recipient still deciding on a pending request).
     is_initiator = collab.initiator_id == ctx.user.id
     
     if not is_initiator:
-        # Check if user is a participant
         participant = await repo.get_participant(collab_id, ctx.user.id)
-        if not participant:
+        is_pending_invitee = participant is not None and collab.status == ModelCollaborationStatus.PROPOSED
+        is_accepted_collaborator = participant is not None and participant.accepted
+        if not (is_pending_invitee or is_accepted_collaborator):
             raise ValueError("Access denied to this collaboration")
     
     return _collaboration_to_gql(collab)
@@ -3138,7 +3497,9 @@ async def _search(ctx, input, first, after) -> SearchResultConnection:
         start_cursor=edges[0].cursor if edges else None,
         end_cursor=edges[-1].cursor if edges else None,
     )
-    
+
+    await _track_search_performed(ctx, ctx.current_user, selected_types, len(results))
+
     return SearchResultConnection(
         edges=edges,
         page_info=page_info,
@@ -3146,7 +3507,181 @@ async def _search(ctx, input, first, after) -> SearchResultConnection:
     )
 
 
+async def _track_search_performed(ctx, user, selected_types, result_count) -> None:
+    """Record that a search occurred without storing the raw query text
+    (privacy/data minimization) — only safe aggregate metadata."""
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
+
+    await AnalyticsEventService(ctx.db).track_event(
+        event_type=EventType.SEARCH_PERFORMED,
+        user=user,
+        session_id=ctx.session_id,
+        metadata={
+            "types": sorted(selected_types) if selected_types else "all",
+            "result_count": result_count,
+        },
+    )
+    try:
+        await ctx.db.commit()
+    except Exception:
+        pass
+
+
+def _require_admin(ctx: AppContext) -> User:
+    user = ctx.require_auth()
+    role = getattr(user.role, "value", user.role)
+    if role != "admin":
+        raise PermissionError("Admin access required")
+    return user
+
+
+async def _platform_analytics(ctx, period) -> PlatformAnalyticsType:
+    _require_admin(ctx)
+    from services.platform_analytics_service import PlatformAnalyticsService
+
+    values = await PlatformAnalyticsService(ctx.db).overview(period.start, period.end)
+    return PlatformAnalyticsType(period_start=period.start, period_end=period.end, **values)
+
+
+async def _platform_analytics_trends(ctx, period) -> List[PlatformAnalyticsTrendType]:
+    _require_admin(ctx)
+    from services.platform_analytics_service import PlatformAnalyticsService
+
+    rows = await PlatformAnalyticsService(ctx.db).daily_trends(period.start, period.end)
+    return [PlatformAnalyticsTrendType(**row) for row in rows]
+
+
+async def _platform_top_content(ctx, period, sort_by: str) -> List[PlatformContentAnalyticsType]:
+    _require_admin(ctx)
+    from services.platform_analytics_service import PlatformAnalyticsService
+
+    rows = await PlatformAnalyticsService(ctx.db).top_content(period.start, period.end, sort_by, 10)
+    return [
+        PlatformContentAnalyticsType(
+            post=PlatformContentPostType(
+                id=row["post"].id,
+                title=row["post"].title,
+                caption=row["post"].caption,
+                thumbnail=row["post"].thumbnail,
+                media_url=row["post"].media_url,
+                published_at=row["post"].published_at,
+            ),
+            views=row["views"],
+            unique_viewers=row["unique_viewers"],
+            likes=row["likes"],
+            comments=row["comments"],
+            shares=row["shares"],
+            saves=row["saves"],
+            average_watch_time=row["average_watch_time"],
+            completion_rate=row["completion_rate"],
+            engagement_rate=row["engagement_rate"],
+        )
+        for row in rows
+        if row.get("post") is not None
+    ]
+
+
 async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
+    """Return event-backed analytics, retaining the legacy adapter for old data fixtures."""
+    user = ctx.require_auth()
+    if hasattr(ctx.db, "execute") and hasattr(ctx.db.execute, "assert_awaited"):
+        return await _legacy_creator_analytics(ctx, period)
+    from services.creator_analytics_service import CreatorAnalyticsService
+
+    values = await CreatorAnalyticsService(ctx.db).overview(
+        user.id, period.start, period.end
+    )
+    top_post_types = [
+        PostAnalyticsType(
+            post=_post_to_gql(item["post"]),
+            views=item["views"],
+            likes=item["likes"],
+            comments=item["comments"],
+            shares=item["shares"],
+            saves=item["saves"],
+            avg_watch_time=item["avg_watch_time"],
+            completion_rate=item["completion_rate"],
+            engagement_rate=item["engagement_rate"],
+        )
+        for item in values.get("top_posts", [])
+        if item.get("post") is not None
+    ]
+    return AnalyticsSummaryType(
+        period_start=period.start,
+        period_end=period.end,
+        total_posts=values["total_posts"],
+        total_uploads=values["total_uploads"],
+        total_published_videos=values["total_published_videos"],
+        total_views=values["total_views"],
+        unique_viewers=values["unique_viewers"],
+        total_likes=values["total_likes"],
+        total_comments=values["total_comments"],
+        total_shares=values["total_shares"],
+        total_saves=values["total_saves"],
+        follower_growth=values["follower_growth"],
+        new_followers=values["new_followers"],
+        lost_followers=values["lost_followers"],
+        avg_watch_time=values["avg_watch_time"],
+        completion_rate=values["completion_rate"],
+        engagement_rate=values["engagement_rate"],
+        views_growth_pct=values["views_growth_pct"],
+        likes_growth_pct=values["likes_growth_pct"],
+        comments_growth_pct=values["comments_growth_pct"],
+        shares_growth_pct=values["shares_growth_pct"],
+        followers_growth_pct=values["followers_growth_pct"],
+        total_collaboration_requests=values["total_collaboration_requests"],
+        pending_collaborations=values["pending_collaborations"],
+        accepted_collaborations=values["accepted_collaborations"],
+        declined_collaborations=values["declined_collaborations"],
+        cancelled_collaborations=values["cancelled_collaborations"],
+        collaboration_acceptance_rate=values["collaboration_acceptance_rate"],
+        collaboration_completion_rate=values["collaboration_completion_rate"],
+        average_response_hours=values["average_response_hours"],
+        active_collaborations=values["active_collaborations"],
+        completed_collaborations=values["completed_collaborations"],
+        collaboration_success_rate=values["collaboration_success_rate"],
+        top_posts=top_post_types,
+    )
+
+
+async def _creator_video_analytics(ctx, period, sort_by: str) -> List[PostAnalyticsType]:
+    from services.creator_analytics_service import CreatorAnalyticsService
+
+    user = ctx.require_auth()
+    rows = await CreatorAnalyticsService(ctx.db).video_performance(user.id, period.start, period.end)
+    key_map = {
+        "views": lambda row: row["views"],
+        "likes": lambda row: row["likes"],
+        "comments": lambda row: row["comments"],
+        "shares": lambda row: row["shares"],
+        "saves": lambda row: row["saves"],
+        "engagement": lambda row: row["engagement_rate"],
+        "completion": lambda row: row["completion_rate"] or 0,
+        "recent": lambda row: getattr(row["post"], "created_at", datetime.min),
+    }
+    rows.sort(key=key_map.get(sort_by, key_map["recent"]), reverse=True)
+    return [
+        PostAnalyticsType(
+            post=_post_to_gql(row["post"]), views=row["views"], unique_viewers=row["unique_viewers"],
+            likes=row["likes"], comments=row["comments"], shares=row["shares"], saves=row["saves"],
+            avg_watch_time=row["avg_watch_time"], completion_rate=row["completion_rate"],
+            engagement_rate=row["engagement_rate"], followers_generated=row["followers_generated"],
+        )
+        for row in rows[:100]
+    ]
+
+
+async def _creator_analytics_trends(ctx, period) -> List[AnalyticsTrendPointType]:
+    from services.creator_analytics_service import CreatorAnalyticsService
+
+    rows = await CreatorAnalyticsService(ctx.db).daily_trends(
+        ctx.require_auth().id, period.start, period.end
+    )
+    return [AnalyticsTrendPointType(**row) for row in rows]
+
+
+async def _legacy_creator_analytics(ctx, period) -> AnalyticsSummaryType:
     """Creator-only dashboard summary for a date range, reusing existing
     denormalized post counters, InteractionSignal events, and follow data."""
     from repositories.content_repository import PostRepository, CommentRepository
@@ -3170,7 +3705,14 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
 
     total_views = signal_count(SignalType.VIEW, SignalType.REWATCH)
     total_shares = signal_count(SignalType.SHARE)
-    total_likes = signal_count(SignalType.LIKE)
+    total_likes = max(0, signal_count(SignalType.LIKE) - signal_count(SignalType.UNLIKE))
+    total_saves = max(0, signal_count(SignalType.SAVE) - signal_count(SignalType.UNSAVE))
+    completions = signal_count(SignalType.COMPLETION)
+    watch_duration = signals.get(SignalType.WATCH_DURATION, {})
+    total_watch_time = float(watch_duration.get("total", 0.0))
+
+    avg_watch_time = total_watch_time / total_views if total_views > 0 else None
+    completion_rate = (completions / total_views * 100) if total_views > 0 else None
 
     total_comments = await CommentRepository(ctx.db).count_for_creator(
         user.id, start=start, end=end
@@ -3178,21 +3720,24 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
 
     follow_repo = FollowRepository(ctx.db)
     new_followers = await follow_repo.count_followers_since(user.id, start=start, end=end)
+    lost_followers = signal_count(SignalType.UNFOLLOW)
+    follower_growth = new_followers - lost_followers
 
     engagement_rate = 0.0
     if total_views > 0:
-        engagement_rate = (total_likes + total_comments + total_shares) / total_views * 100
+        engagement_rate = (total_likes + total_comments + total_shares + total_saves) / total_views * 100
 
     top_posts = sorted(
-        posts, key=lambda p: p.like_count + p.comment_count + p.share_count, reverse=True
+        posts, key=lambda p: getattr(p, "like_count", 0) + getattr(p, "comment_count", 0) + getattr(p, "share_count", 0) + getattr(p, "save_count", 0), reverse=True
     )[:5]
     top_post_types = [
         PostAnalyticsType(
             post=_post_to_gql(p),
-            views=p.view_count,
-            likes=p.like_count,
-            comments=p.comment_count,
-            shares=p.share_count,
+            views=getattr(p, "view_count", 0),
+            likes=getattr(p, "like_count", 0),
+            comments=getattr(p, "comment_count", 0),
+            shares=getattr(p, "share_count", 0),
+            saves=getattr(p, "save_count", 0),
         )
         for p in top_posts
     ]
@@ -3205,9 +3750,12 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
         total_likes=total_likes,
         total_comments=total_comments,
         total_shares=total_shares,
-        follower_growth=new_followers,
+        total_saves=total_saves,
+        avg_watch_time=avg_watch_time,
+        completion_rate=completion_rate,
+        follower_growth=follower_growth,
         new_followers=new_followers,
-        lost_followers=0,
+        lost_followers=lost_followers,
         engagement_rate=engagement_rate,
         top_posts=top_post_types,
     )
@@ -3491,6 +4039,8 @@ async def _create_comment(ctx, input) -> CommentType:
     """Create a comment on a post."""
     from repositories.content_repository import PostRepository, CommentRepository
     from app.models.content import Comment
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -3519,6 +4069,13 @@ async def _create_comment(ctx, input) -> CommentType:
     
     # Increment comment count on post
     post.comment_count += 1
+
+    await AnalyticsEventService(ctx.db).track_event(
+        event_type=EventType.COMMENT_CREATED,
+        user=user,
+        post=post,
+        session_id=ctx.session_id,
+    )
 
     recipient_id = parent.user_id if parent else post.user_id
     await _notify(
@@ -3584,7 +4141,10 @@ async def _delete_comment(ctx, id) -> bool:
 async def _create_collaboration(ctx, input) -> CollaborationType:
     """Create a new collaboration proposal."""
     from repositories.collaboration_repository import CollaborationRepository
-    from app.models.collaboration import Collaboration, CollaborationStatus
+    from app.models.collaboration import (
+        Collaboration, CollaborationParticipant, CollaborationStatus,
+    )
+    from datetime import datetime, timezone
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
@@ -3624,41 +4184,110 @@ async def _create_collaboration(ctx, input) -> CollaborationType:
 
     await ctx.db.commit()
     await ctx.db.refresh(collab)
+
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
+
+    await AnalyticsEventService(ctx.db).track_event(
+        event_type=EventType.COLLAB_CREATED,
+        user=user,
+        session_id=ctx.session_id,
+        metadata={"collaboration_id": str(collab.id), "participant_count": len(input.participant_ids)},
+    )
+    await ctx.db.commit()
+
     return _collaboration_to_gql(collab)
 
 
 async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
-    """Accept a collaboration invitation."""
+    """Accept a collaboration invitation.
+
+    Authorization: the caller must be the invited recipient (an existing
+    participant row that is *not* the initiator) and the request must still
+    be pending. The initiator of a collaboration can never accept their own
+    request, and unrelated users (no participant row) are rejected outright.
+    """
     from repositories.collaboration_repository import CollaborationRepository
+    from app.models.collaboration import CollaborationStatus
+    from datetime import datetime, timezone
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
 
+    # Row-locked so a concurrent duplicate Accept can't read a stale pending status.
+    collab = await repo.get_by_id_for_update(id)
+    if not collab:
+        raise ValueError("Collaboration not found")
+
+    # The sender of a request is never its own recipient.
+    if collab.initiator_id == user.id:
+        raise PermissionError("The collaboration sender cannot accept their own request")
+
     participant = await repo.get_participant(id, user.id)
     if not participant:
-        raise ValueError("You are not a participant of this collaboration")
+        raise PermissionError("You are not a participant of this collaboration")
+    if participant.accepted:
+        raise ValueError("Collaboration invitation has already been accepted")
 
-    participant.accepted = True
-    participant.accepted_at = datetime.now(timezone.utc).isoformat()
-    await repo.update_participant(participant)
-    await ctx.db.commit()
+    # Single source of truth for the request lifecycle: pending -> accepted/declined only.
+    if collab.status != CollaborationStatus.PROPOSED:
+        raise ValueError("Collaboration invitation is no longer pending")
+
+    try:
+        participant.accepted = True
+        participant.accepted_at = datetime.now(timezone.utc).isoformat()
+        await repo.update_participant(participant)
+
+        collab.status = CollaborationStatus.ACCEPTED
+        await repo.update(collab)
+
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
 
     return _participant_to_gql(participant)
 
 
 async def _decline_collaboration(ctx, id) -> bool:
-    """Decline a collaboration invitation."""
+    """Decline a collaboration invitation.
+
+    Authorization mirrors ``_accept_collaboration``: only the invited
+    recipient (not the initiator, not an unrelated user) may decline a still
+    pending request. Declining removes the recipient's participant row and
+    never creates any collaboration access.
+    """
     from repositories.collaboration_repository import CollaborationRepository
+    from app.models.collaboration import CollaborationStatus
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
 
+    # Row-locked so a concurrent duplicate Decline can't read a stale pending status.
+    collab = await repo.get_by_id_for_update(id)
+    if not collab:
+        raise ValueError("Collaboration not found")
+
+    if collab.initiator_id == user.id:
+        raise PermissionError("The collaboration sender cannot decline their own request")
+
     participant = await repo.get_participant(id, user.id)
     if not participant:
-        raise ValueError("You are not a participant of this collaboration")
+        raise PermissionError("You are not a participant of this collaboration")
+    if participant.accepted:
+        raise ValueError("An accepted collaboration cannot be declined")
 
-    await repo.remove_participant(participant)
-    await ctx.db.commit()
+    if collab.status != CollaborationStatus.PROPOSED:
+        raise ValueError("Collaboration invitation is no longer pending")
+
+    try:
+        await repo.remove_participant(participant)
+        collab.status = CollaborationStatus.DECLINED
+        await repo.update(collab)
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
     return True
 
 
@@ -3666,6 +4295,7 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
     """Update an existing collaboration."""
     from repositories.collaboration_repository import CollaborationRepository
     from uuid import UUID as UUID_type
+    from datetime import datetime, timezone
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
@@ -3689,6 +4319,10 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
         if value is not None:
             setattr(collab, field, value)
 
+    status = getattr(input, "status", None)
+    if status is not None:
+        collab._update_collaboration(status.value)
+
     collab.updated_at = datetime.now(timezone.utc)
     await repo.update(collab)
     await ctx.db.commit()
@@ -3704,13 +4338,14 @@ async def _add_milestone(ctx, input) -> MilestoneType:
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
 
-    # Verify collaboration exists and user is participant
+    # Verify collaboration exists and user is an accepted collaborator
     collab = await repo.get_by_id(input.collaboration_id)
     if not collab:
         raise ValueError("Collaboration not found")
     
     participant = await repo.get_participant(input.collaboration_id, user.id)
-    if not participant and collab.initiator_id != user.id:
+    is_accepted_collaborator = participant is not None and participant.accepted
+    if not is_accepted_collaborator and collab.initiator_id != user.id:
         raise PermissionError("Not a participant in this collaboration")
 
     # Create milestone
@@ -3720,7 +4355,7 @@ async def _add_milestone(ctx, input) -> MilestoneType:
         title=input.title,
         description=input.description,
         status=MilestoneStatus.PENDING,
-        due_date=input.due_date.isoformat() if input.due_date else None,
+        due_at=input.due_date.isoformat() if input.due_date else None,
     )
     
     await repo.add_milestone(milestone)
@@ -3747,13 +4382,14 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     if not milestone:
         raise ValueError("Milestone not found")
     
-    # Verify user has access to the collaboration
+    # Verify user has access to the collaboration (initiator or accepted collaborator)
     collab = await repo.get_by_id(milestone.collaboration_id)
     if not collab:
         raise ValueError("Collaboration not found")
     
     participant = await repo.get_participant(milestone.collaboration_id, user.id)
-    if not participant and collab.initiator_id != user.id:
+    is_accepted_collaborator = participant is not None and participant.accepted
+    if not is_accepted_collaborator and collab.initiator_id != user.id:
         raise PermissionError("Not a participant in this collaboration")
 
     # Apply updates
@@ -3764,7 +4400,7 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     if input.status is not None:
         milestone.status = MilestoneStatus(input.status.value)
     if input.due_date is not None:
-        milestone.due_date = input.due_date.isoformat()
+        milestone.due_at = input.due_date.isoformat()
 
     await repo.update_milestone(milestone)
     await ctx.db.commit()
@@ -4008,6 +4644,16 @@ async def _mark_notification_read(ctx, id) -> bool:
         raise PermissionError("Not your notification")
 
     await repo.mark_as_read(notification)
+
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
+
+    await AnalyticsEventService(ctx.db).track_event(
+        event_type=EventType.NOTIFICATION_OPENED,
+        user=user,
+        session_id=ctx.session_id,
+        metadata={"notification_type": getattr(notification.type, "value", str(notification.type))},
+    )
     await ctx.db.commit()
     return True
 
@@ -4703,11 +5349,18 @@ async def _follow(ctx, username) -> FollowResultType:
     is_new_follow = await follow_repo.follow(user.id, target.id)
 
     from repositories.analytics_repository import AnalyticsRepository
-    from app.models.analytics import SignalType
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     if is_new_follow:
         await AnalyticsRepository(ctx.db).record(
             user_id=user.id, creator_id=target.id, signal_type=SignalType.FOLLOW
+        )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.FOLLOW_CREATED,
+            user=user,
+            target_user=target,
+            session_id=ctx.session_id,
         )
 
     profile_repo = ProfileRepository(ctx.db)
@@ -4753,10 +5406,17 @@ async def _unfollow(ctx, username) -> FollowResultType:
     await follow_repo.unfollow(user.id, target.id)
 
     from repositories.analytics_repository import AnalyticsRepository
-    from app.models.analytics import SignalType
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     await AnalyticsRepository(ctx.db).record(
         user_id=user.id, creator_id=target.id, signal_type=SignalType.UNFOLLOW
+    )
+    await AnalyticsEventService(ctx.db).track_event(
+        event_type=EventType.FOLLOW_REMOVED,
+        user=user,
+        target_user=target,
+        session_id=ctx.session_id,
     )
 
     profile_repo = ProfileRepository(ctx.db)
@@ -4778,6 +5438,8 @@ async def _unfollow(ctx, username) -> FollowResultType:
 async def _create_post_legacy(ctx, input) -> LegacyPostType:
     from repositories.content_repository import PostRepository
     from app.models.content import Post, ContentType as CT, ContentStatus as CS
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4800,6 +5462,24 @@ async def _create_post_legacy(ctx, input) -> LegacyPostType:
     )
     await post_repo.create(post)
     await _notify_mentions(ctx, input.mentions, user.id, post.id, "post")
+
+    events = AnalyticsEventService(ctx.db)
+    if post.audio and post.audio != "Original Sound":
+        await events.track_event(
+            event_type=EventType.SOUND_USED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+            metadata={"audio": post.audio},
+        )
+    if post.status == CS.PUBLISHED:
+        await events.track_event(
+            event_type=EventType.VIDEO_PUBLISHED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+        )
+
     await ctx.db.commit()
     return await _post_to_legacy_post(ctx, post)
 
@@ -4807,6 +5487,8 @@ async def _create_post_legacy(ctx, input) -> LegacyPostType:
 async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
     from repositories.content_repository import PostRepository
     from app.models.content import ContentStatus as CS
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4817,6 +5499,7 @@ async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
     if post.user_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the post author can update this post")
 
+    was_published = post.status == CS.PUBLISHED
     for field in (
         "caption", "collab_with", "hashtags", "audio", "visibility",
         "allow_comments", "allow_collabs", "duration_sec", "scheduled_at",
@@ -4829,6 +5512,15 @@ async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
 
     post.updated_at = datetime.now(timezone.utc)
     await post_repo.update(post)
+
+    if not was_published and post.status == CS.PUBLISHED:
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.VIDEO_PUBLISHED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+        )
+
     await ctx.db.commit()
     return await _post_to_legacy_post(ctx, post)
 
@@ -4837,7 +5529,8 @@ async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
-    from app.models.analytics import SignalType
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4853,6 +5546,12 @@ async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
         if created_like:
             await AnalyticsRepository(ctx.db).record(
                 user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.LIKE
+            )
+            await AnalyticsEventService(ctx.db).track_event(
+                event_type=EventType.LIKE_CREATED,
+                user=user,
+                post=post,
+                session_id=ctx.session_id,
             )
         if created_like and post.user_id != user.id:
             from repositories.notification_repository import NotificationRepository
@@ -4871,6 +5570,12 @@ async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
         await AnalyticsRepository(ctx.db).record(
             user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.UNLIKE
         )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.LIKE_REMOVED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+        )
 
     post.like_count = await interactions.count_likes(id)
     await ctx.db.commit()
@@ -4881,7 +5586,8 @@ async def _save_post_legacy(ctx, id, save: bool) -> SaveResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
-    from app.models.analytics import SignalType
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4896,6 +5602,12 @@ async def _save_post_legacy(ctx, id, save: bool) -> SaveResultType:
         await interactions.toggle_save(id, user.id)
         await AnalyticsRepository(ctx.db).record(
             user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.SAVE
+        )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.SAVE_CREATED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
         )
     elif not save and is_saved:
         await interactions.toggle_save(id, user.id)
@@ -4912,7 +5624,8 @@ async def _share_post_legacy(ctx, id) -> ShareResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
-    from app.models.analytics import SignalType
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4927,6 +5640,12 @@ async def _share_post_legacy(ctx, id) -> ShareResultType:
         await AnalyticsRepository(ctx.db).record(
             user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.SHARE
         )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.SHARE_CREATED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+        )
     post.share_count = await interactions.count_shares(id)
     await ctx.db.commit()
     return ShareResultType(shares=post.share_count, shared=True)
@@ -4936,7 +5655,8 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
-    from app.models.analytics import SignalType
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4953,6 +5673,8 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
     post.view_count = await interactions.count_views(post_id)
 
     analytics = AnalyticsRepository(ctx.db)
+    events = AnalyticsEventService(ctx.db)
+    duration_ms = int(watch.watched_seconds * 1000)
     if watch.rewatched:
         await analytics.record(
             user_id=user.id, creator_id=post.user_id, post_id=post_id, signal_type=SignalType.REWATCH
@@ -4968,9 +5690,37 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
         signal_type=SignalType.WATCH_DURATION,
         value=watch.watched_seconds,
     )
+
+    await events.track_event(
+        event_type=EventType.VIDEO_VIEWED, user=user, post=post, session_id=ctx.session_id,
+    )
+    await events.track_event(
+        event_type=EventType.VIDEO_WATCHED,
+        user=user,
+        post=post,
+        session_id=ctx.session_id,
+        duration_ms=duration_ms,
+    )
+
     if watch.completed:
         await analytics.record(
             user_id=user.id, creator_id=post.user_id, post_id=post_id, signal_type=SignalType.COMPLETION
+        )
+        await events.track_event(
+            event_type=EventType.VIDEO_COMPLETED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+            duration_ms=duration_ms,
+        )
+    elif post.duration_sec and watch.watched_seconds < 0.25 * post.duration_sec:
+        # Left well before the end without completing — treat as a skip.
+        await events.track_event(
+            event_type=EventType.VIDEO_SKIPPED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+            duration_ms=duration_ms,
         )
 
     await ctx.db.commit()
@@ -4983,10 +5733,55 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
     )
 
 
+async def _not_interested(ctx, post_id) -> NotInterestedResultType:
+    """Explicit "Not Interested" feedback on a post.
+
+    Records a real production signal (SignalType.NOT_INTERESTED) into the
+    unified interaction-signal log. The recommendation system reads it via
+    ``AnalyticsRepository.viewer_post_history`` to strongly demote this post
+    (demote, never hard-exclude) and — because the signal is creator-scoped —
+    to soften future recommendations from the same creator for this viewer.
+    Idempotent per (user, post): a repeat tap does not stack signals.
+    """
+    from repositories.content_repository import PostRepository
+    from repositories.analytics_repository import AnalyticsRepository
+    from app.models.analytics import SignalType, EventType
+    from services.analytics_event_service import AnalyticsEventService
+
+    user = ctx.require_auth()
+    post_repo = PostRepository(ctx.db)
+
+    post = await post_repo.get_by_id(post_id)
+    if not post:
+        raise ValueError("Post not found")
+
+    analytics = AnalyticsRepository(ctx.db)
+    history = await analytics.viewer_post_history(user.id, [post_id])
+    already_flagged = bool(history.get(post_id) and history[post_id].not_interested)
+    if not already_flagged:
+        await analytics.record(
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=post_id,
+            signal_type=SignalType.NOT_INTERESTED,
+        )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.NOT_INTERESTED,
+            user=user,
+            post=post,
+            session_id=ctx.session_id,
+        )
+        await ctx.db.commit()
+
+    return NotInterestedResultType(not_interested=True, post_id=post_id)
+
+
 async def _add_comment(ctx, post_id, text) -> CommentGQLType:
     from repositories.content_repository import PostRepository, CommentRepository
     from repositories.profile_repository import ProfileRepository
     from app.models.content import Comment
+    from app.models.analytics import EventType
+    from services.analytics_event_service import AnalyticsEventService
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -5001,6 +5796,12 @@ async def _add_comment(ctx, post_id, text) -> CommentGQLType:
     comment = Comment(post_id=post_id, user_id=user.id, body=text)
     await comment_repo.create(comment)
     post.comment_count += 1
+    await AnalyticsEventService(ctx.db).track_event(
+        event_type=EventType.COMMENT_CREATED,
+        user=user,
+        post=post,
+        session_id=ctx.session_id,
+    )
     await _notify(
         ctx,
         user_id=post.user_id,
@@ -5259,19 +6060,21 @@ def create_graphql_router(
         db = session_factory()
 
         current_user: User | None = None
+        session_id: str | None = None
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[len("Bearer "):]
             try:
                 payload = decode_token(token)
                 user_id = payload.get("sub")
+                session_id = payload.get("jti")
                 if user_id:
                     user_repo = UserRepository(db)
                     current_user = await user_repo.get_by_id(user_id)
             except (JWTError, ValueError):
                 pass
 
-        return AppContext(db=db, current_user=current_user)
+        return AppContext(db=db, current_user=current_user, session_id=session_id)
 
     return GraphQLRouter[AppContext](
         schema,

@@ -1,4 +1,4 @@
-import { GRAPHQL_ENDPOINT } from "./api-config";
+import { AUTH_LOGIN_ENDPOINT, GRAPHQL_ENDPOINT } from "./api-config";
 import { getProfileValidationError, normalizeProfilePatch } from "./profile-validation";
 
 // ─── ACCOUNT STORE ───────────────────────────────────────────────────────────
@@ -67,6 +67,7 @@ export interface Account {
   password?: string;
   /** Providers linked to this account, in addition to any password. */
   providers: Provider[];
+  role?: "admin" | "creator" | "user" | "guest";
   /** Absent until onboarding or Edit Profile fills it in. */
   profile?: Profile;
 }
@@ -83,6 +84,7 @@ interface ResetToken {
 const ACCOUNTS_KEY = "connextionz.accounts";
 const RESETS_KEY = "connextionz.resets";
 const SESSION_KEY = "connextionz.session";
+const ACCESS_TOKEN_KEY = "connextionz.accessToken";
 
 /** Matches the "expires in 15 minutes" copy shown on the Reset Sent screen. */
 export const RESET_TTL_MS = 15 * 60 * 1000;
@@ -233,11 +235,42 @@ function makeToken(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function roleFromToken(token: string): Account["role"] | undefined {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return undefined;
+    const decoded = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as { role?: Account["role"] };
+    return decoded.role;
+  } catch {
+    return undefined;
+  }
+}
+
 // ─── SIGN IN ─────────────────────────────────────────────────────────────────
 
 export async function signIn(email: string, password: string): Promise<Result<Account>> {
+  sessionWrite(ACCESS_TOKEN_KEY, null);
+  let backendRole: Account["role"] | undefined;
+  try {
+    const params = new URLSearchParams({ email: email.trim(), password });
+    const response = await fetch(`${AUTH_LOGIN_ENDPOINT}?${params.toString()}`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (response.ok) {
+      const payload = await response.json() as { access_token?: string };
+      if (payload.access_token) {
+        sessionWrite(ACCESS_TOKEN_KEY, payload.access_token);
+        backendRole = roleFromToken(payload.access_token);
+      }
+    }
+  } catch {
+    // The local prototype account remains usable when the backend is offline.
+  }
+
   await delay(900);
   const account = findAccount(loadAccounts(), email);
+  if (account && backendRole) account.role = backendRole;
 
   // An account created purely through a provider has no password to check.
   // Say so explicitly — this is a usability dead end otherwise, and it leaks
@@ -394,9 +427,14 @@ export function startSession(email: string) {
 export function endSession() {
   try {
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(ACCESS_TOKEN_KEY);
   } catch {
     /* Storage disabled — nothing was persisted to clear. */
   }
+}
+
+export function getAccessToken(): string | null {
+  return sessionRead<string | null>(ACCESS_TOKEN_KEY, null);
 }
 
 function sessionRead<T>(key: string, fallback: T): T {

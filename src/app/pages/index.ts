@@ -13,6 +13,7 @@ export { CollabPreferencesPage } from "./CollabPreferencesPage";
 export { ResponseTimePage } from "./ResponseTimePage";
 export { PortfolioPage } from "./PortfolioPage";
 export { AnalyticsPage } from "./AnalyticsPage";
+export { PlatformAnalyticsPage } from "./PlatformAnalyticsPage";
 export { HelpCenterPage } from "./HelpCenterPage";
 export { ReportProblemPage } from "./ReportProblemPage";
 export { TermsPage, PrivacyPolicyPage } from "./LegalPages";

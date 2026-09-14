@@ -17,14 +17,13 @@ import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   ArrowLeft, BarChart3, Bookmark, Eye, Heart, Loader2, MessageCircle,
-  Navigation, RefreshCw, Sparkles, Trash2, TrendingDown, TrendingUp, Trophy,
+  Navigation, RefreshCw, Sparkles, TrendingDown, TrendingUp, Trophy,
   UserPlus, Users, WifiOff,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { ACCENT, EmptyState, useTokens } from "./settings-ui";
 import { SegmentedTabs, Thumb, formatCount } from "./profile-ui";
 import { useViewer } from "./session";
-import { deletePost, useOwnPosts } from "./posts-store";
 import {
   type ContentRow, type DashboardData, type Metric, type MetricKey, type Range,
   RANGES, axisLabels, fetchDashboard, signed,
@@ -33,6 +32,7 @@ import {
 type Tab = "overview" | "content" | "collabs";
 type Status = "loading" | "ready" | "error";
 type Sort = "recent" | "views" | "likes";
+type Trend = "views" | "engagement" | "followers";
 
 const METRIC_ICON: Record<MetricKey, typeof Eye> = {
   views: Eye,
@@ -56,7 +56,6 @@ export function DashboardScreen({
   const t = useTokens(isDark);
   const viewer = useViewer();
   // Publishing or deleting a post has to move these numbers immediately.
-  const myPosts = useOwnPosts();
 
   const [tab, setTab] = useState<Tab>("overview");
   const [range, setRange] = useState<Range>("30d");
@@ -68,12 +67,18 @@ export function DashboardScreen({
     setStatus("loading");
     setError("");
     const result = await fetchDashboard(next);
-    if (!result.ok) { setError(result.error); setStatus("error"); return; }
+    if (!result.ok) {
+      setError(typeof navigator !== "undefined" && !navigator.onLine
+        ? "You appear to be offline. Reconnect and try again."
+        : result.error);
+      setStatus("error");
+      return;
+    }
     setData(result.value);
     setStatus("ready");
   };
 
-  useEffect(() => { void load(range); }, [range, myPosts.length]);
+  useEffect(() => { void load(range); }, [range]);
 
   return (
     <div className="absolute inset-0 z-30 flex flex-col" style={{ background: t.bg }}>
@@ -118,7 +123,7 @@ export function DashboardScreen({
         tabs={[
           { id: "overview" as Tab, label: "Overview" },
           { id: "content" as Tab, label: "Content", count: data?.content.length },
-          { id: "collabs" as Tab, label: "Collabs", count: data?.collab.totalRequests },
+          { id: "collabs" as Tab, label: "Collabs", count: data?.collab.totalRequests ?? undefined },
         ]} />
 
       <div className="flex-1 overflow-y-auto px-5 pt-4 pb-12" style={{ scrollbarWidth: "none" }}>
@@ -144,10 +149,16 @@ export function DashboardScreen({
           <AnimatePresence mode="wait">
             <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18 }}>
-              {tab === "overview" && <Overview data={data} t={t} onOpenPost={onOpenPost} canOpenPost={canOpenPost} />}
+              {tab === "overview" && data.content.length === 0 && data.metrics.every((metric) => metric.value === 0) ? (
+                <EmptyState icon={<BarChart3 className="w-7 h-7" />} t={t}
+                  title="No analytics yet"
+                  body="Publish content and your views, engagement, and watch metrics will appear here." />
+              ) : tab === "overview" ? (
+                <Overview data={data} t={t} onOpenPost={onOpenPost} canOpenPost={canOpenPost} />
+              ) : null}
               {tab === "content" && (
                 <Content data={data} t={t} onOpenPost={onOpenPost} canOpenPost={canOpenPost}
-                  onSharePost={onSharePost} onChanged={() => void load(range)} />
+                  onSharePost={onSharePost} />
               )}
               {tab === "collabs" && <Collabs data={data} t={t} onOpenRequests={onOpenRequests} />}
             </motion.div>
@@ -170,7 +181,13 @@ function Overview({
 }) {
   const views = data.metrics.find((m) => m.key === "views")!;
   const rest = data.metrics.filter((m) => m.key !== "views");
+  const [trend, setTrend] = useState<Trend>("views");
   const labels = useMemo(() => axisLabels(data.days, data.generatedAt), [data.days, data.generatedAt]);
+  const trendSeries = trend === "views"
+    ? views.series
+    : trend === "followers"
+      ? data.metrics.find((m) => m.key === "followers")!.series
+      : data.metrics.filter((m) => m.key !== "followers").reduce((series, metric) => series.map((value, i) => value + metric.series[i]), Array.from({ length: data.days }, () => 0));
 
   const engagement = rest.filter((m) => m.key !== "followers");
   const engagementTotal = engagement.reduce((n, m) => n + m.value, 0) || 1;
@@ -181,9 +198,17 @@ function Overview({
       <div className="rounded-3xl p-4 mb-4" style={{ background: t.groupBg, border: t.groupBorder }}>
         <div className="flex items-start justify-between mb-1">
           <div>
-            <p className="text-[11px] font-bold uppercase tracking-widest" style={{ color: t.sectionLbl }}>Views</p>
+            <div className="flex gap-2 mb-2">
+              {(["views", "engagement", "followers"] as Trend[]).map((option) => (
+                <button key={option} onClick={() => setTrend(option)} className="px-2.5 py-1 rounded-full text-[11px] font-bold"
+                  style={{ color: trend === option ? ACCENT : t.sub, border: `1px solid ${trend === option ? ACCENT : t.divider}` }}>
+                  {option[0].toUpperCase() + option.slice(1)}
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] font-bold uppercase tracking-widest" style={{ color: t.sectionLbl }}>{trend}</p>
             <p className="font-extrabold text-[30px] leading-tight mt-1" style={{ color: t.heading }}>
-              {formatCount(views.value)}
+              {formatCount(trend === "views" ? views.value : trendSeries.reduce((sum, value) => sum + value, 0))}
             </p>
           </div>
           <DeltaPill delta={views.deltaPct} />
@@ -191,12 +216,20 @@ function Overview({
         <p className="text-[12px] mb-3" style={{ color: t.sub }}>
           Last {data.days} days, against the {data.days} before them
         </p>
-        <LineChart series={views.series} labels={labels} t={t} />
+        <LineChart series={trendSeries} labels={labels} t={t} />
       </div>
 
       {/* ── The rest of the counters ── */}
       <div className="grid grid-cols-2 gap-3 mb-4">
         {rest.map((metric) => <MetricCard key={metric.key} metric={metric} t={t} />)}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <QualityCard label="Unique viewers" value={formatCount(data.quality.uniqueViewers)} t={t} />
+        <QualityCard label="Saves" value={formatCount(data.quality.saves)} t={t} />
+        <QualityCard label="Avg watch time" value={data.quality.avgWatchTime == null ? "Unavailable" : `${data.quality.avgWatchTime.toFixed(1)}s`} t={t} />
+        <QualityCard label="Completion rate" value={data.quality.completionRate == null ? "Unavailable" : `${data.quality.completionRate.toFixed(1)}%`} t={t} />
+        <QualityCard label="Engagement rate" value={`${data.quality.engagementRate.toFixed(1)}%`} t={t} />
       </div>
 
       {/* ── Engagement mix ── */}
@@ -254,6 +287,15 @@ function MetricCard({ metric, t }: { metric: Metric; t: ReturnType<typeof useTok
       <p className="font-extrabold text-[20px] leading-tight" style={{ color: t.heading }}>{formatCount(metric.value)}</p>
       <p className="text-[12px] mb-2" style={{ color: t.sub }}>{metric.label}</p>
       <Sparkline series={metric.series} />
+    </div>
+  );
+}
+
+function QualityCard({ label, value, t }: { label: string; value: string; t: ReturnType<typeof useTokens> }) {
+  return (
+    <div className="rounded-2xl p-3.5" style={{ background: t.groupBg, border: t.groupBorder }}>
+      <p className="font-extrabold text-[18px] leading-tight" style={{ color: t.heading }}>{value}</p>
+      <p className="text-[12px] mt-1" style={{ color: t.sub }}>{label}</p>
     </div>
   );
 }
@@ -349,19 +391,15 @@ const SORTS: { id: Sort; label: string }[] = [
 ];
 
 function Content({
-  data, t, onOpenPost, canOpenPost, onSharePost, onChanged,
+  data, t, onOpenPost, canOpenPost, onSharePost,
 }: {
   data: DashboardData;
   t: ReturnType<typeof useTokens>;
   onOpenPost?: (postId: string) => void;
   canOpenPost?: (postId: string) => boolean;
   onSharePost?: (postId: string) => void;
-  /** Re-fetches after a delete, so the totals above follow the list. */
-  onChanged: () => void;
 }) {
   const [sort, setSort] = useState<Sort>("recent");
-  const [confirming, setConfirming] = useState<string | null>(null);
-  const [error, setError] = useState("");
 
   const rows = useMemo(() => {
     const list = [...data.content];
@@ -369,14 +407,6 @@ function Content({
     if (sort === "likes") return list.sort((a, b) => b.likes - a.likes);
     return list.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
   }, [data.content, sort]);
-
-  const remove = (id: string) => {
-    const result = deletePost(id);
-    setConfirming(null);
-    if (!result.ok) { setError(result.error); return; }
-    setError("");
-    onChanged();
-  };
 
   if (!rows.length) {
     return (
@@ -405,10 +435,6 @@ function Content({
         })}
       </div>
 
-      {error && (
-        <p className="text-[12px] mb-3 px-1" style={{ color: "#f87171" }} role="alert">{error}</p>
-      )}
-
       <div className="space-y-3">
         {rows.map((row) => (
           <div key={row.id} className="rounded-2xl p-3" style={{ background: t.groupBg, border: t.groupBorder }}>
@@ -428,30 +454,6 @@ function Content({
                   style={{ background: t.chipBg, border: t.chipBorder, color: t.body }}>
                   Share
                 </button>
-              )}
-              {/* Only posts made in this prototype can be deleted — the seeded
-                  back catalogue has no record behind it to remove. */}
-              {row.own && (
-                confirming === row.id ? (
-                  <>
-                    <button onClick={() => remove(row.id)}
-                      className="h-9 px-3 rounded-full text-[12px] font-bold"
-                      style={{ background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", color: "#f87171" }}>
-                      Delete for good
-                    </button>
-                    <button onClick={() => setConfirming(null)}
-                      className="h-9 px-3 rounded-full text-[12px] font-bold"
-                      style={{ background: t.chipBg, border: t.chipBorder, color: t.sub }}>
-                      Keep
-                    </button>
-                  </>
-                ) : (
-                  <button onClick={() => setConfirming(row.id)} aria-label="Delete post"
-                    className="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0"
-                    style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)" }}>
-                    <Trash2 className="w-4 h-4" style={{ color: "#f87171" }} />
-                  </button>
-                )
               )}
             </div>
           </div>
@@ -492,12 +494,6 @@ function ContentCard({
         <p className="text-[13px] font-semibold line-clamp-2" style={{ color: t.heading }}>
           {row.caption || "No caption"}
         </p>
-        {row.own && (
-          <p className="text-[11px] mt-0.5" style={{ color: ACCENT }}>
-            {row.own.visibility === "public" ? "Public"
-              : row.own.visibility === "followers" ? "Followers only" : "Only you"}
-          </p>
-        )}
         <div className="flex items-center gap-3 mt-1.5 flex-wrap">
           {stats.map((stat, i) => {
             const Icon = stat.icon;
@@ -525,19 +521,13 @@ function Collabs({
   const c = data.collab;
 
   const pipeline: { label: string; value: string | number; hint: string; tone?: string }[] = [
-    { label: "Requests received", value: c.totalRequests, hint: `Last ${data.days} days` },
-    { label: "Pending", value: c.pending, hint: "Waiting on you", tone: "#f59e0b" },
-    { label: "Accepted", value: c.accepted, hint: "You said yes" },
-    { label: "Completed", value: c.completed, hint: "Shipped together" },
-    { label: "Active projects", value: c.active, hint: "In flight now", tone: ACCENT },
-    { label: "Repeat collaborators", value: c.repeatCollaborators, hint: "Came back for another" },
-  ];
-
-  const opportunities: { label: string; value: number }[] = [
-    { label: "Freelance opportunities", value: c.freelanceOpportunities },
-    { label: "Job offers received", value: c.jobOffers },
-    { label: "Brand invitations", value: c.brandInvitations },
-    { label: "Advertising opportunities", value: c.adOpportunities },
+    { label: "Requests received", value: c.totalRequests ?? "-", hint: `Last ${data.days} days` },
+    { label: "Pending", value: c.pending ?? "-", hint: "Waiting on you", tone: "#f59e0b" },
+    { label: "Accepted", value: c.accepted ?? "-", hint: "Accepted or progressed" },
+    { label: "Declined", value: c.declined ?? "-", hint: "Turned down" },
+    { label: "Cancelled", value: c.cancelled ?? "-", hint: "Closed before completion" },
+    { label: "Completed", value: c.completed ?? "-", hint: "Shipped together" },
+    { label: "Active projects", value: c.active ?? "-", hint: "In flight now", tone: ACCENT },
   ];
 
   return (
@@ -545,9 +535,9 @@ function Collabs({
       {/* ── Headline three ── */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         {[
-          { label: "Collab Score", value: c.collabScore.toFixed(1), icon: Sparkles },
-          { label: "Success rate", value: `${c.successRatePct}%`, icon: TrendingUp },
-          { label: "Avg. reply", value: `${c.avgResponseHours}h`, icon: Users },
+          { label: "Acceptance rate", value: c.acceptanceRatePct == null ? "-" : `${c.acceptanceRatePct.toFixed(1)}%`, icon: TrendingUp },
+          { label: "Completion rate", value: c.completionRatePct == null ? "-" : `${c.completionRatePct.toFixed(1)}%`, icon: TrendingUp },
+          { label: "Avg. reply", value: c.avgResponseHours == null ? "-" : `${c.avgResponseHours.toFixed(1)}h`, icon: Users },
         ].map((item) => {
           const Icon = item.icon;
           return (
@@ -575,7 +565,7 @@ function Collabs({
         ))}
       </div>
 
-      {c.pending > 0 && onOpenRequests && (
+      {c.pending != null && c.pending > 0 && onOpenRequests && (
         <motion.button whileTap={{ scale: 0.98 }} onClick={onOpenRequests}
           className="w-full flex items-center gap-3 p-4 rounded-2xl text-left mb-5"
           style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.32)" }}>
@@ -588,24 +578,25 @@ function Collabs({
               {c.pending} request{c.pending === 1 ? "" : "s"} waiting on you
             </span>
             <span className="block text-[12px] mt-0.5" style={{ color: t.sub }}>
-              Replying inside a day is what keeps your score above 4.5
+              Response time is measured when acceptance timestamps are available.
             </span>
           </span>
         </motion.button>
       )}
 
-      {/* ── Opportunities ── */}
+      {/* ── Daily activity ── */}
       <p className="text-[11px] font-bold uppercase tracking-widest mb-2 px-1" style={{ color: t.sectionLbl }}>
-        Opportunities
+        Daily activity
       </p>
       <div className="rounded-2xl overflow-hidden" style={{ background: t.groupBg, border: t.groupBorder }}>
-        {opportunities.map((item, i) => (
-          <div key={item.label} className="flex items-center justify-between px-4 py-3.5"
-            style={{ borderBottom: i < opportunities.length - 1 ? `1px solid ${t.divider}` : "none" }}>
-            <span className="text-[14px]" style={{ color: t.body }}>{item.label}</span>
-            <span className="text-[15px] font-extrabold" style={{ color: ACCENT }}>{item.value}</span>
+        {c.trends.filter((point) => point.requested > 0 || point.accepted > 0 || point.completed > 0).slice(-7).map((point, i, rows) => (
+          <div key={point.date} className="flex items-center justify-between px-4 py-3.5"
+            style={{ borderBottom: i < rows.length - 1 ? `1px solid ${t.divider}` : "none" }}>
+            <span className="text-[14px]" style={{ color: t.body }}>{point.date}</span>
+            <span className="text-[12px]" style={{ color: t.sub }}>{point.requested} requests · {point.accepted} accepted · {point.active} in progress · {point.completed} completed</span>
           </div>
         ))}
+        {c.trends.every((point) => point.requested === 0 && point.accepted === 0 && point.completed === 0) && <p className="px-4 py-3.5 text-[13px]" style={{ color: t.sub }}>No collaboration activity in this period.</p>}
       </div>
 
       <p className="text-[11px] leading-relaxed mt-4 px-1 flex items-start gap-2" style={{ color: t.sub }}>

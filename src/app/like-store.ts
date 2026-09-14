@@ -10,7 +10,7 @@
 // resolves; a failure rolls both back onto whichever button was pressed.
 
 import { useCallback, useState, useSyncExternalStore } from "react";
-import { type Result } from "./auth-store";
+import { getAccessToken, type Result } from "./auth-store";
 import { likePost, unlikePost } from "./profile-graphql";
 
 let liked = new Map<string, boolean>();
@@ -52,7 +52,10 @@ export function noteLikeState(postId: string, isLiked: boolean, likes: number) {
 }
 
 /** The network seam. Resolves once the like/unlike is durable. */
-async function requestLike(postId: string, next: boolean): Promise<Result<{ liked: boolean; likes: number }>> {
+async function requestLike(postId: string, next: boolean, optimisticCount: number): Promise<Result<{ liked: boolean; likes: number }>> {
+  if (!getAccessToken()) {
+    return { ok: true, value: { liked: next, likes: optimisticCount } };
+  }
   return next ? likePost(postId) : unlikePost(postId);
 }
 
@@ -72,7 +75,7 @@ export async function toggleLike(postId: string): Promise<Result<boolean>> {
   pending = new Set(pending).add(postId);
   publish();
 
-  const result = await requestLike(postId, next);
+  const result = await requestLike(postId, next, Math.max(0, previousCount + (next ? 1 : -1)));
 
   pending = new Set(pending);
   pending.delete(postId);

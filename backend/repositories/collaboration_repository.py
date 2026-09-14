@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, list
+from typing import Optional
 
-from sqlalchemy import select, and_, or_
+from sqlalchemy import func, select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.collaboration import (
     Collaboration, CollaborationParticipant, Milestone,
@@ -31,18 +32,30 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         """Initialize with database session."""
         super().__init__(db, Collaboration)
 
+    async def get_by_id_for_update(self, entity_id: uuid.UUID) -> Optional[Collaboration]:
+        """Get a collaboration and lock its row for the transaction.
+
+        Serializes concurrent Accept/Decline calls on the same collaboration
+        so a duplicate request can't slip past the pending-state check before
+        the first request commits.
+        """
+        result = await self.db.execute(
+            select(Collaboration).where(Collaboration.id == entity_id).with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def get_for_user(
         self,
         user_id: uuid.UUID,
         status: Optional[CollaborationStatus] = None,
         limit: int = 20,
-        before_id: Optional[uuid.UUID] = None,
+        before: Optional[tuple[datetime, uuid.UUID]] = None,
     ) -> list[Collaboration]:
         """Get collaborations where user is initiator or participant."""
         # Subquery to find collaboration IDs where user is a participant
         participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
             CollaborationParticipant.user_id == user_id
-        ).subquery()
+        ).scalar_subquery()
 
         stmt = select(Collaboration).where(
             or_(
@@ -52,10 +65,66 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         if status:
             stmt = stmt.where(Collaboration.status == status)
-        if before_id:
-            stmt = stmt.where(Collaboration.id < before_id)
-        stmt = stmt.order_by(Collaboration.created_at.desc()).limit(limit)
+        if before:
+            before_time, before_id = before
+            stmt = stmt.where(
+                or_(
+                    Collaboration.created_at < before_time,
+                    and_(
+                        Collaboration.created_at == before_time,
+                        Collaboration.id < before_id,
+                    ),
+                )
+            )
+        stmt = stmt.order_by(
+            Collaboration.created_at.desc(), Collaboration.id.desc()
+        ).limit(limit)
         result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def status_counts_for_user(self, user_id: uuid.UUID) -> dict[CollaborationStatus, int]:
+        """Count collaborations for a user grouped by status."""
+        participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
+            CollaborationParticipant.user_id == user_id
+        ).scalar_subquery()
+
+        result = await self.db.execute(
+            select(Collaboration.status, func.count().label("collaboration_count"))
+            .where(
+                Collaboration.deleted_at.is_(None),
+                or_(
+                    Collaboration.initiator_id == user_id,
+                    Collaboration.id.in_(participant_collab_ids),
+                ),
+            )
+            .group_by(Collaboration.status)
+        )
+        return {
+            row.status: int(row.collaboration_count if row.collaboration_count is not None else 0)
+            for row in result.all()
+        }
+
+    async def get_for_user_in_period(
+        self, user_id: uuid.UUID, start: datetime, end: datetime
+    ) -> list[Collaboration]:
+        """Return a user's non-deleted collaborations created in a period."""
+        participant_collab_ids = select(CollaborationParticipant.collaboration_id).where(
+            CollaborationParticipant.user_id == user_id
+        ).scalar_subquery()
+        result = await self.db.execute(
+            select(Collaboration)
+            .options(selectinload(Collaboration.participants))
+            .where(
+                Collaboration.deleted_at.is_(None),
+                Collaboration.created_at >= start,
+                Collaboration.created_at <= end,
+                or_(
+                    Collaboration.initiator_id == user_id,
+                    Collaboration.id.in_(participant_collab_ids),
+                ),
+            )
+            .order_by(Collaboration.created_at.asc(), Collaboration.id.asc())
+        )
         return list(result.scalars().all())
 
     async def get_marketplace(
@@ -63,7 +132,7 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         tags: Optional[list[str]] = None,
         content_type: Optional[str] = None,
         limit: int = 20,
-        before_id: Optional[uuid.UUID] = None,
+        before: Optional[tuple[datetime, uuid.UUID]] = None,
     ) -> list[Collaboration]:
         """Get public collaboration marketplace listings."""
         stmt = select(Collaboration).where(
@@ -75,9 +144,20 @@ class CollaborationRepository(BaseRepository[Collaboration]):
             # Filter by tags (JSONB contains any of the provided tags)
             for tag in tags:
                 stmt = stmt.where(Collaboration.tags.contains([tag]))
-        if before_id:
-            stmt = stmt.where(Collaboration.id < before_id)
-        stmt = stmt.order_by(Collaboration.created_at.desc()).limit(limit)
+        if before:
+            before_time, before_id = before
+            stmt = stmt.where(
+                or_(
+                    Collaboration.created_at < before_time,
+                    and_(
+                        Collaboration.created_at == before_time,
+                        Collaboration.id < before_id,
+                    ),
+                )
+            )
+        stmt = stmt.order_by(
+            Collaboration.created_at.desc(), Collaboration.id.desc()
+        ).limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
@@ -111,6 +191,16 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         return result.scalar_one_or_none()
 
+    async def get_participants(self, collaboration_id: uuid.UUID) -> list[uuid.UUID]:
+        """Return accepted participant user IDs for a collaboration."""
+        result = await self.db.execute(
+            select(CollaborationParticipant.user_id).where(
+                CollaborationParticipant.collaboration_id == collaboration_id,
+                CollaborationParticipant.accepted.is_(True),
+            )
+        )
+        return list(result.scalars().all())
+
     async def update_participant(
         self, participant: CollaborationParticipant
     ) -> CollaborationParticipant:
@@ -137,8 +227,34 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         return list(result.scalars().all())
 
+    async def get_milestone_by_id(self, milestone_id: uuid.UUID) -> Optional[Milestone]:
+        """Get a single milestone by its id."""
+        result = await self.db.execute(
+            select(Milestone).where(Milestone.id == milestone_id)
+        )
+        return result.scalar_one_or_none()
+
     async def update_milestone(self, milestone: Milestone) -> Milestone:
         """Update a milestone."""
         await self.db.flush()
         await self.db.refresh(milestone)
         return milestone
+    
+    async def get_pending_participants(self, collaboration: Collaboration) -> list[CollaborationParticipant]:
+        result = await self.db.execute(
+            select(CollaborationParticipant).where(
+                CollaborationParticipant.collaboration_id == collaboration.id,
+                CollaborationParticipant.accepted.is_(False),
+            )
+        )
+        return list(result.scalars().all())
+
+    async def get_accepted_participants(self, collaboration: Collaboration) -> list[CollaborationParticipant]:
+        result = await self.db.execute(
+            select(CollaborationParticipant).where(
+                CollaborationParticipant.collaboration_id == collaboration.id,
+                CollaborationParticipant.accepted.is_(True),
+            )
+        )
+        return list(result.scalars().all())
+

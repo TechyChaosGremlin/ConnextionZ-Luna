@@ -11,6 +11,16 @@ from repositories.content_repository import PostRepository
 from repositories.user_repository import UserRepository
 
 
+@pytest.fixture(autouse=True)
+def _stub_analytics(monkeypatch):
+    async def noop_track_event(self, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "services.analytics_event_service.AnalyticsEventService.track_event", noop_track_event
+    )
+
+
 @pytest.mark.asyncio
 async def test_user_search_accepts_string_type_filters(monkeypatch):
     user = User(

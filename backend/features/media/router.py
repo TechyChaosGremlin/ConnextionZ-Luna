@@ -9,11 +9,13 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session
+from app.models.analytics import EventType
 from app.models.base import generate_uuidv7
 from app.models.content import Media
 from app.models.user import User, UserRole
 from features.auth.middleware import get_current_active_user
 from repositories.content_repository import MediaRepository, PostRepository
+from services.analytics_event_service import AnalyticsEventService
 from services.media_storage import MediaStorageError, media_storage
 
 router = APIRouter(prefix="/media", tags=["media"])
@@ -64,6 +66,13 @@ async def upload_media(
     )
     try:
         await MediaRepository(db).create(media)
+        if media.media_type.startswith("video/"):
+            await AnalyticsEventService(db).track_event(
+                event_type=EventType.VIDEO_UPLOADED,
+                user=current_user,
+                post=post,
+                metadata={"file_size_bytes": media.file_size_bytes},
+            )
         await db.commit()
     except Exception:
         await db.rollback()

@@ -17,6 +17,7 @@ export type SettingsRoute =
   | "responseTime"
   | "portfolio"
   | "analytics"
+  | "platformAnalytics"
   | "helpCenter"
   | "reportProblem"
   | "terms"

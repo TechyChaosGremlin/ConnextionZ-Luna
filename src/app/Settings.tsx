@@ -74,6 +74,10 @@ const SECTIONS: SettingsSection[] = [
   },
 ];
 
+const ADMIN_SECTIONS: SettingsSection[] = [
+  { title: "Administration", rows: [{ route: "platformAnalytics", label: "Platform Analytics" }] },
+];
+
 // ─── SETTINGS SCREEN ─────────────────────────────────────────────────────────
 
 export function SettingsScreen({
@@ -90,6 +94,7 @@ export function SettingsScreen({
 }) {
   const t = useTokens(isDark);
   const profile = profileOf(account);
+  const sections = account.role === "admin" ? [...SECTIONS, ...ADMIN_SECTIONS] : SECTIONS;
 
   // A stack, not a single route: pages cross-link to each other (Help Center →
   // Report a Problem, Collab Preferences → Response Time), and Back has to
@@ -175,7 +180,7 @@ export function SettingsScreen({
           </div>
 
           {/* Navigable sections */}
-          {SECTIONS.map((sec) => (
+          {sections.map((sec) => (
             <div key={sec.title} className="mb-5">
               <p className="text-[11px] font-bold uppercase tracking-widest mb-2 px-1" style={{ color: t.sectionLbl }}>{sec.title}</p>
               <div className="rounded-2xl overflow-hidden" style={{ background: t.groupBg, border: t.groupBorder }}>

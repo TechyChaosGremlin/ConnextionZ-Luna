@@ -18,7 +18,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type Result } from "./auth-store";
-import { registerCreator, type FeedVideo } from "./creators";
+import { FEED, registerCreator, type FeedVideo } from "./creators";
 import { noteLikeState } from "./like-store";
 import { noteSaveState } from "./save-store";
 import { noteShareState } from "./share-store";
@@ -36,6 +36,9 @@ export async function fetchFeedPage(cursor: string | null, following = false): P
     return { ok: false, error: "You're offline. Reconnect to load the feed." };
   }
   const page = await fetchFeedPageFromApi(cursor, 10, following);
+  if (!page && cursor === null && !following) {
+    return { ok: true, value: { items: FEED, cursor: null } };
+  }
   if (!page) return { ok: false, error: "The feed could not be loaded. Try again." };
   return {
     ok: true,

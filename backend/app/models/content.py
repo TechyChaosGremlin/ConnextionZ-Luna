@@ -52,13 +52,16 @@ class Post(Base, TimestampMixin, SoftDeleteMixin):
     )
 
     # Content
+    # values_callable makes SQLAlchemy persist the enum *values* ("video",
+    # "published") rather than the member *names* ("VIDEO", "PUBLISHED"),
+    # matching the lowercase labels migration 001 created in the DB enums.
     content_type: Mapped[ContentType] = mapped_column(
-        Enum(ContentType, name="content_type"),
+        Enum(ContentType, name="content_type", values_callable=lambda e: [m.value for m in e]),
         nullable=False,
         default=ContentType.POST,
     )
     status: Mapped[ContentStatus] = mapped_column(
-        Enum(ContentStatus, name="content_status"),
+        Enum(ContentStatus, name="content_status", values_callable=lambda e: [m.value for m in e]),
         nullable=False,
         default=ContentStatus.DRAFT,
     )

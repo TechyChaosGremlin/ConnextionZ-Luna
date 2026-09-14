@@ -15,7 +15,7 @@
 // rather than retrofitted once latency becomes real.
 
 import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
-import { type Result } from "./auth-store";
+import { getAccessToken, type Result } from "./auth-store";
 import { registerCreator, type Creator, creatorById } from "./creators";
 import { fetchMyFollowing, followProfile, type GraphQLFollowResult, unfollowProfile } from "./profile-graphql";
 
@@ -110,6 +110,17 @@ function applyFollowerCount(creatorId: string, followersExcludingViewer: number)
 /** The network seam. Resolves once the follow is durable. */
 async function requestFollow(creatorId: string, next: boolean): Promise<Result<GraphQLFollowResult>> {
   if (!activeEmail) return { ok: false, error: "Sign in to follow creators." };
+  if (!getAccessToken()) {
+    const creator = creatorById(creatorId);
+    return {
+      ok: true,
+      value: {
+        following: next,
+        followers: (creator?.followers ?? 0) + (next ? 1 : 0),
+        followingCount: following.size,
+      },
+    };
+  }
   const identifier = creatorById(creatorId)?.username ?? creatorId;
   return next ? followProfile(identifier) : unfollowProfile(identifier);
 }

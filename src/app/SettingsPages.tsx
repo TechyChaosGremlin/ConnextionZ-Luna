@@ -17,6 +17,7 @@ import {
   type SettingsRoute, type PageProps,
   EditProfilePage, ChangePasswordPage, NotificationsPage, PrivacyPage,
   CollabPreferencesPage, ResponseTimePage, PortfolioPage, AnalyticsPage,
+  PlatformAnalyticsPage,
   HelpCenterPage, ReportProblemPage, TermsPage, PrivacyPolicyPage,
 } from "./pages";
 
@@ -37,6 +38,7 @@ export const SETTINGS_PAGES: Record<SettingsRoute, (props: PageProps) => ReactEl
   responseTime: ResponseTimePage,
   portfolio: PortfolioPage,
   analytics: AnalyticsPage,
+  platformAnalytics: PlatformAnalyticsPage,
   helpCenter: HelpCenterPage,
   reportProblem: ReportProblemPage,
   terms: TermsPage,
