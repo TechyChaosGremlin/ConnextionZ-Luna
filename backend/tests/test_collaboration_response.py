@@ -80,6 +80,9 @@ def patch_repo(monkeypatch, participant, collab, pending_participants=None):
     """Patch the collaboration repository with deterministic doubles."""
     state = {"collab": collab, "removed": False, "add_participant_calls": 0}
 
+    async def fake_ensure_direct_conversation(self, collaboration, accepted_participant):
+        state["messaging_bridge"] = (collaboration, accepted_participant)
+
     async def fake_get_participant(self, collab_id, user_id):
         if participant is None:
             return None
@@ -138,6 +141,10 @@ def patch_repo(monkeypatch, participant, collab, pending_participants=None):
         "repositories.collaboration_repository.CollaborationRepository.add_participant",
         fake_add_participant,
     )
+    monkeypatch.setattr(
+        "services.collaboration_messaging_service.CollaborationMessagingService.ensure_direct_conversation",
+        fake_ensure_direct_conversation,
+    )
     return state
 
 
@@ -160,6 +167,7 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     assert participant.accepted_at is not None
     assert collab.status == CollaborationStatus.ACCEPTED
     assert state["removed"] is False
+    assert state["messaging_bridge"] == (collab, participant)
     ctx.db.commit.assert_awaited_once_with()
     # Accepting activates the existing participant row; it never inserts a
     # brand-new collaboration/participant record.
@@ -249,6 +257,29 @@ async def test_accept_collaboration_rolls_back_when_participant_update_fails(mon
     ctx.db.rollback.assert_awaited_once_with()
     ctx.db.commit.assert_not_awaited()
     assert collab.status == CollaborationStatus.PROPOSED
+
+
+@pytest.mark.asyncio
+async def test_accept_collaboration_rolls_back_when_messaging_bridge_fails(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab()
+    patch_repo(monkeypatch, participant, collab)
+
+    async def fail_ensure_direct_conversation(self, collaboration, accepted_participant):
+        raise PermissionError("Cannot message a blocked user")
+
+    monkeypatch.setattr(
+        "services.collaboration_messaging_service.CollaborationMessagingService.ensure_direct_conversation",
+        fail_ensure_direct_conversation,
+    )
+    ctx = make_ctx(user)
+
+    with pytest.raises(PermissionError, match="blocked"):
+        await _accept_collaboration(ctx, collab.id)
+
+    ctx.db.rollback.assert_awaited_once_with()
+    ctx.db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

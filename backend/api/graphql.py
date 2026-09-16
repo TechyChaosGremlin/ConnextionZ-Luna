@@ -4259,6 +4259,13 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
             await repo.remove_participant(pending_participant)
         await repo.update(collab)
 
+        from repositories.messaging_repository import ConversationRepository
+        from services.collaboration_messaging_service import CollaborationMessagingService
+
+        await CollaborationMessagingService(
+            ConversationRepository(ctx.db)
+        ).ensure_direct_conversation(collab, participant)
+
         await ctx.db.commit()
     except Exception:
         await ctx.db.rollback()

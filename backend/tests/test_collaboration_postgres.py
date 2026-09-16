@@ -53,6 +53,7 @@ from app.models.collaboration import (
 )
 from app.models.user import AccountStatus, Profile, User, UserRole
 from repositories.collaboration_repository import CollaborationRepository
+from repositories.messaging_repository import ConversationRepository
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────
@@ -1162,6 +1163,88 @@ async def test_accept_collaboration_failure_leaves_database_consistent():
             assert collab.status == CollaborationStatus.PROPOSED
 
             participant = await repo.get_participant(collab_id, participant_user.id)
+            assert participant is not None
+            assert participant.accepted is False
+    finally:
+        await cleanup_users(initiator.id, participant_user.id)
+
+
+@pytest.mark.asyncio
+async def test_accepted_collaboration_creates_and_reuses_direct_messaging_bridge():
+    """Accept persists one direct thread with both collaborators as members."""
+    initiator = await create_and_commit_user("bridge_init")
+    participant_user = await create_and_commit_user("bridge_part")
+    first_collab_id = await create_and_commit_pending_collaboration(
+        initiator.id, participant_user.id
+    )
+
+    try:
+        async with async_session_factory() as session:
+            await _accept_collaboration(
+                AppContext(db=session, current_user=participant_user), first_collab_id
+            )
+
+        async with async_session_factory() as session:
+            conversation_repo = ConversationRepository(session)
+            first_conversation = await conversation_repo.get_direct_conversation(
+                initiator.id, participant_user.id
+            )
+            assert first_conversation is not None
+            assert set(
+                await conversation_repo.get_participant_ids(first_conversation.id)
+            ) == {initiator.id, participant_user.id}
+
+        second_collab_id = await create_and_commit_pending_collaboration(
+            initiator.id, participant_user.id
+        )
+        async with async_session_factory() as session:
+            await _accept_collaboration(
+                AppContext(db=session, current_user=participant_user), second_collab_id
+            )
+
+        async with async_session_factory() as session:
+            conversation_repo = ConversationRepository(session)
+            reused_conversation = await conversation_repo.get_direct_conversation(
+                initiator.id, participant_user.id
+            )
+            assert reused_conversation is not None
+            assert reused_conversation.id == first_conversation.id
+            assert set(
+                await conversation_repo.get_participant_ids(reused_conversation.id)
+            ) == {initiator.id, participant_user.id}
+    finally:
+        await cleanup_users(initiator.id, participant_user.id)
+
+
+@pytest.mark.asyncio
+async def test_messaging_bridge_failure_rolls_back_collaboration_acceptance(monkeypatch):
+    """A handoff failure leaves the persisted invite pending."""
+    initiator = await create_and_commit_user("bridge_txn_init")
+    participant_user = await create_and_commit_user("bridge_txn_part")
+    collab_id = await create_and_commit_pending_collaboration(
+        initiator.id, participant_user.id
+    )
+
+    async def fail_ensure_direct_conversation(self, collaboration, participant):
+        raise RuntimeError("simulated messaging bridge failure")
+
+    monkeypatch.setattr(
+        "services.collaboration_messaging_service.CollaborationMessagingService.ensure_direct_conversation",
+        fail_ensure_direct_conversation,
+    )
+    try:
+        async with async_session_factory() as session:
+            with pytest.raises(RuntimeError, match="simulated messaging bridge failure"):
+                await _accept_collaboration(
+                    AppContext(db=session, current_user=participant_user), collab_id
+                )
+
+        async with async_session_factory() as session:
+            collaboration = await CollaborationRepository(session).get_by_id(collab_id)
+            participant = await CollaborationRepository(session).get_participant(
+                collab_id, participant_user.id
+            )
+            assert collaboration.status == CollaborationStatus.PROPOSED
             assert participant is not None
             assert participant.accepted is False
     finally:

@@ -85,7 +85,7 @@ class ConversationRepository(BaseRepository[Conversation]):
         )
         result = await self.db.execute(
             select(Conversation).where(
-                Conversation.id.in_(matching_conversations),
+                Conversation.id.in_(matching_conversations.select()),
                 Conversation.is_group.is_(False),
                 Conversation.deleted_at.is_(None),
             )
