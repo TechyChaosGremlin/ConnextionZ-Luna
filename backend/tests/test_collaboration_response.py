@@ -63,15 +63,20 @@ def make_participant(user_id, *, accepted=False, accepted_at=None, role="partici
 
 
 def make_collab(initiator_id=None, status=CollaborationStatus.PROPOSED, deleted_at=None) -> SimpleNamespace:
-    return SimpleNamespace(
+    collab = SimpleNamespace(
         id=uuid.uuid4(),
         initiator_id=initiator_id if initiator_id is not None else uuid.uuid4(),
         status=status,
         deleted_at=deleted_at,
+        started_at=None,
     )
+    collab._update_collaboration = lambda new_status: setattr(
+        collab, "status", CollaborationStatus(new_status)
+    )
+    return collab
 
 
-def patch_repo(monkeypatch, participant, collab):
+def patch_repo(monkeypatch, participant, collab, pending_participants=None):
     """Patch the collaboration repository with deterministic doubles."""
     state = {"collab": collab, "removed": False, "add_participant_calls": 0}
 
@@ -91,6 +96,9 @@ def patch_repo(monkeypatch, participant, collab):
 
     async def fake_remove_participant(self, p):
         state["removed"] = True
+
+    async def fake_get_pending_participants(self, c):
+        return list(pending_participants or [])
 
     async def fake_add_participant(self, p):
         # Accept/decline must never create new participant rows; only
@@ -121,6 +129,10 @@ def patch_repo(monkeypatch, participant, collab):
     monkeypatch.setattr(
         "repositories.collaboration_repository.CollaborationRepository.remove_participant",
         fake_remove_participant,
+    )
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_pending_participants",
+        fake_get_pending_participants,
     )
     monkeypatch.setattr(
         "repositories.collaboration_repository.CollaborationRepository.add_participant",
@@ -154,6 +166,21 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     assert state["add_participant_calls"] == 0
 
 
+@pytest.mark.asyncio
+async def test_accepting_one_invitee_resolves_and_removes_remaining_pending_invites(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    remaining = make_participant(uuid.uuid4())
+    collab = make_collab()
+    patch_repo(monkeypatch, participant, collab, pending_participants=[remaining])
+
+    await _accept_collaboration(make_ctx(user), collab.id)
+
+    assert participant.accepted is True
+    assert collab.status == CollaborationStatus.ACCEPTED
+    assert remaining.accepted is False
+
+
 # ── Decline ──────────────────────────────────────────────────────────────────
 
 
@@ -172,6 +199,32 @@ async def test_decline_collaboration_removes_participant_and_marks_declined(monk
     assert collab.status == CollaborationStatus.DECLINED
     assert participant.accepted is False
     ctx.db.commit.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_declining_one_of_multiple_invitees_keeps_proposal_open(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    remaining = make_participant(uuid.uuid4())
+    collab = make_collab()
+    state = patch_repo(monkeypatch, participant, collab, pending_participants=[remaining])
+
+    await _decline_collaboration(make_ctx(user), collab.id)
+
+    assert state["removed"] is True
+    assert collab.status == CollaborationStatus.PROPOSED
+
+
+@pytest.mark.asyncio
+async def test_declining_last_invitee_marks_collaboration_declined(monkeypatch):
+    user = make_user()
+    participant = make_participant(user.id)
+    collab = make_collab()
+    patch_repo(monkeypatch, participant, collab)
+
+    await _decline_collaboration(make_ctx(user), collab.id)
+
+    assert collab.status == CollaborationStatus.DECLINED
 
 
 @pytest.mark.asyncio

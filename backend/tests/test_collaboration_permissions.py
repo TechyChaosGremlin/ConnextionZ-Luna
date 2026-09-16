@@ -75,6 +75,9 @@ def make_collab(initiator_id, status=CollaborationStatus.PROPOSED, deleted_at=No
         completed_at=None,
         deleted_at=deleted_at,
     )
+    collab._update_collaboration = lambda new_status: setattr(
+        collab, "status", CollaborationStatus(new_status)
+    )
     return collab
 
 
@@ -99,7 +102,8 @@ def _uuid(value):
 
 
 def patch_collab_repo(
-    monkeypatch, *, collab=None, milestone=None, participant_user_id=None, participant_accepted=True
+    monkeypatch, *, collab=None, milestone=None, participant_user_id=None,
+    participant_accepted=True, accepted_participants=None
 ):
     """Patch collaboration repository accessors with deterministic doubles."""
     repo_path = "repositories.collaboration_repository.CollaborationRepository"
@@ -113,6 +117,9 @@ def patch_collab_repo(
         if participant_user_id is not None and user_id == participant_user_id:
             return SimpleNamespace(id=uuid.uuid4(), user_id=user_id, accepted=participant_accepted)
         return None
+
+    async def fake_get_accepted_participants(self, c):
+        return list(accepted_participants or [])
 
     async def fake_get_milestone_by_id(self, milestone_id):
         if milestone is not None and _uuid(milestone_id) == milestone.id:
@@ -130,6 +137,7 @@ def patch_collab_repo(
 
     monkeypatch.setattr(f"{repo_path}.get_by_id", fake_get_by_id)
     monkeypatch.setattr(f"{repo_path}.get_participant", fake_get_participant)
+    monkeypatch.setattr(f"{repo_path}.get_accepted_participants", fake_get_accepted_participants)
     monkeypatch.setattr(f"{repo_path}.get_milestone_by_id", fake_get_milestone_by_id)
     monkeypatch.setattr(f"{repo_path}.update", fake_update)
     monkeypatch.setattr(f"{repo_path}.update_milestone", fake_update_milestone)
@@ -310,6 +318,54 @@ async def test_update_rejects_missing_collaboration(monkeypatch):
 
     with pytest.raises(ValueError, match="Collaboration not found"):
         await _update_collaboration(make_ctx(user), str(uuid.uuid4()), SimpleNamespace())
+
+
+@pytest.mark.asyncio
+async def test_update_cannot_bypass_pending_invitation_acceptance(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id)
+    patch_collab_repo(monkeypatch, collab=collab, participant_user_id=owner.id)
+
+    with pytest.raises(ValueError, match="before an invitee accepts"):
+        await _update_collaboration(
+            make_ctx(owner),
+            str(collab.id),
+            SimpleNamespace(status=SimpleNamespace(value="accepted")),
+        )
+
+    assert collab.status == CollaborationStatus.PROPOSED
+
+
+@pytest.mark.asyncio
+async def test_status_transitions_set_lifecycle_timestamps(monkeypatch):
+    owner = make_user(username="owner")
+    invitee = make_user(username="invitee")
+    collab = make_collab(owner.id)
+    accepted_participant = SimpleNamespace(user_id=invitee.id)
+    patch_collab_repo(
+        monkeypatch,
+        collab=collab,
+        participant_user_id=owner.id,
+        accepted_participants=[accepted_participant],
+    )
+    ctx = make_ctx(owner)
+
+    await _update_collaboration(
+        ctx, str(collab.id), SimpleNamespace(status=SimpleNamespace(value="accepted"))
+    )
+    assert collab.started_at is None
+
+    await _update_collaboration(
+        ctx, str(collab.id), SimpleNamespace(status=SimpleNamespace(value="in_progress"))
+    )
+    started_at = collab.started_at
+    assert started_at is not None
+
+    await _update_collaboration(
+        ctx, str(collab.id), SimpleNamespace(status=SimpleNamespace(value="completed"))
+    )
+    assert collab.started_at == started_at
+    assert collab.completed_at is not None
 # ── Add milestone (_add_milestone) ────────────────────────────────────────────
 
 
@@ -393,6 +449,20 @@ async def test_add_milestone_rejects_missing_collaboration(monkeypatch):
 
     with pytest.raises(ValueError, match="Collaboration not found"):
         await _add_milestone(make_ctx(owner), _milestone_input(uuid.uuid4()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [CollaborationStatus.DECLINED, CollaborationStatus.COMPLETED, CollaborationStatus.CANCELLED],
+)
+async def test_add_milestone_denies_terminal_collaboration(monkeypatch, terminal_status):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, status=terminal_status)
+    patch_collab_repo(monkeypatch, collab=collab, participant_user_id=owner.id)
+
+    with pytest.raises(ValueError, match="terminal"):
+        await _add_milestone(make_ctx(owner), _milestone_input(collab.id))
 # ── Update milestone (_update_milestone) ──────────────────────────────────────
 
 
@@ -427,6 +497,28 @@ async def test_update_milestone_allows_initiator(monkeypatch):
     )
 
     assert result.title == "Updated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [CollaborationStatus.DECLINED, CollaborationStatus.COMPLETED, CollaborationStatus.CANCELLED],
+)
+async def test_update_milestone_denies_terminal_collaboration(monkeypatch, terminal_status):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, status=terminal_status)
+    milestone = make_milestone(collab.id)
+    patch_collab_repo(
+        monkeypatch,
+        collab=collab,
+        milestone=milestone,
+        participant_user_id=owner.id,
+    )
+
+    with pytest.raises(ValueError, match="terminal"):
+        await _update_milestone(
+            make_ctx(owner), str(milestone.id), _milestone_update_input()
+        )
 
 
 @pytest.mark.asyncio
@@ -510,3 +602,37 @@ async def test_update_milestone_denies_pending_invitee(monkeypatch):
 
     with pytest.raises(PermissionError, match="Not a participant"):
         await _update_milestone(make_ctx(invitee), str(milestone.id), _milestone_update_input())
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_sets_completed_at_when_status_becomes_completed(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id)
+    milestone = make_milestone(collab.id)
+    patch_collab_repo(monkeypatch, collab=collab, milestone=milestone, participant_user_id=owner.id)
+
+    result = await _update_milestone(
+        make_ctx(owner),
+        str(milestone.id),
+        SimpleNamespace(title=None, description=None, status=SimpleNamespace(value="completed"), due_date=None),
+    )
+
+    assert result.status.value == "completed"
+    assert result.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_does_not_set_completed_at_for_non_completed_status(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id)
+    milestone = make_milestone(collab.id)
+    patch_collab_repo(monkeypatch, collab=collab, milestone=milestone, participant_user_id=owner.id)
+
+    result = await _update_milestone(
+        make_ctx(owner),
+        str(milestone.id),
+        SimpleNamespace(title=None, description=None, status=SimpleNamespace(value="in_progress"), due_date=None),
+    )
+
+    assert result.status.value == "in_progress"
+    assert result.completed_at is None
