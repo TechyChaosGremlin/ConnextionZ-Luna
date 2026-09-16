@@ -3375,14 +3375,11 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     edges = []
     user_repo = UserRepository(ctx.db)
     for profile in profiles:
-        creator_card = CreatorCard(
-            user_id=profile.user_id,
-            display_name=profile.display_name,
-            avatar_url=profile.avatar_url,
-            bio=profile.bio,
-            tags=profile.tags,
-            follower_count=profile.follower_count,
-            following_count=profile.following_count,
+        creator_card = CreatorCardType(
+            user=_user_to_gql(await user_repo.get_by_id(profile.user_id)),
+            profile=_profile_to_gql(profile),
+            relevance_score=0.0,
+            matching_tags=[tag for tag in (profile.tags or []) if not tags or tag in tags] or None,
         )
         edges.append(
             CreatorCardEdge(
@@ -3399,7 +3396,11 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return CreatorCardConnection(edges=edges, page_info=page_info)
+    return CreatorCardConnection(
+        edges=edges,
+        page_info=page_info,
+        total_count=len(edges),
+    )
 
 
 async def _search(ctx, input, first, after) -> SearchResultConnection:
@@ -4148,6 +4149,11 @@ async def _create_collaboration(ctx, input) -> CollaborationType:
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
+    from services.collaboration_service import CollaborationInviteEligibilityService
+
+    participant_ids = await CollaborationInviteEligibilityService(
+        ctx.db
+    ).validate_participant_ids(user, input.participant_ids)
 
     collab = Collaboration(
         initiator_id=user.id,
@@ -4159,19 +4165,19 @@ async def _create_collaboration(ctx, input) -> CollaborationType:
         budget_min=input.budget_min,
         budget_max=input.budget_max,
         budget_currency=input.budget_currency or "USD",
+        proposed_at=datetime.now(timezone.utc).isoformat(),
     )
     try:
         await repo.create(collab)
 
         # Add participants
-        for pid in input.participant_ids:
-            if pid != user.id:
-                participant = CollaborationParticipant(
-                    collaboration_id=collab.id,
-                    user_id=pid,
-                    role="participant",
-                )
-                await repo.add_participant(participant)
+        for pid in participant_ids:
+            participant = CollaborationParticipant(
+                collaboration_id=collab.id,
+                user_id=pid,
+                role="participant",
+            )
+            await repo.add_participant(participant)
 
         # Add initiator as accepted participant
         initiator_participant = CollaborationParticipant(
@@ -4246,7 +4252,11 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
         participant.accepted_at = datetime.now(timezone.utc).isoformat()
         await repo.update_participant(participant)
 
-        collab.status = CollaborationStatus.ACCEPTED
+        collab._update_collaboration(CollaborationStatus.ACCEPTED)
+        if not collab.started_at:
+            collab.started_at = datetime.now(timezone.utc).isoformat()
+        for pending_participant in await repo.get_pending_participants(collab):
+            await repo.remove_participant(pending_participant)
         await repo.update(collab)
 
         await ctx.db.commit()
@@ -4290,7 +4300,9 @@ async def _decline_collaboration(ctx, id) -> bool:
 
     try:
         await repo.remove_participant(participant)
-        collab.status = CollaborationStatus.DECLINED
+        pending_participants = await repo.get_pending_participants(collab)
+        if not pending_participants:
+            collab._update_collaboration(CollaborationStatus.DECLINED)
         await repo.update(collab)
         await ctx.db.commit()
     except Exception:
@@ -4321,26 +4333,45 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
     if collab.initiator_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the collaboration initiator can update it")
 
-    # Apply updates from input
-    for field in ("title", "description", "content_type", "platform", "tags", "budget_min", "budget_max", "budget_currency"):
-        value = getattr(input, field, None)
-        if value is not None:
-            setattr(collab, field, value)
+    previous_state = (collab.status, collab.proposed_at, collab.started_at, collab.completed_at)
+    try:
+        # Apply updates from input
+        for field in ("title", "description", "content_type", "platform", "tags", "budget_min", "budget_max", "budget_currency"):
+            value = getattr(input, field, None)
+            if value is not None:
+                setattr(collab, field, value)
 
-    status = getattr(input, "status", None)
-    if status is not None:
-        collab._update_collaboration(status.value)
+        status = getattr(input, "status", None)
+        if status is not None:
+            next_status = status.value
+            if next_status == "accepted":
+                accepted_participants = await repo.get_accepted_participants(collab)
+                if not any(
+                    participant.user_id != collab.initiator_id
+                    for participant in accepted_participants
+                ):
+                    raise ValueError("Collaboration cannot be accepted before an invitee accepts")
+            collab._update_collaboration(next_status)
+            now = datetime.now(timezone.utc).isoformat()
+            if next_status == "in_progress" and not collab.started_at:
+                collab.started_at = now
+            if next_status == "completed" and not collab.completed_at:
+                collab.completed_at = now
 
-    collab.updated_at = datetime.now(timezone.utc)
-    await repo.update(collab)
-    await ctx.db.commit()
+        collab.updated_at = datetime.now(timezone.utc)
+        await repo.update(collab)
+        await ctx.db.commit()
+    except Exception:
+        collab.status, collab.proposed_at, collab.started_at, collab.completed_at = previous_state
+        await ctx.db.rollback()
+        raise
     return _collaboration_to_gql(collab)
 
 
 async def _add_milestone(ctx, input) -> MilestoneType:
     """Add a milestone to a collaboration."""
     from repositories.collaboration_repository import CollaborationRepository
-    from app.models.collaboration import Milestone, MilestoneStatus
+    from app.models.collaboration import CollaborationStatus, Milestone, MilestoneStatus
     from uuid import uuid4
 
     user = ctx.require_auth()
@@ -4350,6 +4381,12 @@ async def _add_milestone(ctx, input) -> MilestoneType:
     collab = await repo.get_by_id(input.collaboration_id)
     if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
+    if collab.status in (
+        CollaborationStatus.DECLINED,
+        CollaborationStatus.COMPLETED,
+        CollaborationStatus.CANCELLED,
+    ):
+        raise ValueError("Milestones cannot be changed after the collaboration is terminal")
 
     participant = await repo.get_participant(input.collaboration_id, user.id)
     is_accepted_collaborator = participant is not None and participant.accepted
@@ -4379,7 +4416,8 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     """Update a milestone."""
     from repositories.collaboration_repository import CollaborationRepository
     from uuid import UUID as UUID_type
-    from app.models.collaboration import MilestoneStatus
+    from datetime import datetime, timezone
+    from app.models.collaboration import CollaborationStatus, MilestoneStatus
 
     user = ctx.require_auth()
     repo = CollaborationRepository(ctx.db)
@@ -4398,6 +4436,12 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
     collab = await repo.get_by_id(milestone.collaboration_id)
     if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
+    if collab.status in (
+        CollaborationStatus.DECLINED,
+        CollaborationStatus.COMPLETED,
+        CollaborationStatus.CANCELLED,
+    ):
+        raise ValueError("Milestones cannot be changed after the collaboration is terminal")
 
     participant = await repo.get_participant(milestone.collaboration_id, user.id)
     is_accepted_collaborator = participant is not None and participant.accepted
@@ -4411,6 +4455,9 @@ async def _update_milestone(ctx, id, input) -> MilestoneType:
         milestone.description = input.description
     if input.status is not None:
         milestone.status = MilestoneStatus(input.status.value)
+        # Server-derived, not client-suppliable: first transition into COMPLETED stamps it.
+        if milestone.status == MilestoneStatus.COMPLETED and not milestone.completed_at:
+            milestone.completed_at = datetime.now(timezone.utc).isoformat()
     if input.due_date is not None:
         milestone.due_at = input.due_date.isoformat()
 

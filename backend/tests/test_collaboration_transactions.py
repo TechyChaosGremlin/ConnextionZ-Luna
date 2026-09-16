@@ -23,7 +23,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api.graphql import AppContext, _add_milestone, _create_collaboration, _update_milestone
+from api.graphql import (
+    AppContext,
+    _add_milestone,
+    _create_collaboration,
+    _update_collaboration,
+    _update_milestone,
+)
 from app.models.collaboration import CollaborationStatus, MilestoneStatus
 from app.models.user import AccountStatus, User, UserRole
 
@@ -66,9 +72,16 @@ def _stub_analytics(monkeypatch):
     async def fake_track_event(self, **kwargs):
         return None
 
+    async def allow_participants(self, initiator, participant_ids):
+        return participant_ids
+
     monkeypatch.setattr(
         "services.analytics_event_service.AnalyticsEventService.track_event",
         fake_track_event,
+    )
+    monkeypatch.setattr(
+        "services.collaboration_service.CollaborationInviteEligibilityService.validate_participant_ids",
+        allow_participants,
     )
 
 
@@ -107,11 +120,16 @@ async def test_create_collaboration_rolls_back_when_participant_insert_fails(mon
 
 
 def make_collab(initiator_id=None, deleted_at=None) -> SimpleNamespace:
-    return SimpleNamespace(
+    collab = SimpleNamespace(
         id=uuid.uuid4(),
         initiator_id=initiator_id if initiator_id is not None else uuid.uuid4(),
+        status=CollaborationStatus.PROPOSED,
         deleted_at=deleted_at,
     )
+    collab._update_collaboration = lambda new_status: setattr(
+        collab, "status", CollaborationStatus(new_status)
+    )
+    return collab
 
 
 def make_milestone_input(collaboration_id, **overrides):
@@ -216,5 +234,59 @@ async def test_update_milestone_rolls_back_and_preserves_prior_state_when_update
     with pytest.raises(RuntimeError, match="milestone update failed"):
         await _update_milestone(ctx, str(milestone.id), update_input)
 
+    ctx.db.rollback.assert_awaited_once_with()
+    ctx.db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_collaboration_rolls_back_when_status_update_fails(monkeypatch):
+    owner = make_user(username="owner")
+    collab = SimpleNamespace(
+        id=uuid.uuid4(),
+        initiator_id=owner.id,
+        title="Original",
+        description=None,
+        content_type=None,
+        platform=None,
+        tags=None,
+        budget_min=None,
+        budget_max=None,
+        budget_currency="USD",
+        status=CollaborationStatus.ACCEPTED,
+        proposed_at=None,
+        started_at=None,
+        completed_at=None,
+        updated_at=None,
+        created_at=None,
+        deleted_at=None,
+    )
+    collab._update_collaboration = lambda new_status: setattr(
+        collab, "status", CollaborationStatus(new_status)
+    )
+
+    async def fake_get_by_id(self, entity_id):
+        return collab
+
+    async def fail_update(self, collaboration):
+        raise RuntimeError("collaboration update failed")
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_by_id",
+        fake_get_by_id,
+    )
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.update",
+        fail_update,
+    )
+
+    ctx = make_ctx(owner)
+    with pytest.raises(RuntimeError, match="collaboration update failed"):
+        await _update_collaboration(
+            ctx,
+            str(collab.id),
+            SimpleNamespace(status=SimpleNamespace(value="completed")),
+        )
+
+    assert collab.status == CollaborationStatus.ACCEPTED
     ctx.db.rollback.assert_awaited_once_with()
     ctx.db.commit.assert_not_awaited()

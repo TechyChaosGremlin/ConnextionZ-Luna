@@ -98,6 +98,16 @@ def repo_participants(monkeypatch):
         "repositories.collaboration_repository.CollaborationRepository.add_participant",
         fake_add_participant,
     )
+
+    async def allow_participants(self, initiator, participant_ids):
+        if initiator.id in participant_ids:
+            raise ValueError("You cannot invite yourself to a collaboration")
+        return participant_ids
+
+    monkeypatch.setattr(
+        "services.collaboration_service.CollaborationInviteEligibilityService.validate_participant_ids",
+        allow_participants,
+    )
     return participants
 
 
@@ -124,6 +134,7 @@ async def test_create_collaboration_creates_collaboration_with_participants_and_
     assert result.budget_min == 100.0
     assert result.budget_max == 500.0
     assert result.budget_currency == "USD"
+    assert result.proposed_at is not None
     # The GraphQL CollaborationType.status is the strawberry enum; compare by value.
     assert result.status.value == CollaborationStatus.PROPOSED.value
 
@@ -144,20 +155,18 @@ async def test_create_collaboration_creates_collaboration_with_participants_and_
 
 
 @pytest.mark.asyncio
-async def test_create_collaboration_does_not_duplicate_initiator(repo_participants):
+async def test_create_collaboration_rejects_self_invite(repo_participants):
     owner = make_user(username="owner")
     other = uuid.uuid4()
     ctx = make_ctx(owner)
 
-    await _create_collaboration(
-        ctx,
-        make_input(participant_ids=[other, owner.id]),  # owner listed too
-    )
+    with pytest.raises(ValueError, match="cannot invite yourself"):
+        await _create_collaboration(
+            ctx,
+            make_input(participant_ids=[other, owner.id]),
+        )
 
-    # Initiator is added exactly once: only the "other" pending participant + initiator.
-    assert len(repo_participants) == 2
-    assert sorted(p.user_id for p in repo_participants) == sorted([owner.id, other])
-    assert sum(1 for p in repo_participants if p.role == "initiator") == 1
+    assert repo_participants == []
 
 
 @pytest.mark.asyncio

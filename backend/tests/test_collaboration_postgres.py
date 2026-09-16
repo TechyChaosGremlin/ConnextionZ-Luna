@@ -27,12 +27,23 @@ from types import SimpleNamespace
 from typing import AsyncGenerator
 
 import pytest
-from sqlalchemy import text
+import pytest_asyncio
+from sqlalchemy import delete, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.graphql import AppContext, _accept_collaboration, _decline_collaboration
-from app.db.session import async_session_factory
+from api.graphql import (
+    AppContext,
+    _accept_collaboration,
+    _add_milestone,
+    _collaboration,
+    _create_collaboration,
+    _decline_collaboration,
+    _discover_creators,
+    _update_collaboration,
+    _update_milestone,
+)
+from app.db.session import async_engine, async_session_factory
 from app.models.collaboration import (
     Collaboration,
     CollaborationParticipant,
@@ -40,8 +51,28 @@ from app.models.collaboration import (
     Milestone,
     MilestoneStatus,
 )
-from app.models.user import AccountStatus, User, UserRole
+from app.models.user import AccountStatus, Profile, User, UserRole
 from repositories.collaboration_repository import CollaborationRepository
+
+
+# ── Fixtures ─────────────────────────────────────────────────────────
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_async_engine_pool_per_test():
+    """Dispose pooled asyncpg connections after every test.
+
+    pytest-asyncio (strict mode) gives each test function its own event
+    loop, but ``async_engine`` is a module-level singleton whose pool holds
+    asyncpg connections bound to whichever loop created them. Left
+    undisposed, the next test's new loop tries to reuse a connection tied
+    to an already-closed loop, producing "Event loop is closed" /
+    "'NoneType' object has no attribute 'send'" failures. Disposing the
+    pool here (while its owning loop is still open) forces fresh
+    connections to be created per test.
+    """
+    yield
+    await async_engine.dispose()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -89,6 +120,7 @@ async def create_and_commit_user(prefix: str) -> User:
     )
     async with async_session_factory() as session:
         session.add(user)
+        await session.flush()
         await session.commit()
     return user
 
@@ -1170,4 +1202,202 @@ async def test_decline_collaboration_failure_leaves_database_consistent():
             assert participant.accepted is False
     finally:
         await cleanup_users(initiator.id, participant_user.id)
+
+
+@pytest.mark.asyncio
+async def test_full_collaboration_lifecycle_end_to_end():
+    """16. End-to-end persisted lifecycle through the real resolvers against Postgres:
+
+    create -> pending invite -> invitee view -> accept -> in_progress ->
+    add milestone -> update milestone (in_progress -> completed) -> complete
+    collaboration. Each step uses its own session/AppContext (a fresh
+    "request") so every assertion reads back genuinely persisted state.
+    """
+    initiator = await create_and_commit_user("e2e_init")
+    invitee = await create_and_commit_user("e2e_invitee")
+    collab_id = None
+
+    try:
+        # 1-3. Create via the real mutation; verify PROPOSED + pending invite persisted.
+        create_input = SimpleNamespace(
+            title="E2E Livestream Collab",
+            description="Full lifecycle coverage",
+            content_type="livestream",
+            platform="twitch",
+            tags=["e2e", "lifecycle"],
+            participant_ids=[invitee.id],
+            budget_min=100.0,
+            budget_max=400.0,
+            budget_currency="USD",
+        )
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=initiator, session_id="e2e-create")
+            created = await _create_collaboration(ctx, create_input)
+        collab_id = created.id
+
+        assert created.status.value == "proposed"
+        assert created.proposed_at is not None
+        assert created.started_at is None
+        assert created.completed_at is None
+
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            invitee_participant = await repo.get_participant(collab_id, invitee.id)
+            assert invitee_participant is not None
+            assert invitee_participant.accepted is False
+
+        # 4. The pending invitee can view the collaboration while it's still PROPOSED.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=invitee, session_id="e2e-view")
+            viewed = await _collaboration(ctx, str(collab_id))
+        assert viewed is not None
+        assert viewed.status.value == "proposed"
+
+        # 5-7. Accept through the real mutation; verify ACCEPTED + timestamps.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=invitee, session_id="e2e-accept")
+            accepted_participant = await _accept_collaboration(ctx, collab_id)
+        assert accepted_participant.accepted is True
+
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            collab = await repo.get_by_id(collab_id)
+            assert collab.status == CollaborationStatus.ACCEPTED
+            assert collab.proposed_at is not None
+            assert collab.started_at is not None
+            started_at_after_accept = collab.started_at
+
+        # 8-9. Transition to IN_PROGRESS; started_at must remain the accept-time value.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=initiator, session_id="e2e-in-progress")
+            in_progress = await _update_collaboration(
+                ctx, str(collab_id), SimpleNamespace(status=SimpleNamespace(value="in_progress"))
+            )
+        assert in_progress.status.value == "in_progress"
+        assert in_progress.started_at is not None
+        assert in_progress.started_at.isoformat() == started_at_after_accept
+
+        # 10. Add a milestone through the real mutation.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=initiator, session_id="e2e-add-milestone")
+            milestone = await _add_milestone(
+                ctx,
+                SimpleNamespace(
+                    collaboration_id=collab_id,
+                    title="Phase 1: Stream Setup",
+                    description="Configure stream and channel",
+                    due_date=None,
+                ),
+            )
+        milestone_id = milestone.id
+        assert milestone.status.value == "pending"
+        assert milestone.completed_at is None
+
+        # 11. Update the milestone to IN_PROGRESS; completed_at must stay unset.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=initiator, session_id="e2e-milestone-progress")
+            milestone = await _update_milestone(
+                ctx,
+                str(milestone_id),
+                SimpleNamespace(title=None, description=None, status=SimpleNamespace(value="in_progress"), due_date=None),
+            )
+        assert milestone.status.value == "in_progress"
+        assert milestone.completed_at is None
+
+        # 12-13. Complete the milestone; completed_at must now be persisted.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=initiator, session_id="e2e-milestone-complete")
+            milestone = await _update_milestone(
+                ctx,
+                str(milestone_id),
+                SimpleNamespace(title=None, description=None, status=SimpleNamespace(value="completed"), due_date=None),
+            )
+        assert milestone.status.value == "completed"
+        assert milestone.completed_at is not None
+
+        # 14-16. Complete the collaboration; completed_at persisted, status COMPLETED.
+        async with async_session_factory() as session:
+            ctx = AppContext(db=session, current_user=initiator, session_id="e2e-complete")
+            completed = await _update_collaboration(
+                ctx, str(collab_id), SimpleNamespace(status=SimpleNamespace(value="completed"))
+            )
+        assert completed.status.value == "completed"
+        assert completed.completed_at is not None
+
+        # 17. Final state, read back from an independent session.
+        async with async_session_factory() as session:
+            repo = CollaborationRepository(session)
+            final_collab = await repo.get_by_id(collab_id)
+            assert final_collab.status == CollaborationStatus.COMPLETED
+            assert final_collab.proposed_at is not None
+            assert final_collab.started_at is not None
+            assert final_collab.completed_at is not None
+
+            final_milestone = await repo.get_milestone_by_id(milestone_id)
+            assert final_milestone.status == MilestoneStatus.COMPLETED
+            assert final_milestone.completed_at is not None
+    finally:
+        await cleanup_users(initiator.id, invitee.id)
+
+
+@pytest.mark.asyncio
+async def test_discovered_creator_becomes_pending_collaboration_participant():
+    """A discovered creator's returned user ID is eligible and persisted as an invitee."""
+    initiator = await create_and_commit_user("handoff_init")
+    creator = await create_and_commit_user("handoff_creator")
+    handoff_tag = f"step-10-handoff-{creator.id}"
+
+    try:
+        async with async_session_factory() as session:
+            session.add(
+                Profile(
+                    user_id=creator.id,
+                    display_name="Handoff Creator",
+                    tags=[handoff_tag],
+                    open_to_collab=True,
+                    private_account=False,
+                )
+            )
+            await session.commit()
+
+        async with async_session_factory() as session:
+            discovery = await _discover_creators(
+                AppContext(db=session, current_user=initiator, session_id="handoff-discovery"),
+                query=None,
+                tags=[handoff_tag],
+                first=20,
+                after=None,
+            )
+        selected_creator_id = discovery.edges[0].node.user.id
+        assert selected_creator_id == creator.id
+
+        create_input = SimpleNamespace(
+            title="Discovered Creator Handoff",
+            description=None,
+            content_type="video",
+            platform="youtube",
+            tags=[handoff_tag],
+            participant_ids=[selected_creator_id],
+            budget_min=None,
+            budget_max=None,
+            budget_currency=None,
+        )
+        async with async_session_factory() as session:
+            created = await _create_collaboration(
+                AppContext(db=session, current_user=initiator, session_id="handoff-create"),
+                create_input,
+            )
+
+        async with async_session_factory() as session:
+            participant = await CollaborationRepository(session).get_participant(
+                created.id, selected_creator_id
+            )
+            assert participant is not None
+            assert participant.user_id == selected_creator_id
+            assert participant.accepted is False
+    finally:
+        async with async_session_factory() as session:
+            await session.execute(delete(Profile).where(Profile.user_id == creator.id))
+            await session.execute(delete(User).where(User.id.in_([initiator.id, creator.id])))
+            await session.commit()
 

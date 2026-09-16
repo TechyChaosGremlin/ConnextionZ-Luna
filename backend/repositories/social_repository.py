@@ -128,6 +128,44 @@ class FeedSafetyRepository:
         )
         return set(blocked.scalars()) | set(blocking_viewer.scalars()) | set(muted.scalars())
 
+    async def get_invitation_restricted_user_ids(
+        self, initiator_id: uuid.UUID, target_ids: list[uuid.UUID]
+    ) -> set[uuid.UUID]:
+        """Return invitees blocked or muted in either direction."""
+        if not target_ids:
+            return set()
+
+        blocked_by_initiator = await self.db.execute(
+            select(UserBlock.blocked_id).where(
+                UserBlock.blocker_id == initiator_id,
+                UserBlock.blocked_id.in_(target_ids),
+            )
+        )
+        blocking_initiator = await self.db.execute(
+            select(UserBlock.blocker_id).where(
+                UserBlock.blocked_id == initiator_id,
+                UserBlock.blocker_id.in_(target_ids),
+            )
+        )
+        muted_by_initiator = await self.db.execute(
+            select(UserMute.muted_id).where(
+                UserMute.muter_id == initiator_id,
+                UserMute.muted_id.in_(target_ids),
+            )
+        )
+        muting_initiator = await self.db.execute(
+            select(UserMute.muter_id).where(
+                UserMute.muted_id == initiator_id,
+                UserMute.muter_id.in_(target_ids),
+            )
+        )
+        return (
+            set(blocked_by_initiator.scalars())
+            | set(blocking_initiator.scalars())
+            | set(muted_by_initiator.scalars())
+            | set(muting_initiator.scalars())
+        )
+
 
 class PostInteractionRepository:
     """Likes/saves/shares/watches for posts — mirrors the legacy toggle semantics."""
