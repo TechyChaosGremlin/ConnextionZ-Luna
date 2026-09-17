@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     """Top-level application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file="../.env",
+        env_file=Path(__file__).resolve().parents[1] / ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

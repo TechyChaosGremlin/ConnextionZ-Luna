@@ -30,6 +30,7 @@ from api.graphql import (
     _accept_collaboration,
     _decline_collaboration,
 )
+from app.models.analytics import EventType
 from app.models.collaboration import CollaborationStatus
 from app.models.user import AccountStatus, User, UserRole
 
@@ -74,6 +75,21 @@ def make_collab(initiator_id=None, status=CollaborationStatus.PROPOSED, deleted_
         collab, "status", CollaborationStatus(new_status)
     )
     return collab
+
+
+@pytest.fixture(autouse=True)
+def _stub_analytics(monkeypatch):
+    calls = []
+
+    async def fake_track_event(self, **kwargs):
+        calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "services.analytics_event_service.AnalyticsEventService.track_event",
+        fake_track_event,
+    )
+    return calls
 
 
 def patch_repo(monkeypatch, participant, collab, pending_participants=None):
@@ -152,7 +168,7 @@ def patch_repo(monkeypatch, participant, collab, pending_participants=None):
 
 
 @pytest.mark.asyncio
-async def test_accept_collaboration_marks_participant_and_collaboration_accepted(monkeypatch):
+async def test_accept_collaboration_marks_participant_and_collaboration_accepted(monkeypatch, _stub_analytics):
     user = make_user()
     participant = make_participant(user.id)
     collab = make_collab()
@@ -172,6 +188,12 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     # Accepting activates the existing participant row; it never inserts a
     # brand-new collaboration/participant record.
     assert state["add_participant_calls"] == 0
+    assert len(_stub_analytics) == 1
+    event = _stub_analytics[0]
+    assert event["event_type"] == EventType.COLLAB_CREATED
+    assert event["user"] is user
+    assert event["session_id"] == "sess-test"
+    assert event["metadata"] == {"collaboration_id": str(collab.id), "outcome": "accepted"}
 
 
 @pytest.mark.asyncio

@@ -4266,6 +4266,16 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
             ConversationRepository(ctx.db)
         ).ensure_direct_conversation(collab, participant)
 
+        from app.models.analytics import EventType
+        from services.analytics_event_service import AnalyticsEventService
+
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.COLLAB_CREATED,
+            user=user,
+            session_id=ctx.session_id,
+            metadata={"collaboration_id": str(collab.id), "outcome": "accepted"},
+        )
+
         await ctx.db.commit()
     except Exception:
         await ctx.db.rollback()
