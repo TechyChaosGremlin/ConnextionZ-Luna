@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.analytics import InteractionSignal, SignalType
 from repositories.base import BaseRepository
+from repositories.feed_ranking import ViewerPostSignals
 
 
 class AnalyticsRepository(BaseRepository[InteractionSignal]):
