@@ -262,3 +262,39 @@ class CollaborationRepository(BaseRepository[Collaboration]):
         )
         return list(result.scalars().all())
 
+    async def get_pairwise_history(
+        self,
+        user_id: uuid.UUID,
+        other_user_id: uuid.UUID,
+    ) -> list[Collaboration]:
+        """Return non-deleted collaborations involving both users."""
+        participant_ids = (
+            select(CollaborationParticipant.collaboration_id)
+            .where(
+                CollaborationParticipant.user_id == other_user_id,
+            )
+            .scalar_subquery()
+        )
+
+        stmt = (
+            select(Collaboration)
+            .where(
+                Collaboration.deleted_at.is_(None),
+                Collaboration.id.in_(participant_ids),
+                or_(
+                    Collaboration.initiator_id == user_id,
+                    Collaboration.id.in_(
+                        select(CollaborationParticipant.collaboration_id).where(
+                            CollaborationParticipant.user_id == user_id
+                        )
+                    ),
+                ),
+            )
+            .order_by(
+                Collaboration.created_at.desc(),
+                Collaboration.id.desc(),
+            )
+        )
+
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())

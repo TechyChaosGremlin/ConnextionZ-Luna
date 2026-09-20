@@ -263,6 +263,61 @@ async def test_get_for_user_initiator_and_participant():
         assert collab2.id not in user_c_ids
 
 
+
+@pytest.mark.asyncio
+async def test_get_pairwise_history():
+    """Return collaborations shared by two users."""
+    async with transactional_session() as session:
+        user_a = await create_test_user(session, "pairwise_a")
+        user_b = await create_test_user(session, "pairwise_b")
+        user_c = await create_test_user(session, "pairwise_c")
+
+        shared_collab = Collaboration(
+            initiator_id=user_a.id,
+            title="Shared Collaboration",
+            status=CollaborationStatus.COMPLETED,
+            tags=["art", "crafting"],
+        )
+
+        unrelated_collab = Collaboration(
+            initiator_id=user_a.id,
+            title="Unrelated Collaboration",
+            status=CollaborationStatus.COMPLETED,
+        )
+
+        session.add_all([shared_collab, unrelated_collab])
+        await session.flush()
+
+        session.add_all(
+            [
+                CollaborationParticipant(
+                    collaboration_id=shared_collab.id,
+                    user_id=user_b.id,
+                    role="participant",
+                    accepted=True,
+                ),
+                CollaborationParticipant(
+                    collaboration_id=unrelated_collab.id,
+                    user_id=user_c.id,
+                    role="participant",
+                    accepted=True,
+                ),
+            ]
+        )
+        await session.flush()
+
+        repo = CollaborationRepository(session)
+
+        history = await repo.get_pairwise_history(
+            user_a.id,
+            user_b.id,
+        )
+
+        assert len(history) == 1
+        assert history[0].id == shared_collab.id
+        assert history[0].status == CollaborationStatus.COMPLETED
+
+
 @pytest.mark.asyncio
 async def test_status_filtering():
     """3. status filtering on get_for_user() and status_counts_for_user()."""
@@ -780,6 +835,7 @@ async def test_concurrent_accept_accept_same_invite_exactly_one_wins():
         async with async_session_factory() as session:
             repo = CollaborationRepository(session)
             collab = await repo.get_by_id(collab_id)
+            assert collab is not None
             assert collab.status == CollaborationStatus.ACCEPTED
 
             participant = await repo.get_participant(collab_id, participant_user.id)
@@ -826,6 +882,7 @@ async def test_concurrent_accept_decline_race_exactly_one_wins():
             collab = await repo.get_by_id(collab_id)
             participant = await repo.get_participant(collab_id, participant_user.id)
 
+            assert collab is not None
             assert collab.status in (
                 CollaborationStatus.ACCEPTED,
                 CollaborationStatus.DECLINED,
@@ -928,6 +985,7 @@ async def test_explicit_row_lock_blocks_concurrent_transaction():
                 # in Postgres until this transaction commits/releases the lock).
                 await b_attempted.wait()
                 await asyncio.sleep(0.3)
+                assert locked is not None
                 locked.title = "Updated by A while holding the lock"
                 await CollaborationRepository(session).update(locked)
             timestamps["a_committed"] = time.monotonic()
@@ -941,6 +999,7 @@ async def test_explicit_row_lock_blocks_concurrent_transaction():
                 # This blocks at the PostgreSQL level until session A commits.
                 locked = await repo.get_by_id_for_update(collab_id)
                 timestamps["b_locked"] = time.monotonic()
+                assert locked is not None
                 return locked.title
 
     try:
@@ -1160,6 +1219,7 @@ async def test_accept_collaboration_failure_leaves_database_consistent():
         async with async_session_factory() as session:
             repo = CollaborationRepository(session)
             collab = await repo.get_by_id(collab_id)
+            assert collab is not None
             assert collab.status == CollaborationStatus.PROPOSED
 
             participant = await repo.get_participant(collab_id, participant_user.id)
@@ -1244,6 +1304,7 @@ async def test_messaging_bridge_failure_rolls_back_collaboration_acceptance(monk
             participant = await CollaborationRepository(session).get_participant(
                 collab_id, participant_user.id
             )
+            assert collaboration is not None
             assert collaboration.status == CollaborationStatus.PROPOSED
             assert participant is not None
             assert participant.accepted is False
@@ -1278,6 +1339,7 @@ async def test_decline_collaboration_failure_leaves_database_consistent():
         async with async_session_factory() as session:
             repo = CollaborationRepository(session)
             collab = await repo.get_by_id(collab_id)
+            assert collab is not None
             assert collab.status == CollaborationStatus.PROPOSED
 
             participant = await repo.get_participant(collab_id, participant_user.id)
@@ -1345,6 +1407,7 @@ async def test_full_collaboration_lifecycle_end_to_end():
         async with async_session_factory() as session:
             repo = CollaborationRepository(session)
             collab = await repo.get_by_id(collab_id)
+            assert collab is not None
             assert collab.status == CollaborationStatus.ACCEPTED
             assert collab.proposed_at is not None
             assert collab.started_at is not None
@@ -1411,12 +1474,14 @@ async def test_full_collaboration_lifecycle_end_to_end():
         async with async_session_factory() as session:
             repo = CollaborationRepository(session)
             final_collab = await repo.get_by_id(collab_id)
+            assert final_collab is not None
             assert final_collab.status == CollaborationStatus.COMPLETED
             assert final_collab.proposed_at is not None
             assert final_collab.started_at is not None
             assert final_collab.completed_at is not None
 
             final_milestone = await repo.get_milestone_by_id(milestone_id)
+            assert final_milestone is not None
             assert final_milestone.status == MilestoneStatus.COMPLETED
             assert final_milestone.completed_at is not None
     finally:

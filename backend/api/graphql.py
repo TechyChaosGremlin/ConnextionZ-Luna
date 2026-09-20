@@ -12,6 +12,11 @@ from the JWT Bearer token.
 
 from __future__ import annotations
 
+from repositories.creator_scoring import (
+    calculate_collaboration_history,
+    calculate_collaboration_history_score,
+)
+
 import uuid
 import re
 from datetime import datetime
@@ -3332,6 +3337,8 @@ async def _live_stream(ctx, id) -> Optional[LiveStreamType]:
         viewer_count=stream.viewer_count,
         started_at=stream.started_at,
         ended_at=stream.ended_at,
+        created_at=stream.created_at,
+        updated_at=stream.updated_at,
     )
 
 
@@ -3343,7 +3350,9 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     from uuid import UUID as UUID_type
     from repositories.profile_repository import ProfileRepository
     from repositories.user_repository import UserRepository
-    
+    from repositories.collaboration_repository import CollaborationRepository
+
+    collab_repo = CollaborationRepository(ctx.db)
     repo = ProfileRepository(ctx.db)
     
     # Parse cursor for pagination
@@ -3375,10 +3384,23 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     edges = []
     user_repo = UserRepository(ctx.db)
     for profile in profiles:
+        pairwise_history = await collab_repo.get_pairwise_history(
+            ctx.user.id,
+            profile.user_id,
+        )
+
+        history_statuses = [str(collab.status.value) for collab in pairwise_history]
+        collaboration_count, positive_outcomes = calculate_collaboration_history(
+            history_statuses
+        )
+        collaboration_history_score = calculate_collaboration_history_score(
+            collaboration_count,
+            positive_outcomes,
+        )
         creator_card = CreatorCardType(
             user=_user_to_gql(await user_repo.get_by_id(profile.user_id)),
             profile=_profile_to_gql(profile),
-            relevance_score=0.0,
+            relevance_score=collaboration_history_score,
             matching_tags=[tag for tag in (profile.tags or []) if not tags or tag in tags] or None,
         )
         edges.append(

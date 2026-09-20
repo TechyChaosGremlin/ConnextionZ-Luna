@@ -351,3 +351,34 @@ def calculate_interest_match(
 
     return calculate_interest_score(shared_count)
 
+def calculate_collaboration_history_score(
+    collaboration_count: int = 0,
+    positive_outcomes: int = 0,
+) -> float:
+    """Score prior collaboration history for creator matching."""
+    collaboration_score = min(collaboration_count, 4) / 4 * 60.0
+    outcome_score = min(positive_outcomes, 4) / 4 * 40.0
+
+    return max(
+        0.0,
+        min(
+            100.0,
+            collaboration_score + outcome_score,
+        ),
+    )
+
+def calculate_collaboration_history(
+    statuses: list[str] | None,
+) -> tuple[int, int]:
+    """Return total collaboration count and completed collaboration count."""
+    if not statuses:
+        return 0, 0
+
+    collaboration_count = len(statuses)
+    positive_outcomes = sum(
+        1
+        for status in statuses
+        if str(status).lower() == "completed"
+    )
+
+    return collaboration_count, positive_outcomes
