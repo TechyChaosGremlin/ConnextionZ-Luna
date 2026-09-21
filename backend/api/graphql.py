@@ -19,7 +19,7 @@ from repositories.creator_scoring import (
 
 import uuid
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import wraps
 from typing import AsyncIterator, Optional, List, Callable
@@ -29,6 +29,7 @@ from fastapi import Request, Response
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from strawberry.fastapi import BaseContext, GraphQLRouter
+from strawberry.extensions import SchemaExtension
 from strawberry.schema.config import StrawberryConfig
 from strawberry.types import Info as StrawberryInfo
 
@@ -1002,19 +1003,6 @@ class AuthPayloadType:
 # (Placeholder — full connection types will use generic edge/node patterns)
 
 
-@strawberry.type
-class PostEdge:
-    cursor: str
-    node: PostType
-
-
-@strawberry.type
-class PostConnection:
-    edges: List[PostEdge]
-    page_info: PageInfo
-    total_count: int
-
-
 # ── Input Types ──────────────────────────────────────────────────────────────
 
 
@@ -1034,18 +1022,6 @@ class LoginInput:
 @strawberry.input
 class RefreshTokenInput:
     refresh_token: str
-
-
-@strawberry.input
-class UpdateProfileInput:
-    display_name: Optional[str] = None
-    bio: Optional[str] = None
-    avatar_url: Optional[str] = None
-    cover_image_url: Optional[str] = None
-    website_url: Optional[str] = None
-    location: Optional[str] = None
-    social_links: strawberry.scalars.JSON | None = None
-    tags: Optional[List[str]] = None
 
 
 @strawberry.input
@@ -2233,6 +2209,7 @@ async def _my_collaborations(ctx, status, first, after) -> CollaborationConnecti
         raise ValueError("Authentication required")
     
     from uuid import UUID as UUID_type
+    from repositories.collaboration_repository import CollaborationRepository
     
     repo = CollaborationRepository(ctx.db)
     
@@ -2280,7 +2257,11 @@ async def _my_collaborations(ctx, status, first, after) -> CollaborationConnecti
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return CollaborationConnection(edges=edges, page_info=page_info)
+    return CollaborationConnection(
+        edges=edges,
+        page_info=page_info,
+        total_count=len(edges),
+    )
 
 
 async def _register(ctx: AppContext, input: RegisterInput) -> AuthPayloadType:
@@ -2360,6 +2341,8 @@ async def _refresh_token(ctx: AppContext, refresh_token_str: str) -> AuthPayload
 
     user_id = payload.get("sub")
     user_repo = UserRepository(ctx.db)
+    if not user_id:
+        raise ValueError("Invalid refresh token subject")
     user = await user_repo.get_by_id(user_id)
     if not user:
         raise ValueError("User not found")
@@ -2599,7 +2582,9 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
     from repositories.profile_repository import ProfileRepository
     from repositories.social_repository import FeedSafetyRepository
     from repositories.analytics_repository import AnalyticsRepository
-    from repositories import feed_ranking
+    import importlib
+
+    feed_ranking = importlib.import_module("repositories.feed_ranking")
 
     post_repo = PostRepository(ctx.db)
     analytics_repo = AnalyticsRepository(ctx.db)
@@ -2779,18 +2764,18 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
     repo = PostRepository(ctx.db)
     
     # Cursor contains the ordered timestamp and UUID tie-breaker.
-    before = None
+    before_id = None
     if after:
         try:
-            before_time, before_id = after.rsplit("|", 1)
-            before = (datetime.fromisoformat(before_time), UUID_type(before_id))
+            _before_time, before_id = after.rsplit("|", 1)
+            before_id = UUID_type(before_id)
         except (TypeError, ValueError):
             raise ValueError("Invalid cursor")
     
     posts = await repo.get_by_user_id(
         user_id=uid,
         limit=first + 1,  # Fetch one extra to check hasNextPage
-        before=before,
+        before_id=before_id,
     )
     
     # Check if there are more results
@@ -2815,7 +2800,11 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return PostConnection(edges=edges, page_info=page_info)
+    return PostConnection(
+        edges=edges,
+        page_info=page_info,
+        total_count=len(edges),
+    )
 
 
 async def _collaboration_marketplace(ctx, tags, content_type, first, after) -> CollaborationConnection:
@@ -2866,7 +2855,11 @@ async def _collaboration_marketplace(ctx, tags, content_type, first, after) -> C
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return CollaborationConnection(edges=edges, page_info=page_info)
+    return CollaborationConnection(
+        edges=edges,
+        page_info=page_info,
+        total_count=len(edges),
+    )
 
 
 async def _collaboration(ctx, id) -> Optional[CollaborationType]:
@@ -3088,7 +3081,11 @@ async def _notifications(ctx, unread_only, first, after) -> NotificationConnecti
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return NotificationConnection(edges=edges, page_info=page_info)
+    return NotificationConnection(
+        edges=edges,
+        page_info=page_info,
+        total_count=len(edges),
+    )
 
 
 async def _unread_notification_count(ctx) -> int:
@@ -3109,15 +3106,18 @@ async def _reputation(ctx, user_id) -> Optional[ReputationScoreType]:
         raise ValueError("Authentication required")
     
     from uuid import UUID as UUID_type
-    from repositories.reputation_repository import ReputationRepository
+    from sqlalchemy import select
+    from app.models.reputation import ReputationScore
     
     try:
         uid = UUID_type(user_id)
     except ValueError:
         raise ValueError("Invalid user ID")
     
-    repo = ReputationRepository(ctx.db)
-    score = await repo.get_reputation_score(uid)
+    result = await ctx.db.execute(
+        select(ReputationScore).where(ReputationScore.user_id == uid)
+    )
+    score = result.scalar_one_or_none()
     
     if not score:
         return None
@@ -3126,11 +3126,20 @@ async def _reputation(ctx, user_id) -> Optional[ReputationScoreType]:
         id=score.id,
         user_id=score.user_id,
         overall_score=score.overall_score,
-        content_score=score.content_score,
+        content_quality_score=score.content_quality_score,
         collaboration_score=score.collaboration_score,
-        endorsement_count=score.endorsement_count,
-        badge_count=score.badge_count,
-        last_calculated_at=score.last_calculated_at,
+        community_score=score.community_score,
+        reliability_score=score.reliability_score,
+        total_endorsements=score.total_endorsements,
+        completed_collaborations=score.completed_collaborations,
+        on_time_delivery_rate=score.on_time_delivery_rate,
+        computed_at=(
+            datetime.fromisoformat(score.computed_at)
+            if score.computed_at
+            else None
+        ),
+        created_at=score.created_at,
+        updated_at=score.updated_at,
     )
 
 
@@ -3140,15 +3149,13 @@ async def _endorsements(ctx, user_id, category, first, after) -> EndorsementConn
         raise ValueError("Authentication required")
     
     from uuid import UUID as UUID_type
-    from repositories.reputation_repository import ReputationRepository
-    from app.models.reputation import EndorsementStatus
+    from sqlalchemy import select
+    from app.models.reputation import Endorsement
     
     try:
         uid = UUID_type(user_id)
     except ValueError:
         raise ValueError("Invalid user ID")
-    
-    repo = ReputationRepository(ctx.db)
     
     # Parse cursor for pagination
     before_id = None
@@ -3158,18 +3165,18 @@ async def _endorsements(ctx, user_id, category, first, after) -> EndorsementConn
         except ValueError:
             raise ValueError("Invalid cursor")
     
-    # Get endorsements
-    status_filter = EndorsementStatus.APPROVED  # Only show approved
-    endorsements = await repo.get_endorsements_for_user(
-        user_id=uid,
-        status=status_filter,
-        limit=first + 1,
-        before_id=before_id,
-    )
+    stmt = select(Endorsement).where(Endorsement.endorsee_id == uid)
+    if before_id:
+        stmt = stmt.where(Endorsement.id < before_id)
+    stmt = stmt.order_by(
+        Endorsement.created_at.desc(), Endorsement.id.desc()
+    ).limit(first + 1)
+    result = await ctx.db.execute(stmt)
+    endorsements = list(result.scalars().all())
     
     # Filter by category if provided
     if category:
-        endorsements = [e for e in endorsements if e.skill == category]
+        endorsements = [e for e in endorsements if e.category == category]
     
     # Check if there are more results
     has_next_page = len(endorsements) > first
@@ -3182,10 +3189,11 @@ async def _endorsements(ctx, user_id, category, first, after) -> EndorsementConn
             node=EndorsementType(
                 id=e.id,
                 endorser_id=e.endorser_id,
-                endorsed_user_id=e.endorsed_user_id,
-                skill=e.skill,
+                endorsee_id=e.endorsee_id,
+                category=e.category,
                 comment=e.comment,
-                status=e.status,
+                rating=e.rating,
+                collaboration_id=e.collaboration_id,
                 created_at=e.created_at,
             ),
             cursor=str(e.id),
@@ -3201,7 +3209,11 @@ async def _endorsements(ctx, user_id, category, first, after) -> EndorsementConn
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return EndorsementConnection(edges=edges, page_info=page_info)
+    return EndorsementConnection(
+        edges=edges,
+        page_info=page_info,
+        total_count=len(edges),
+    )
 
 
 async def _user_badges(ctx, user_id) -> List[UserBadgeType]:
@@ -3210,15 +3222,18 @@ async def _user_badges(ctx, user_id) -> List[UserBadgeType]:
         raise ValueError("Authentication required")
     
     from uuid import UUID as UUID_type
-    from repositories.reputation_repository import ReputationRepository
-    
+    from sqlalchemy import select
+    from app.models.reputation import UserBadge
+
     try:
         uid = UUID_type(user_id)
     except ValueError:
         raise ValueError("Invalid user ID")
     
-    repo = ReputationRepository(ctx.db)
-    user_badges = await repo.get_user_badges(uid)
+    result = await ctx.db.execute(
+        select(UserBadge).where(UserBadge.user_id == uid)
+    )
+    user_badges = result.scalars().all()
     
     return [
         UserBadgeType(
@@ -3236,10 +3251,11 @@ async def _badges(ctx) -> List[BadgeType]:
     if not ctx.user:
         raise ValueError("Authentication required")
     
-    from repositories.reputation_repository import ReputationRepository
-    
-    repo = ReputationRepository(ctx.db)
-    badges = await repo.get_available_badges()
+    from sqlalchemy import select
+    from app.models.reputation import Badge
+
+    result = await ctx.db.execute(select(Badge).order_by(Badge.category, Badge.tier, Badge.name))
+    badges = result.scalars().all()
     
     return [
         BadgeType(
@@ -3248,7 +3264,8 @@ async def _badges(ctx) -> List[BadgeType]:
             description=b.description,
             icon_url=b.icon_url,
             category=b.category,
-            required_score=b.required_score,
+            tier=b.tier,
+            created_at=b.created_at,
         )
         for b in badges
     ]
@@ -3256,8 +3273,7 @@ async def _badges(ctx) -> List[BadgeType]:
 
 async def _live_streams(ctx, first, after) -> LiveStreamConnection:
     """Get currently active live streams."""
-    if not ctx.user:
-        raise ValueError("Authentication required")
+    raise NotImplementedError("Live streams are not backed by a database model yet")
     
     from uuid import UUID as UUID_type
     from repositories.live_stream_repository import LiveStreamRepository
@@ -3312,8 +3328,7 @@ async def _live_streams(ctx, first, after) -> LiveStreamConnection:
 
 async def _live_stream(ctx, id) -> Optional[LiveStreamType]:
     """Get a specific live stream by ID."""
-    if not ctx.user:
-        raise ValueError("Authentication required")
+    raise NotImplementedError("Live streams are not backed by a database model yet")
     
     from uuid import UUID as UUID_type
     from repositories.live_stream_repository import LiveStreamRepository
@@ -3384,6 +3399,9 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     edges = []
     user_repo = UserRepository(ctx.db)
     for profile in profiles:
+        profile_user = await user_repo.get_by_id(profile.user_id)
+        if profile_user is None:
+            continue
         pairwise_history = await collab_repo.get_pairwise_history(
             ctx.user.id,
             profile.user_id,
@@ -3398,7 +3416,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
             positive_outcomes,
         )
         creator_card = CreatorCardType(
-            user=_user_to_gql(await user_repo.get_by_id(profile.user_id)),
+            user=_user_to_gql(profile_user),
             profile=_profile_to_gql(profile),
             relevance_score=collaboration_history_score,
             matching_tags=[tag for tag in (profile.tags or []) if not tags or tag in tags] or None,
@@ -3828,8 +3846,7 @@ async def _post_analytics(ctx, post_id) -> Optional[PostAnalyticsType]:
 
 async def _my_reports(ctx, first, after) -> ReportConnection:
     """Get reports filed by the authenticated user."""
-    if not ctx.user:
-        raise ValueError("Authentication required")
+    raise NotImplementedError("Reports are not backed by a database model yet")
     
     from uuid import UUID as UUID_type
     from app.models.notification import Report, ReportStatus
@@ -4021,6 +4038,7 @@ async def _update_post(ctx, id, input) -> PostType:
 
 async def _share_post(ctx, post_id) -> PostType:
     """Share a post to the current user's feed."""
+    raise NotImplementedError("The legacy share mutation is the supported implementation")
     from repositories.content_repository import PostRepository
     from app.models.content import Post, ContentType as CT, ContentStatus as CS
     from uuid import uuid4, UUID as UUID_type
@@ -4773,45 +4791,47 @@ async def _mark_all_notifications_read(ctx) -> bool:
 
 async def _endorse_user(ctx, input) -> EndorsementType:
     """Endorse another user."""
-    from repositories.reputation_repository import ReputationRepository
-    from app.models.reputation import Endorsement, EndorsementStatus
+    from app.models.reputation import Endorsement
     from uuid import uuid4
 
     user = ctx.require_auth()
     
     # Prevent self-endorsement
-    if user.id == input.endorsed_user_id:
+    if user.id == input.endorsee_id:
         raise ValueError("Cannot endorse yourself")
-    
-    repo = ReputationRepository(ctx.db)
     
     # Create endorsement
     endorsement = Endorsement(
         id=uuid4(),
         endorser_id=user.id,
-        endorsed_user_id=input.endorsed_user_id,
-        skill=input.skill,
+        endorsee_id=input.endorsee_id,
+        category=input.category,
         comment=input.comment,
-        status=EndorsementStatus.PENDING,  # Requires approval or auto-approve
+        rating=input.rating,
+        collaboration_id=input.collaboration_id,
     )
     
-    await repo.create_endorsement(endorsement)
+    ctx.db.add(endorsement)
+    await ctx.db.flush()
+    await ctx.db.refresh(endorsement)
     await ctx.db.commit()
     
     # Map to GraphQL type
     return EndorsementType(
         id=endorsement.id,
         endorser_id=endorsement.endorser_id,
-        endorsed_user_id=endorsement.endorsed_user_id,
-        skill=endorsement.skill,
+        endorsee_id=endorsement.endorsee_id,
+        category=endorsement.category,
         comment=endorsement.comment,
-        status=EndorsementStatus(endorsement.status.value),
+        rating=endorsement.rating,
+        collaboration_id=endorsement.collaboration_id,
         created_at=endorsement.created_at,
     )
 
 
 async def _start_live_stream(ctx, title) -> LiveStreamType:
     """Start a live stream."""
+    raise NotImplementedError("Live streams are not backed by a database model yet")
     from repositories.live_stream_repository import LiveStreamRepository
     from app.models.content import LiveStream, LiveStreamStatus
     from uuid import uuid4
@@ -4846,6 +4866,7 @@ async def _start_live_stream(ctx, title) -> LiveStreamType:
 
 async def _end_live_stream(ctx, id) -> LiveStreamType:
     """End a live stream."""
+    raise NotImplementedError("Live streams are not backed by a database model yet")
     from repositories.live_stream_repository import LiveStreamRepository
     from uuid import UUID as UUID_type
 
@@ -4885,6 +4906,7 @@ async def _end_live_stream(ctx, id) -> LiveStreamType:
 
 async def _create_brand_opportunity(ctx, input) -> BrandOpportunityType:
     """Create a brand partnership opportunity."""
+    raise NotImplementedError("Brand opportunities are not backed by a database model yet")
     from app.models.content import BrandOpportunity, BrandOpportunityStatus
     from uuid import uuid4
 
@@ -4922,6 +4944,7 @@ async def _create_brand_opportunity(ctx, input) -> BrandOpportunityType:
 
 async def _apply_to_brand_opportunity(ctx, input) -> BrandApplicationType:
     """Apply to a brand partnership opportunity."""
+    raise NotImplementedError("Brand applications are not backed by a database model yet")
     from app.models.content import BrandApplication, BrandApplicationStatus
     from uuid import uuid4
 
@@ -4955,6 +4978,7 @@ async def _apply_to_brand_opportunity(ctx, input) -> BrandApplicationType:
 
 async def _report_content(ctx, input) -> ReportType:
     """Report content or a user."""
+    raise NotImplementedError("Reports are not backed by a database model yet")
     from app.models.notification import Report, ReportStatus, ReportReason
     from uuid import uuid4
 
@@ -6074,7 +6098,7 @@ class Subscription:
     """Placeholder subscription root for future real-time features."""
 
     @strawberry.subscription
-    async def placeholder(self) -> str:
+    async def placeholder(self) -> AsyncIterator[str]:
         """Placeholder subscription (subscriptions not yet implemented)."""
         yield "placeholder"
 
@@ -6082,7 +6106,7 @@ class Subscription:
 # ── Error Handling Extension ─────────────────────────────────────────────────
 
 
-class ConnextionZErrorExtension(strawberry.extensions.SchemaExtension):
+class ConnextionZErrorExtension(SchemaExtension):
     """
     Custom Strawberry extension that catches resolver exceptions and converts
     them to structured GraphQL errors with proper extensions.
@@ -6098,13 +6122,14 @@ class ConnextionZErrorExtension(strawberry.extensions.SchemaExtension):
         yield
         # After execution, check for errors and enrich them
         result = self.execution_context.result
-        errors = result.errors if result is not None else None
+        errors = vars(result).get("errors") if result is not None else None
         if errors:
             for error in errors:
                 # Add request ID if available
-                if hasattr(self.execution_context, "request_id"):
+                request_id = vars(self.execution_context).get("request_id")
+                if request_id is not None:
                     error.extensions = error.extensions or {}
-                    error.extensions["requestId"] = self.execution_context.request_id
+                    error.extensions["requestId"] = request_id
 
                 # Map Python exceptions to GraphQL error codes
                 original = error.original_error
