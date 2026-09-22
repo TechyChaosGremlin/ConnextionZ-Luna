@@ -26,6 +26,8 @@ from app.db.session import check_db_connection
 from api.graphql import create_graphql_router
 from features.auth.router import router as auth_router
 from features.media.router import router as media_router
+from features.streaming.router import router as streaming_router
+from features.streaming.service import stream_manager
 from services.redis_service import RedisService
 from services.rabbitmq_service import rabbitmq_service
 
@@ -102,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Shutdown
     logger.info("Shutting down ConnextionZ Platform API")
+    await stream_manager.cleanup()
     try:
         await redis_service.disconnect()
     except Exception:
@@ -167,6 +170,7 @@ def create_app() -> FastAPI:
     # ── Routers ─────────────────────────────────────────────
     app.include_router(auth_router)
     app.include_router(media_router)
+    app.include_router(streaming_router)
 
     # GraphQL (Strawberry) — served at /graphql to match the frontend's api-config.ts
     graphql_router = create_graphql_router(async_session_factory)

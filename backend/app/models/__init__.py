@@ -16,6 +16,7 @@ from app.models import notification  # noqa: F401
 from app.models import messaging  # noqa: F401
 from app.models import social  # noqa: F401
 from app.models import analytics  # noqa: F401
+from app.models import streaming  # noqa: F401
 
 __all__ = [
     "Base",

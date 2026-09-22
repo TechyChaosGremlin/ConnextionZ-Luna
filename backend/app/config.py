@@ -96,6 +96,23 @@ class Settings(BaseSettings):
     aws_endpoint_url: str = Field(default="")
     aws_s3_bucket: str = Field(default="connextionz-media")
 
+    # ── Streaming ────────────────────────────────────────────────
+    ffmpeg_path: str = Field(default="ffmpeg")
+    ffmpeg_startup_timeout_seconds: float = Field(default=1.0, gt=0)
+    ffmpeg_stop_timeout_seconds: float = Field(default=10.0, gt=0)
+    streaming_twitch_destination_url: SecretStr = Field(
+        default=SecretStr("rtmp://127.0.0.1:1935/live/luna-twitch-test")
+    )
+    streaming_youtube_destination_url: SecretStr = Field(
+        default=SecretStr("rtmp://127.0.0.1:1935/live/luna-youtube-test")
+    )
+    streaming_kick_destination_url: SecretStr = Field(
+        default=SecretStr("rtmp://127.0.0.1:1935/live/luna-kick-test")
+    )
+    streaming_facebook_destination_url: SecretStr = Field(
+        default=SecretStr("rtmp://127.0.0.1:1935/live/luna-facebook-test")
+    )
+
     # ── CORS ─────────────────────────────────────────────────────
     cors_origins: list[str] = Field(
         default_factory=lambda: [

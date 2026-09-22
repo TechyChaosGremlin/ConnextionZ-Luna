@@ -94,6 +94,12 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     sessions: Mapped[list["Session"]] = relationship(
         "Session", back_populates="user", lazy="selectin"
     )
+    stream_sessions: Mapped[list["StreamSession"]] = relationship(  # noqa: F821
+        "StreamSession", back_populates="owner"
+    )
+    connected_stream_accounts: Mapped[list["ConnectedStreamAccount"]] = relationship(  # noqa: F821
+        "ConnectedStreamAccount", back_populates="user"
+    )
 
     def __repr__(self) -> str:
         return f"<User id={self.id!r} email={self.email!r} role={self.role.value!r}>"
