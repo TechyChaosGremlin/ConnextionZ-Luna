@@ -13,9 +13,19 @@ from the JWT Bearer token.
 from __future__ import annotations
 
 from repositories.creator_scoring import (
+    calculate_activity_score,
+    calculate_behavioral_match,
     calculate_collaboration_history,
     calculate_collaboration_history_score,
+    calculate_follow_score,
+    calculate_interest_match,
+    calculate_reputation_score,
 )
+
+
+def calculate_collaboration_score(*, positive_history: bool) -> float:
+    """Convert prior positive collaboration history into a score."""
+    return 1.0 if positive_history else 0.0
 
 import uuid
 import re
@@ -2483,6 +2493,7 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
     from repositories.content_repository import PostRepository
     from repositories.profile_repository import ProfileRepository
     from repositories.social_repository import FeedSafetyRepository, FollowRepository
+    
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -3366,9 +3377,39 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     from repositories.profile_repository import ProfileRepository
     from repositories.user_repository import UserRepository
     from repositories.collaboration_repository import CollaborationRepository
+    from repositories.analytics_repository import AnalyticsRepository
+    from repositories.follow_repository import FollowRepository
+    from repositories.reputation_repository import ReputationRepository
+    from sqlalchemy import select, func
+    from app.models.content import Post
 
     collab_repo = CollaborationRepository(ctx.db)
+    analytics_repo = AnalyticsRepository(ctx.db)
+    follow_repo = FollowRepository(ctx.db)
+    reputation_repo = ReputationRepository(ctx.db)
+
+    activity_result = await ctx.db.execute(
+        select(
+            Post.user_id,
+            func.max(Post.created_at),
+            func.count(Post.id),
+        )
+        .where(
+            Post.deleted_at.is_(None),
+        )
+        .group_by(Post.user_id)
+    )
+
+    activity_map = {
+        row[0]: (row[1], row[2])
+        for row in activity_result.all()
+    }
+    
+    behavioral_affinity = await analytics_repo.creator_affinity(ctx.user.id)
+    behavioral_affinity_map = dict(behavioral_affinity)
+
     repo = ProfileRepository(ctx.db)
+    viewer_profile = await repo.get_by_user_id(ctx.user.id)
     
     # Parse cursor for pagination
     before_id = None
@@ -3398,36 +3439,116 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     # Build edges
     edges = []
     user_repo = UserRepository(ctx.db)
+
     for profile in profiles:
         profile_user = await user_repo.get_by_id(profile.user_id)
         if profile_user is None:
             continue
+
+        last_post_at, recent_post_count = activity_map.get(
+            profile.user_id,
+            (None, 0),
+        )
+
+        if last_post_at is None:
+            days_since_last_post = None
+        else:
+            days_since_last_post = (
+                datetime.now(timezone.utc) - last_post_at
+            ).total_seconds() / 86400
+
+        activity_score = calculate_activity_score(
+            days_since_last_post,
+            recent_post_count,
+        )
+
+        viewer_follows_creator, creator_follows_viewer = (
+            await follow_repo.are_following_each_other(
+                ctx.user.id,
+                profile.user_id,
+            )
+        )
+
+        follow_score = calculate_follow_score(
+            viewer_follows_creator,
+            creator_follows_viewer,
+        )
+
+        behavioral_score = calculate_behavioral_match(
+            behavioral_affinity_map.get(profile.user_id),
+        )
+
+        interest_score = calculate_interest_match(
+            viewer_profile.tags if viewer_profile else [],
+            profile.tags or [],
+        )
+
         pairwise_history = await collab_repo.get_pairwise_history(
             ctx.user.id,
             profile.user_id,
         )
 
-        history_statuses = [str(collab.status.value) for collab in pairwise_history]
+        history_statuses = [
+            str(collab.status.value)
+            for collab in pairwise_history
+        ]
+
         collaboration_count, positive_outcomes = calculate_collaboration_history(
             history_statuses
         )
+
+        collaboration_count, positive_outcomes = calculate_collaboration_history(
+    history_statuses
+)
+
         collaboration_history_score = calculate_collaboration_history_score(
             collaboration_count,
             positive_outcomes,
         )
+
+        positive_history = positive_outcomes > 0
+
+        collaboration_score = calculate_collaboration_score(
+            positive_history=positive_history,
+        )
+
+        reputation = await reputation_repo.get_reputation_score(
+            profile.user_id
+        )
+
+        reputation_score = calculate_reputation_score(
+            successful_collaborations=collaboration_count,
+            positive_outcomes=positive_outcomes,
+            engagement_quality=reputation.overall_score if reputation else 0.0,
+            consistency=reputation.reliability_score if reputation else 0.0,
+            trust_safety=reputation.community_score if reputation else 0.0,
+        )
+
         creator_card = CreatorCardType(
             user=_user_to_gql(profile_user),
             profile=_profile_to_gql(profile),
-            relevance_score=collaboration_history_score,
-            matching_tags=[tag for tag in (profile.tags or []) if not tags or tag in tags] or None,
+            relevance_score=(
+                interest_score * 0.30
+                + behavioral_score * 0.25
+                + collaboration_score * 0.15
+                + follow_score * 0.10
+                + activity_score * 0.10
+                + reputation_score * 0.10
+            ),
+            matching_tags=[
+                tag
+                for tag in (profile.tags or [])
+                if not tags or tag in tags
+            ] or None,
         )
+
         edges.append(
             CreatorCardEdge(
                 node=creator_card,
                 cursor=str(profile.id),
             )
         )
-    
+
     # Build page info
     page_info = PageInfo(
         has_next_page=has_next_page,
@@ -3435,7 +3556,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         start_cursor=edges[0].cursor if edges else None,
         end_cursor=edges[-1].cursor if edges else None,
     )
-    
+
     return CreatorCardConnection(
         edges=edges,
         page_info=page_info,
