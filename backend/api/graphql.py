@@ -17,15 +17,11 @@ from repositories.creator_scoring import (
     calculate_behavioral_match,
     calculate_collaboration_history,
     calculate_collaboration_history_score,
+    calculate_collaboration_score,
     calculate_follow_score,
     calculate_interest_match,
     calculate_reputation_score,
 )
-
-
-def calculate_collaboration_score(*, positive_history: bool) -> float:
-    """Convert prior positive collaboration history into a score."""
-    return 1.0 if positive_history else 0.0
 
 import uuid
 import re
@@ -3441,6 +3437,9 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     user_repo = UserRepository(ctx.db)
 
     for profile in profiles:
+        if profile.user_id == ctx.user.id:
+            continue
+
         profile_user = await user_repo.get_by_id(profile.user_id)
         if profile_user is None:
             continue
@@ -3478,10 +3477,18 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
             behavioral_affinity_map.get(profile.user_id),
         )
 
+        viewer_tags = viewer_profile.tags or [] if viewer_profile else []
+        profile_tags = profile.tags or []
+
+        viewer_tags_list = list(viewer_tags or [])
+        profile_tags_list = list(profile_tags or [])
+
         interest_score = calculate_interest_match(
-            viewer_profile.tags if viewer_profile else [],
-            profile.tags or [],
+            viewer_tags_list,
+            profile_tags_list,
         )
+
+        shared_interests = len(set(viewer_tags_list) & set(profile_tags_list))
 
         pairwise_history = await collab_repo.get_pairwise_history(
             ctx.user.id,
@@ -3509,6 +3516,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         positive_history = positive_outcomes > 0
 
         collaboration_score = calculate_collaboration_score(
+            shared_interests=shared_interests,
             positive_history=positive_history,
         )
 
@@ -3547,8 +3555,14 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
                 node=creator_card,
                 cursor=str(profile.id),
             )
-        )
+            )
 
+    edges.sort(
+        key=lambda edge: edge.node.relevance_score or 0.0,
+        reverse=True,
+    )
+        
+    
     # Build page info
     page_info = PageInfo(
         has_next_page=has_next_page,

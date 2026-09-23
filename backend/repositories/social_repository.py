@@ -48,6 +48,7 @@ class FollowRepository(BaseRepository[Follow]):
             insert(Follow)
             .values(follower_id=follower_id, following_id=following_id)
             .on_conflict_do_nothing(constraint="uq_follow_pair")
+            .returning(Follow.id)
         )
         await self.db.flush()
         return result.rowcount == 1
@@ -159,12 +160,16 @@ class FeedSafetyRepository:
                 UserMute.muter_id.in_(target_ids),
             )
         )
-        return (
-            set(blocked_by_initiator.scalars())
-            | set(blocking_initiator.scalars())
-            | set(muted_by_initiator.scalars())
-            | set(muting_initiator.scalars())
-        )
+        return {
+            item.blocked_id
+            for item in blocked.scalars()
+        } | {
+            item.viewer_id
+            for item in blocking_viewer.scalars()
+        } | {
+            item.muted_id
+            for item in muted.scalars()
+        }
 
 
 class PostInteractionRepository:
