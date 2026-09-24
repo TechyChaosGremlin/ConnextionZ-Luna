@@ -51,7 +51,7 @@ class FollowRepository(BaseRepository[Follow]):
             .returning(Follow.id)
         )
         await self.db.flush()
-        return result.rowcount == 1
+        return result.first() is not None
 
     async def unfollow(self, follower_id: uuid.UUID, following_id: uuid.UUID) -> None:
         await self.db.execute(
@@ -160,16 +160,12 @@ class FeedSafetyRepository:
                 UserMute.muter_id.in_(target_ids),
             )
         )
-        return {
-            item.blocked_id
-            for item in blocked.scalars()
-        } | {
-            item.viewer_id
-            for item in blocking_viewer.scalars()
-        } | {
-            item.muted_id
-            for item in muted.scalars()
-        }
+        return (
+            set(blocked_by_initiator.scalars())
+            | set(blocking_initiator.scalars())
+            | set(muted_by_initiator.scalars())
+            | set(muting_initiator.scalars())
+        )
 
 
 class PostInteractionRepository:
@@ -240,7 +236,8 @@ class PostInteractionRepository:
             .on_conflict_do_nothing(constraint="uq_post_like")
         )
         await self.db.flush()
-        return result.rowcount > 0
+        rowcount = getattr(result, "rowcount", 0)
+        return bool(rowcount and rowcount > 0)
 
     async def toggle_save(self, post_id: uuid.UUID, user_id: uuid.UUID) -> bool:
         if await self.has_saved(post_id, user_id):
@@ -255,7 +252,8 @@ class PostInteractionRepository:
             .on_conflict_do_nothing(constraint="uq_post_save")
         )
         await self.db.flush()
-        return result.rowcount > 0
+        rowcount = getattr(result, "rowcount", 0)
+        return bool(rowcount and rowcount > 0)
 
     async def add_share(self, post_id: uuid.UUID, user_id: uuid.UUID) -> bool:
         """Idempotent — repeated shares by the same user don't duplicate rows."""

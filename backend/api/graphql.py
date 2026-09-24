@@ -3378,11 +3378,13 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     from repositories.reputation_repository import ReputationRepository
     from sqlalchemy import select, func
     from app.models.content import Post
+    from repositories.social_repository import FeedSafetyRepository
 
     collab_repo = CollaborationRepository(ctx.db)
     analytics_repo = AnalyticsRepository(ctx.db)
     follow_repo = FollowRepository(ctx.db)
     reputation_repo = ReputationRepository(ctx.db)
+    safety_repo = FeedSafetyRepository(ctx.db)
 
     activity_result = await ctx.db.execute(
         select(
@@ -3408,16 +3410,36 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     viewer_profile = await repo.get_by_user_id(ctx.user.id)
     
     # Parse cursor for pagination
-    before_id = None
+ # Parse cursor for pagination
+    skip = 0
+
     if after:
         try:
-            before_id = UUID_type(after)
+            skip = int(after)
         except ValueError:
             raise ValueError("Invalid cursor")
+
+    # Get profiles (simplified discovery - would use algorithm in production)
+    profiles = await repo.get_all(
+        skip=skip,
+        limit=first + 1,
+    )
     
     # Get profiles (simplified discovery - would use algorithm in production)
     profiles = await repo.get_all(limit=first + 1)
-    
+
+    candidate_ids = [profile.user_id for profile in profiles]
+
+    hidden_creator_ids = await safety_repo.get_hidden_creator_ids(
+        ctx.user.id,
+        candidate_ids,
+    )
+
+    profiles = [
+        profile
+        for profile in profiles
+        if profile.user_id not in hidden_creator_ids
+    ]
     # Filter by tags if provided
     if tags:
         profiles = [p for p in profiles if p.tags and any(tag in p.tags for tag in tags)]
