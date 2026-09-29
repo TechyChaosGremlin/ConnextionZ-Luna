@@ -1407,10 +1407,14 @@ async def test_full_collaboration_lifecycle_end_to_end():
         async with async_session_factory() as session:
             repo = CollaborationRepository(session)
             collab = await repo.get_by_id(collab_id)
+            persisted_participant = await repo.get_participant(collab_id, invitee.id)
             assert collab is not None
             assert collab.status == CollaborationStatus.ACCEPTED
             assert collab.proposed_at is not None
             assert collab.started_at is not None
+            assert persisted_participant is not None
+            assert persisted_participant.accepted is True
+            assert persisted_participant.accepted_at is not None
             started_at_after_accept = collab.started_at
 
         # 8-9. Transition to IN_PROGRESS; started_at must remain the accept-time value.
