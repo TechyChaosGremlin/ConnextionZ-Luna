@@ -28,6 +28,7 @@ from features.streaming.schemas import (
     StreamStatusResponse,
     StopStreamResponse,
 )
+from repositories.stream_session_repository import StreamSessionRepository
 
 
 class StreamNotFoundError(LookupError):
@@ -149,13 +150,8 @@ class StreamingService:
         return self._stream_response(stream)
 
     async def list(self, owner: User) -> list[StreamResponse]:
-        result = await self.db.execute(
-            select(StreamSession)
-            .options(selectinload(StreamSession.destinations))
-            .where(StreamSession.owner_id == owner.id)
-            .order_by(StreamSession.created_at.desc())
-        )
-        return [self._stream_response(stream) for stream in result.scalars().unique().all()]
+        streams = await StreamSessionRepository(self.db).get_for_owner(owner.id)
+        return [self._stream_response(stream) for stream in streams]
 
     async def status(self, stream_id: uuid.UUID, owner: User) -> StreamStatusResponse:
         stream = await self._owned_stream(stream_id, owner.id)
