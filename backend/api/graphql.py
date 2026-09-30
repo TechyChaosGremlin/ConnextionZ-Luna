@@ -18,6 +18,7 @@ from repositories.creator_scoring import (
     calculate_collaboration_history,
     calculate_collaboration_history_score,
     calculate_collaboration_score,
+    calculate_creator_match,
     calculate_follow_score,
     calculate_interest_match,
     calculate_reputation_score,
@@ -3280,7 +3281,6 @@ async def _badges(ctx) -> List[BadgeType]:
 
 async def _live_streams(ctx, first, after) -> LiveStreamConnection:
     """Get currently active live streams."""
-    raise NotImplementedError("Live streams are not backed by a database model yet")
     
     from uuid import UUID as UUID_type
     from repositories.live_stream_repository import LiveStreamRepository
@@ -3379,6 +3379,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     from sqlalchemy import select, func
     from app.models.content import Post
     from repositories.social_repository import FeedSafetyRepository
+    from services.collaboration_service import CollaborationInviteEligibilityService
 
     collab_repo = CollaborationRepository(ctx.db)
     analytics_repo = AnalyticsRepository(ctx.db)
@@ -3404,7 +3405,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     }
     
     behavioral_affinity = await analytics_repo.creator_affinity(ctx.user.id)
-    behavioral_affinity_map = dict(behavioral_affinity)
+    behavioral_affinity_map = dict(behavioral_affinity or {})
 
     repo = ProfileRepository(ctx.db)
     viewer_profile = await repo.get_by_user_id(ctx.user.id)
@@ -3424,9 +3425,6 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         skip=skip,
         limit=first + 1,
     )
-    
-    # Get profiles (simplified discovery - would use algorithm in production)
-    profiles = await repo.get_all(limit=first + 1)
 
     candidate_ids = [profile.user_id for profile in profiles]
 
@@ -3457,9 +3455,18 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     # Build edges
     edges = []
     user_repo = UserRepository(ctx.db)
+    invite_eligibility = CollaborationInviteEligibilityService(ctx.db)
 
     for profile in profiles:
         if profile.user_id == ctx.user.id:
+            continue
+
+        try:
+            await invite_eligibility.validate_participant_ids(
+                ctx.user,
+                [profile.user_id],
+            )
+        except (ValueError, PermissionError):
             continue
 
         profile_user = await user_repo.get_by_id(profile.user_id)
@@ -3519,7 +3526,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
 
         history_statuses = [
             str(collab.status.value)
-            for collab in pairwise_history
+            for collab in (pairwise_history or [])
         ]
 
         collaboration_count, positive_outcomes = calculate_collaboration_history(
@@ -3538,6 +3545,8 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         positive_history = positive_outcomes > 0
 
         collaboration_score = calculate_collaboration_score(
+            open_to_collab=profile.open_to_collab,
+            status_compatible=profile_user.status == ctx.user.status,
             shared_interests=shared_interests,
             positive_history=positive_history,
         )
@@ -3557,13 +3566,13 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         creator_card = CreatorCardType(
             user=_user_to_gql(profile_user),
             profile=_profile_to_gql(profile),
-            relevance_score=(
-                interest_score * 0.30
-                + behavioral_score * 0.25
-                + collaboration_score * 0.15
-                + follow_score * 0.10
-                + activity_score * 0.10
-                + reputation_score * 0.10
+            relevance_score=calculate_creator_match(
+                interest=interest_score,
+                behavioral=behavioral_score,
+                collaboration=collaboration_score,
+                follow=follow_score,
+                activity=activity_score,
+                reputation=reputation_score,
             ),
             matching_tags=[
                 tag
@@ -3575,13 +3584,16 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         edges.append(
             CreatorCardEdge(
                 node=creator_card,
-                cursor=str(profile.id),
+                cursor=str(skip + len(edges)),
             )
             )
 
+    # Tie-break by profile user id (ascending) so equal scores sort deterministically
     edges.sort(
-        key=lambda edge: edge.node.relevance_score or 0.0,
-        reverse=True,
+        key=lambda edge: (
+            -(edge.node.relevance_score or 0.0),
+            str(edge.node.profile.id),
+        ),
     )
         
     
