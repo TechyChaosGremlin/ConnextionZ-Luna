@@ -69,6 +69,12 @@ class CollaborationInviteEligibilityService:
     async def validate_participant_ids(
         self, initiator: User, participant_ids: list[uuid.UUID]
     ) -> list[uuid.UUID]:
+        await self.validate_participant_users(initiator, participant_ids)
+        return participant_ids
+
+    async def validate_participant_users(
+        self, initiator: User, participant_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, User]:
         if len(set(participant_ids)) != len(participant_ids):
             raise ValueError("Duplicate collaboration participant IDs are not allowed")
         if initiator.id in participant_ids:
@@ -84,6 +90,7 @@ class CollaborationInviteEligibilityService:
         restricted_ids = await FeedSafetyRepository(
             self.db
         ).get_invitation_restricted_user_ids(initiator.id, participant_ids)
+        validated_users = {}
 
         for participant_id in participant_ids:
             target = await user_repository.get_by_id(participant_id)
@@ -104,4 +111,6 @@ class CollaborationInviteEligibilityService:
             ):
                 raise PermissionError("Creator only accepts collaboration invites from followers")
 
-        return participant_ids
+            validated_users[participant_id] = target
+
+        return validated_users

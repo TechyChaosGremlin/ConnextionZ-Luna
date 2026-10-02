@@ -3371,7 +3371,6 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     
     from uuid import UUID as UUID_type
     from repositories.profile_repository import ProfileRepository
-    from repositories.user_repository import UserRepository
     from repositories.collaboration_repository import CollaborationRepository
     from repositories.analytics_repository import AnalyticsRepository
     from repositories.follow_repository import FollowRepository
@@ -3454,22 +3453,37 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     
     # Build edges
     edges = []
-    user_repo = UserRepository(ctx.db)
     invite_eligibility = CollaborationInviteEligibilityService(ctx.db)
+
+    scoring_profiles = [
+        profile for profile in profiles if profile.user_id != ctx.user.id
+    ]
+    scoring_user_ids = [profile.user_id for profile in scoring_profiles]
+    follow_states = await follow_repo.are_following_each_other_for_users(
+        ctx.user.id,
+        scoring_user_ids,
+    )
+    collaboration_histories = await collab_repo.get_pairwise_history_for_users(
+        ctx.user.id,
+        scoring_user_ids,
+    )
+    reputation_scores = await reputation_repo.get_reputation_scores(
+        scoring_user_ids,
+    )
 
     for profile in profiles:
         if profile.user_id == ctx.user.id:
             continue
 
         try:
-            await invite_eligibility.validate_participant_ids(
+            validated_users = await invite_eligibility.validate_participant_users(
                 ctx.user,
                 [profile.user_id],
             )
         except (ValueError, PermissionError):
             continue
 
-        profile_user = await user_repo.get_by_id(profile.user_id)
+        profile_user = validated_users.get(profile.user_id)
         if profile_user is None:
             continue
 
@@ -3490,11 +3504,9 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
             recent_post_count,
         )
 
-        viewer_follows_creator, creator_follows_viewer = (
-            await follow_repo.are_following_each_other(
-                ctx.user.id,
-                profile.user_id,
-            )
+        viewer_follows_creator, creator_follows_viewer = follow_states.get(
+            profile.user_id,
+            (False, False),
         )
 
         follow_score = calculate_follow_score(
@@ -3519,10 +3531,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
 
         shared_interests = len(set(viewer_tags_list) & set(profile_tags_list))
 
-        pairwise_history = await collab_repo.get_pairwise_history(
-            ctx.user.id,
-            profile.user_id,
-        )
+        pairwise_history = collaboration_histories.get(profile.user_id, [])
 
         history_statuses = [
             str(collab.status.value)
@@ -3551,9 +3560,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
             positive_history=positive_history,
         )
 
-        reputation = await reputation_repo.get_reputation_score(
-            profile.user_id
-        )
+        reputation = reputation_scores.get(profile.user_id)
 
         reputation_score = calculate_reputation_score(
             successful_collaborations=collaboration_count,
@@ -3584,7 +3591,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         edges.append(
             CreatorCardEdge(
                 node=creator_card,
-                cursor=str(skip + len(edges)),
+                cursor=str(skip + len(edges) + 1),
             )
             )
 
@@ -3602,7 +3609,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         has_next_page=has_next_page,
         has_previous_page=False,
         start_cursor=edges[0].cursor if edges else None,
-        end_cursor=edges[-1].cursor if edges else None,
+        end_cursor=str(skip + len(profiles)) if edges else None,
     )
 
     return CreatorCardConnection(
@@ -4479,10 +4486,10 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
         from services.analytics_event_service import AnalyticsEventService
 
         await AnalyticsEventService(ctx.db).track_event(
-            event_type=EventType.COLLAB_CREATED,
+            event_type=EventType.COLLAB_ACCEPTED,
             user=user,
             session_id=ctx.session_id,
-            metadata={"collaboration_id": str(collab.id), "outcome": "accepted"},
+            metadata={"collaboration_id": str(collab.id)},
         )
 
         await ctx.db.commit()
@@ -4530,6 +4537,16 @@ async def _decline_collaboration(ctx, id) -> bool:
         if not pending_participants:
             collab._update_collaboration(CollaborationStatus.DECLINED)
         await repo.update(collab)
+
+        from app.models.analytics import EventType
+        from services.analytics_event_service import AnalyticsEventService
+
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.COLLAB_DECLINED,
+            user=user,
+            session_id=ctx.session_id,
+            metadata={"collaboration_id": str(collab.id)},
+        )
         await ctx.db.commit()
     except Exception:
         await ctx.db.rollback()
@@ -4586,6 +4603,32 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
 
         collab.updated_at = datetime.now(timezone.utc)
         await repo.update(collab)
+        if status is not None and (
+            (
+                previous_state[0].value == CollaborationStatus.ACCEPTED.value
+                and next_status == CollaborationStatus.IN_PROGRESS.value
+            )
+            or next_status in (
+                CollaborationStatus.CANCELLED.value,
+                CollaborationStatus.COMPLETED.value,
+            )
+        ):
+            from app.models.analytics import EventType
+            from services.analytics_event_service import AnalyticsEventService
+
+            event_type = (
+                EventType.COLLAB_STARTED
+                if next_status == CollaborationStatus.IN_PROGRESS.value
+                else EventType.COLLAB_COMPLETED
+                if next_status == CollaborationStatus.COMPLETED.value
+                else EventType.COLLAB_CANCELLED
+            )
+            await AnalyticsEventService(ctx.db).track_event(
+                event_type=event_type,
+                user=user,
+                session_id=ctx.session_id,
+                metadata={"collaboration_id": str(collab.id)},
+            )
         await ctx.db.commit()
     except Exception:
         collab.status, collab.proposed_at, collab.started_at, collab.completed_at = previous_state
@@ -6291,7 +6334,7 @@ class ConnextionZErrorExtension(SchemaExtension):
         yield
         # After execution, check for errors and enrich them
         result = self.execution_context.result
-        errors = vars(result).get("errors") if result is not None else None
+        errors = getattr(result, "errors", None)
         if errors:
             for error in errors:
                 # Add request ID if available

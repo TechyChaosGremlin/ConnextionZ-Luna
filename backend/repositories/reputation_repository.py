@@ -77,6 +77,19 @@ class ReputationRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_reputation_scores(
+        self,
+        user_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, ReputationScore]:
+        """Return reputation scores for several users in one query."""
+        if not user_ids:
+            return {}
+
+        result = await self.db.execute(
+            select(ReputationScore).where(ReputationScore.user_id.in_(user_ids))
+        )
+        return {score.user_id: score for score in result.scalars().all()}
+
     async def create_or_update_reputation_score(
         self,
         user_id: uuid.UUID,

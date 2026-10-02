@@ -30,6 +30,7 @@ from api.graphql import (
     AppContext,
     _accept_collaboration,
     _decline_collaboration,
+    _update_collaboration,
 )
 from app.models.analytics import EventType
 from app.models.collaboration import CollaborationStatus
@@ -209,10 +210,10 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     assert state["add_participant_calls"] == 0
     assert len(_stub_analytics) == 1
     event = _stub_analytics[0]
-    assert event["event_type"] == EventType.COLLAB_CREATED
+    assert event["event_type"] == EventType.COLLAB_ACCEPTED
     assert event["user"] is user
     assert event["session_id"] == "sess-test"
-    assert event["metadata"] == {"collaboration_id": str(collab.id), "outcome": "accepted"}
+    assert event["metadata"] == {"collaboration_id": str(collab.id)}
     assert collab.started_at is not None
 
 
@@ -277,7 +278,7 @@ async def test_accepting_one_invitee_resolves_and_removes_remaining_pending_invi
 
 
 @pytest.mark.asyncio
-async def test_decline_collaboration_removes_participant_and_marks_declined(monkeypatch):
+async def test_decline_collaboration_removes_participant_and_marks_declined(monkeypatch, _stub_analytics):
     user = make_user()
     participant = make_participant(user.id)
     collab = make_collab()
@@ -292,6 +293,76 @@ async def test_decline_collaboration_removes_participant_and_marks_declined(monk
     assert participant.accepted is False
     commit_mock: AsyncMock = ctx.db.commit  # type: ignore[assignment]
     commit_mock.assert_awaited_once_with()
+    assert len(_stub_analytics) == 1
+    event = _stub_analytics[0]
+    assert event["event_type"] == EventType.COLLAB_DECLINED
+    assert event["user"] is user
+    assert event["session_id"] == "sess-test"
+    assert event["metadata"] == {"collaboration_id": str(collab.id)}
+
+
+@pytest.mark.asyncio
+async def test_cancel_collaboration_tracks_cancelled_event(monkeypatch, _stub_analytics):
+    user = make_user()
+    collab = make_collab(initiator_id=user.id)
+    collab.proposed_at = None
+    collab.completed_at = None
+    patch_repo(monkeypatch, None, collab)
+    ctx = make_ctx(user)
+    monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
+
+    await _update_collaboration(
+        ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="cancelled")),
+    )
+
+    assert _stub_analytics[0]["event_type"] == EventType.COLLAB_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_start_collaboration_tracks_started_event(monkeypatch, _stub_analytics):
+    user = make_user()
+    collab = make_collab(initiator_id=user.id, status=CollaborationStatus.ACCEPTED)
+    collab.proposed_at = None
+    collab.completed_at = None
+    patch_repo(monkeypatch, None, collab)
+    ctx = make_ctx(user)
+    monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
+
+    await _update_collaboration(
+        ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="in_progress")),
+    )
+
+    assert collab.status == CollaborationStatus.IN_PROGRESS
+    assert collab.started_at is not None
+    assert len(_stub_analytics) == 1
+    event = _stub_analytics[0]
+    assert event["event_type"] == EventType.COLLAB_STARTED
+    assert event["user"] is user
+    assert event["session_id"] == "sess-test"
+    assert event["metadata"] == {"collaboration_id": str(collab.id)}
+
+
+@pytest.mark.asyncio
+async def test_complete_collaboration_tracks_completed_event(monkeypatch, _stub_analytics):
+    user = make_user()
+    collab = make_collab(initiator_id=user.id)
+    collab.proposed_at = None
+    collab.completed_at = None
+    patch_repo(monkeypatch, None, collab)
+    ctx = make_ctx(user)
+    monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
+
+    await _update_collaboration(
+        ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="completed")),
+    )
+
+    assert _stub_analytics[0]["event_type"] == EventType.COLLAB_COMPLETED
 
 
 @pytest.mark.asyncio

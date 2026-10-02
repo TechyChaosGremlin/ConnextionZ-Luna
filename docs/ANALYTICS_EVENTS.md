@@ -43,6 +43,11 @@ Defined in `backend/app/models/analytics.py::EventType`:
 | `SOUND_USED`            | A post is created with a non-default `audio` value. |
 | `SEARCH_PERFORMED`      | The `search` query runs a non-empty query. Only aggregate metadata (result count, requested types) is stored — **never the raw query text**. |
 | `COLLAB_CREATED`        | `createCollaboration` mutation succeeds. |
+| `COLLAB_ACCEPTED`       | `acceptCollaboration` mutation succeeds. |
+| `COLLAB_STARTED`        | `updateCollaboration` transitions an accepted collaboration to `in_progress`. |
+| `COLLAB_DECLINED`       | `declineCollaboration` mutation succeeds. |
+| `COLLAB_CANCELLED`      | `updateCollaboration` mutation successfully transitions a collaboration to cancelled. |
+| `COLLAB_COMPLETED`      | `updateCollaboration` mutation successfully transitions a collaboration to completed. |
 | `NOTIFICATION_OPENED`   | `markNotificationRead` mutation succeeds. |
 
 ## Model

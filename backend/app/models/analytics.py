@@ -114,6 +114,11 @@ class EventType(str, enum.Enum):
     SOUND_USED = "sound_used"
     SEARCH_PERFORMED = "search_performed"
     COLLAB_CREATED = "collab_created"
+    COLLAB_ACCEPTED = "collab_accepted"
+    COLLAB_STARTED = "collab_started"
+    COLLAB_DECLINED = "collab_declined"
+    COLLAB_CANCELLED = "collab_cancelled"
+    COLLAB_COMPLETED = "collab_completed"
     NOTIFICATION_OPENED = "notification_opened"
     NOT_INTERESTED = "not_interested"
 

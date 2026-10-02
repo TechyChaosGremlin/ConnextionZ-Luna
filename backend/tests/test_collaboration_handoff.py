@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from api.graphql import AppContext, _create_collaboration, _discover_creators
+from api.graphql import AppContext, _create_collaboration, _discover_creators, schema
 from app.models.user import AccountStatus, User, UserRole
 from services.collaboration_service import CollaborationInviteEligibilityService
 
@@ -84,14 +84,23 @@ def discovery_dependencies(monkeypatch):
     async def are_following_each_other(self, follower_id, following_id):
         return False, False
 
+    async def are_following_each_other_for_users(self, viewer_id, creator_ids):
+        return {creator_id: (False, False) for creator_id in creator_ids}
+
     async def creator_affinity(self, user_id, limit=20):
         return []
 
     async def get_pairwise_history(self, initiator_id, target_id):
         return []
 
+    async def get_pairwise_history_for_users(self, initiator_id, target_ids):
+        return {target_id: [] for target_id in target_ids}
+
     async def get_reputation_score(self, user_id):
         return None
+
+    async def get_reputation_scores(self, user_ids):
+        return {}
 
     monkeypatch.setattr("repositories.profile_repository.ProfileRepository.get_all", get_all)
     monkeypatch.setattr("repositories.profile_repository.ProfileRepository.get_by_user_id", get_profile)
@@ -100,9 +109,12 @@ def discovery_dependencies(monkeypatch):
     monkeypatch.setattr("repositories.social_repository.FeedSafetyRepository.get_invitation_restricted_user_ids", get_restricted_ids)
     monkeypatch.setattr("repositories.social_repository.FollowRepository.is_following", is_following)
     monkeypatch.setattr("repositories.follow_repository.FollowRepository.are_following_each_other", are_following_each_other)
+    monkeypatch.setattr("repositories.follow_repository.FollowRepository.are_following_each_other_for_users", are_following_each_other_for_users)
     monkeypatch.setattr("repositories.analytics_repository.AnalyticsRepository.creator_affinity", creator_affinity)
     monkeypatch.setattr("repositories.collaboration_repository.CollaborationRepository.get_pairwise_history", get_pairwise_history)
+    monkeypatch.setattr("repositories.collaboration_repository.CollaborationRepository.get_pairwise_history_for_users", get_pairwise_history_for_users)
     monkeypatch.setattr("repositories.reputation_repository.ReputationRepository.get_reputation_score", get_reputation_score)
+    monkeypatch.setattr("repositories.reputation_repository.ReputationRepository.get_reputation_scores", get_reputation_scores)
 
     activity_result = MagicMock()
     activity_result.all.return_value = []
@@ -120,6 +132,48 @@ async def discover_with_dependencies(viewer, db, *, first=20, after=None):
         first,
         after,
     )
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_graphql_returns_filtered_creator(discovery_dependencies):
+        viewer, creators, profiles, db = discovery_dependencies
+
+        result = await schema.execute(
+                """
+                query DiscoverCreators($tags: [String!]) {
+                    discoverCreators(tags: $tags) {
+                        totalCount
+                        edges {
+                            node {
+                                user { id username }
+                                profile { id displayName tags }
+                                matchingTags
+                                relevanceScore
+                                reputationScore
+                            }
+                        }
+                    }
+                }
+                """,
+                variable_values={"tags": ["music"]},
+                context_value=AppContext(db=db, current_user=viewer),
+        )
+
+        assert result.errors is None
+        assert result.data is not None
+        discovery = result.data["discoverCreators"]
+        assert discovery["totalCount"] == 1
+        assert len(discovery["edges"]) == 1
+        card = discovery["edges"][0]["node"]
+        assert card["user"] == {"id": str(creators[0].id), "username": creators[0].username}
+        assert card["profile"] == {
+            "id": str(profiles[0].id),
+            "displayName": profiles[0].display_name,
+            "tags": ["music"],
+        }
+        assert card["matchingTags"] == ["music"]
+        assert card["relevanceScore"] > 0
+        assert card["reputationScore"] is None
 
 
 @pytest.fixture
@@ -188,6 +242,10 @@ async def test_discover_creators_returns_declared_creator_card(
     empty_result_6 = MagicMock()
     empty_result_6.scalar_one_or_none.return_value = None
 
+    empty_batch_result = MagicMock()
+    empty_batch_result.all.return_value = []
+    empty_batch_result.scalars.return_value.all.return_value = []
+
     db.execute.side_effect = [
         activity_result,
         empty_result_1,
@@ -196,6 +254,9 @@ async def test_discover_creators_returns_declared_creator_card(
         empty_result_4,
         empty_result_5,
         empty_result_6,
+        empty_batch_result,
+        empty_batch_result,
+        empty_batch_result,
     ]
 
     result = await _discover_creators(
@@ -223,6 +284,68 @@ async def test_discover_creators_after_cursor_returns_next_creator(discovery_dep
 
 
 @pytest.mark.asyncio
+async def test_discover_creators_filters_scores_ranks_and_paginates_cards(
+    monkeypatch, discovery_dependencies,
+):
+    viewer, creators, profiles, db = discovery_dependencies
+    next_creator = make_user("next_creator")
+    excluded_by_tags = make_user("excluded_by_tags")
+    excluded_by_query = make_user("excluded_by_query")
+    users = {user.id: user for user in [*creators, next_creator, excluded_by_tags, excluded_by_query]}
+
+    for profile in profiles:
+        profile.display_name = "Studio creator"
+        profile.tags = ["music"]
+    profiles.extend([
+        make_profile(next_creator, display_name="Studio next"),
+        make_profile(excluded_by_tags, display_name="Studio art", tags=["art"]),
+        make_profile(excluded_by_query, display_name="Unrelated creator"),
+    ])
+
+    from repositories.profile_repository import ProfileRepository
+
+    original_get_profile = ProfileRepository.get_by_user_id
+
+    async def get_profile(self, user_id):
+        if user_id == next_creator.id:
+            return profiles[2]
+        return await original_get_profile(self, user_id)
+
+    async def get_user(self, user_id):
+        return users.get(user_id)
+
+    async def creator_affinity(self, user_id, limit=20):
+        assert user_id == viewer.id
+        return [(creators[0].id, 20.0), (creators[1].id, 100.0)]
+
+    monkeypatch.setattr(ProfileRepository, "get_by_user_id", get_profile)
+    monkeypatch.setattr("repositories.user_repository.UserRepository.get_by_id", get_user)
+    monkeypatch.setattr("repositories.analytics_repository.AnalyticsRepository.creator_affinity", creator_affinity)
+
+    async def request(after=None):
+        return await _discover_creators(
+            AppContext(db=db, current_user=viewer), "studio", ["music"], 2, after,
+        )
+
+    first_page = await request()
+    repeat = await request()
+    second_page = await request(first_page.page_info.end_cursor)
+
+    assert [edge.node.user.id for edge in first_page.edges] == [creators[1].id, creators[0].id]
+    assert first_page.edges[0].node.relevance_score > first_page.edges[1].node.relevance_score
+    assert [edge.node.user.id for edge in repeat.edges] == [creators[1].id, creators[0].id]
+    assert first_page.total_count == 2
+    assert first_page.page_info.has_next_page is True
+    assert [edge.node.user.id for edge in second_page.edges] == [next_creator.id]
+    assert second_page.total_count == 1
+    assert second_page.page_info.has_next_page is False
+    for edge in [*first_page.edges, *second_page.edges]:
+        assert edge.node.profile.id in {profile.id for profile in profiles[:3]}
+        assert edge.node.matching_tags == ["music"]
+        assert edge.node.relevance_score is not None
+
+
+@pytest.mark.asyncio
 async def test_discover_creators_orders_results_by_relevance_score(discovery_dependencies):
     viewer, creators, profiles, db = discovery_dependencies
 
@@ -233,6 +356,84 @@ async def test_discover_creators_orders_results_by_relevance_score(discovery_dep
     assert scores == sorted(scores, reverse=True)
     assert scores[0] > scores[1]
     assert profiles[0].tags == ["music"]
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_batches_scoring_lookups(monkeypatch, discovery_dependencies):
+    viewer, creators, _, db = discovery_dependencies
+    calls = {"follows": [], "history": [], "reputation": []}
+
+    async def follow_states(self, viewer_id, creator_ids):
+        calls["follows"].append((viewer_id, creator_ids))
+        return {creator_id: (False, False) for creator_id in creator_ids}
+
+    async def collaboration_histories(self, viewer_id, creator_ids):
+        calls["history"].append((viewer_id, creator_ids))
+        return {creator_id: [] for creator_id in creator_ids}
+
+    async def reputation_scores(self, user_ids):
+        calls["reputation"].append(user_ids)
+        return {}
+
+    async def single_lookup_must_not_run(*args, **kwargs):
+        raise AssertionError("single-candidate scoring lookup was called")
+
+    monkeypatch.setattr(
+        "repositories.follow_repository.FollowRepository.are_following_each_other_for_users",
+        follow_states,
+    )
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_pairwise_history_for_users",
+        collaboration_histories,
+    )
+    monkeypatch.setattr(
+        "repositories.reputation_repository.ReputationRepository.get_reputation_scores",
+        reputation_scores,
+    )
+    monkeypatch.setattr(
+        "repositories.follow_repository.FollowRepository.are_following_each_other",
+        single_lookup_must_not_run,
+    )
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_pairwise_history",
+        single_lookup_must_not_run,
+    )
+    monkeypatch.setattr(
+        "repositories.reputation_repository.ReputationRepository.get_reputation_score",
+        single_lookup_must_not_run,
+    )
+
+    result = await discover_with_dependencies(viewer, db)
+    expected_ids = [creator.id for creator in creators]
+
+    assert len(result.edges) == len(creators)
+    assert calls["follows"] == [(viewer.id, expected_ids)]
+    assert calls["history"] == [(viewer.id, expected_ids)]
+    assert calls["reputation"] == [expected_ids]
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_reuses_users_fetched_during_eligibility(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, creators, _, db = discovery_dependencies
+    user_lookups = []
+    users = {creator.id: creator for creator in creators}
+
+    async def tracked_get_user(self, user_id):
+        user_lookups.append(user_id)
+        return users.get(user_id)
+
+    monkeypatch.setattr(
+        "repositories.user_repository.UserRepository.get_by_id",
+        tracked_get_user,
+    )
+
+    result = await discover_with_dependencies(viewer, db)
+
+    assert len(result.edges) == len(creators)
+    assert user_lookups == [creator.id for creator in creators]
 
 
 @pytest.mark.asyncio
@@ -256,19 +457,19 @@ async def test_discover_creators_handles_missing_scoring_data(
             missing_affinity,
         )
     elif missing_data == "reputation":
-        async def missing_reputation(self, user_id):
-            return None
+        async def missing_reputation(self, user_ids):
+            return {}
 
         monkeypatch.setattr(
-            "repositories.reputation_repository.ReputationRepository.get_reputation_score",
+            "repositories.reputation_repository.ReputationRepository.get_reputation_scores",
             missing_reputation,
         )
     elif missing_data == "collaboration_history":
-        async def missing_history(self, initiator_id, target_id):
-            return None
+        async def missing_history(self, initiator_id, target_ids):
+            return {}
 
         monkeypatch.setattr(
-            "repositories.collaboration_repository.CollaborationRepository.get_pairwise_history",
+            "repositories.collaboration_repository.CollaborationRepository.get_pairwise_history_for_users",
             missing_history,
         )
     elif missing_data == "viewer_profile":
@@ -397,6 +598,10 @@ async def test_discovered_creator_id_becomes_pending_collaboration_participant(m
     empty_result_6 = MagicMock()
     empty_result_6.scalar_one_or_none.return_value = None
 
+    empty_batch_result = MagicMock()
+    empty_batch_result.all.return_value = []
+    empty_batch_result.scalars.return_value.all.return_value = []
+
     db.execute.side_effect = [
         activity_result,
         empty_result_1,
@@ -405,6 +610,9 @@ async def test_discovered_creator_id_becomes_pending_collaboration_participant(m
         empty_result_4,
         empty_result_5,
         empty_result_6,
+        empty_batch_result,
+        empty_batch_result,
+        empty_batch_result,
     ]
 
     ctx = AppContext(db=db, current_user=initiator, session_id="handoff")

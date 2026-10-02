@@ -298,3 +298,41 @@ class CollaborationRepository(BaseRepository[Collaboration]):
 
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_pairwise_history_for_users(
+        self,
+        user_id: uuid.UUID,
+        other_user_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, list[Collaboration]]:
+        """Return pairwise histories for several users in one query."""
+        histories = {other_user_id: [] for other_user_id in other_user_ids}
+        if not other_user_ids:
+            return histories
+
+        viewer_participations = select(
+            CollaborationParticipant.collaboration_id
+        ).where(CollaborationParticipant.user_id == user_id)
+        stmt = (
+            select(CollaborationParticipant.user_id, Collaboration)
+            .join(
+                Collaboration,
+                Collaboration.id == CollaborationParticipant.collaboration_id,
+            )
+            .where(
+                CollaborationParticipant.user_id.in_(other_user_ids),
+                Collaboration.deleted_at.is_(None),
+                or_(
+                    Collaboration.initiator_id == user_id,
+                    Collaboration.id.in_(viewer_participations),
+                ),
+            )
+            .order_by(
+                Collaboration.created_at.desc(),
+                Collaboration.id.desc(),
+            )
+        )
+
+        result = await self.db.execute(stmt)
+        for other_user_id, collaboration in result.all():
+            histories[other_user_id].append(collaboration)
+        return histories
