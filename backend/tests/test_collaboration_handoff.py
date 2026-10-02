@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -176,6 +176,122 @@ async def test_discover_creators_graphql_returns_filtered_creator(discovery_depe
         assert card["reputationScore"] is None
 
 
+@pytest.mark.asyncio
+async def test_discover_creators_graphql_scores_filters_and_paginates_ranked_results(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, creators, profiles, db = discovery_dependencies
+    ineligible_creator = creators[1]
+    profiles[1].open_to_collab = False
+
+    high_affinity_creator = make_user("high_affinity_creator")
+    high_affinity_profile = make_profile(high_affinity_creator, tags=["art"])
+    profiles.append(high_affinity_profile)
+    users_by_id = {
+        viewer.id: viewer,
+        **{creator.id: creator for creator in creators},
+        high_affinity_creator.id: high_affinity_creator,
+    }
+    profiles_by_user_id = {
+        viewer.id: make_profile(viewer, tags=["music"]),
+        **{profile.user_id: profile for profile in profiles},
+    }
+
+    async def get_user(self, user_id):
+        return users_by_id.get(user_id)
+
+    async def get_profile(self, user_id):
+        return profiles_by_user_id.get(user_id)
+
+    async def creator_affinity(self, user_id, limit=20):
+        return [(high_affinity_creator.id, 100.0)]
+
+    monkeypatch.setattr("repositories.user_repository.UserRepository.get_by_id", get_user)
+    monkeypatch.setattr("repositories.profile_repository.ProfileRepository.get_by_user_id", get_profile)
+    monkeypatch.setattr("repositories.analytics_repository.AnalyticsRepository.creator_affinity", creator_affinity)
+
+    query = """
+        query DiscoverCreators($first: Int!, $after: String) {
+            discoverCreators(first: $first, after: $after) {
+                totalCount
+                pageInfo {
+                    hasNextPage
+                    hasPreviousPage
+                    startCursor
+                    endCursor
+                }
+                edges {
+                    cursor
+                    node {
+                        user { id username }
+                        profile { id displayName tags }
+                        matchingTags
+                        relevanceScore
+                    }
+                }
+            }
+        }
+    """
+
+    first_result = await schema.execute(
+        query,
+        variable_values={"first": 1, "after": None},
+        context_value=AppContext(db=db, current_user=viewer),
+    )
+    assert first_result.errors is None
+    first_page = first_result.data["discoverCreators"]
+
+    second_result = await schema.execute(
+        query,
+        variable_values={
+            "first": 1,
+            "after": first_page["pageInfo"]["endCursor"],
+        },
+        context_value=AppContext(db=db, current_user=viewer),
+    )
+    assert second_result.errors is None
+    second_page = second_result.data["discoverCreators"]
+
+    first_edge = first_page["edges"][0]
+    second_edge = second_page["edges"][0]
+    assert first_page["totalCount"] == second_page["totalCount"] == 1
+    assert first_edge["node"]["user"] == {
+        "id": str(high_affinity_creator.id),
+        "username": high_affinity_creator.username,
+    }
+    assert first_edge["node"]["profile"] == {
+        "id": str(high_affinity_profile.id),
+        "displayName": high_affinity_profile.display_name,
+        "tags": ["art"],
+    }
+    assert first_edge["node"]["matchingTags"] == ["art"]
+    assert first_edge["node"]["relevanceScore"] == pytest.approx(39.875)
+    assert first_page["pageInfo"] == {
+        "hasNextPage": True,
+        "hasPreviousPage": False,
+        "startCursor": "1",
+        "endCursor": "1",
+    }
+
+    assert second_edge["node"]["user"] == {
+        "id": str(creators[0].id),
+        "username": creators[0].username,
+    }
+    assert second_edge["node"]["relevanceScore"] == pytest.approx(19.6)
+    assert second_page["pageInfo"] == {
+        "hasNextPage": False,
+        "hasPreviousPage": False,
+        "startCursor": "2",
+        "endCursor": "2",
+    }
+    returned_creator_ids = {
+        first_edge["node"]["user"]["id"],
+        second_edge["node"]["user"]["id"],
+    }
+    assert str(ineligible_creator.id) not in returned_creator_ids
+
+
 @pytest.fixture
 def eligibility_dependencies(monkeypatch):
     initiator = make_user("initiator")
@@ -284,6 +400,36 @@ async def test_discover_creators_after_cursor_returns_next_creator(discovery_dep
 
 
 @pytest.mark.asyncio
+async def test_discover_creators_rejects_zero_page_size(discovery_dependencies):
+    viewer, _, _, db = discovery_dependencies
+
+    with pytest.raises(ValueError, match="first must be between 1 and 100"):
+        await discover_with_dependencies(viewer, db, first=0)
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_fills_page_after_restricted_candidate(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, creators, _, db = discovery_dependencies
+
+    async def get_restricted_ids(self, initiator_id, target_ids):
+        return {creators[0].id} if creators[0].id in target_ids else set()
+
+    monkeypatch.setattr(
+        "repositories.social_repository.FeedSafetyRepository.get_invitation_restricted_user_ids",
+        get_restricted_ids,
+    )
+
+    result = await discover_with_dependencies(viewer, db, first=1)
+
+    assert [edge.node.user.id for edge in result.edges] == [creators[1].id]
+    assert result.page_info.has_next_page is False
+    assert result.page_info.end_cursor == "1"
+
+
+@pytest.mark.asyncio
 async def test_discover_creators_filters_scores_ranks_and_paginates_cards(
     monkeypatch, discovery_dependencies,
 ):
@@ -356,6 +502,110 @@ async def test_discover_creators_orders_results_by_relevance_score(discovery_dep
     assert scores == sorted(scores, reverse=True)
     assert scores[0] > scores[1]
     assert profiles[0].tags == ["music"]
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_activity_changes_final_relevance_score(discovery_dependencies):
+    viewer, creators, profiles, db = discovery_dependencies
+    profiles[1].tags = profiles[0].tags
+    now = datetime.now(timezone.utc)
+    db.execute.return_value.all.return_value = [
+        (creators[0].id, now, 5),
+        (creators[1].id, now - timedelta(days=30), 0),
+    ]
+
+    result = await discover_with_dependencies(viewer, db)
+    scores = {edge.node.user.id: edge.node.relevance_score for edge in result.edges}
+
+    assert scores[creators[0].id] - scores[creators[1].id] == pytest.approx(8.6)
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_reputation_changes_final_relevance_score(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, creators, profiles, db = discovery_dependencies
+    profiles[1].tags = profiles[0].tags
+    populated_reputation = SimpleNamespace(
+        overall_score=100.0,
+        reliability_score=100.0,
+        community_score=100.0,
+    )
+
+    async def reputation_scores(self, user_ids):
+        return {creators[0].id: populated_reputation}
+
+    monkeypatch.setattr(
+        "repositories.reputation_repository.ReputationRepository.get_reputation_scores",
+        reputation_scores,
+    )
+
+    result = await discover_with_dependencies(viewer, db)
+    cards = {edge.node.user.id: edge.node for edge in result.edges}
+
+    assert cards[creators[0].id].relevance_score - cards[creators[1].id].relevance_score == pytest.approx(5.0)
+    assert cards[creators[0].id].reputation_score is None
+    assert cards[creators[1].id].reputation_score is None
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_paginates_after_global_relevance_ranking(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, creators, _, db = discovery_dependencies
+
+    async def creator_affinity(self, user_id, limit=20):
+        return [(creators[1].id, 100.0)]
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.creator_affinity",
+        creator_affinity,
+    )
+
+    first_page = await discover_with_dependencies(viewer, db, first=1)
+    second_page = await discover_with_dependencies(
+        viewer,
+        db,
+        first=1,
+        after=first_page.page_info.end_cursor,
+    )
+
+    assert [edge.node.user.id for edge in first_page.edges] == [creators[1].id]
+    assert first_page.page_info.end_cursor == "1"
+    assert [edge.node.user.id for edge in second_page.edges] == [creators[0].id]
+    assert second_page.page_info.end_cursor == "2"
+    assert second_page.page_info.has_next_page is False
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_passes_normalized_complementary_interests_to_scoring(
+    monkeypatch,
+    discovery_dependencies,
+):
+    from repositories.creator_scoring import calculate_collaboration_score as score_collaboration
+
+    viewer, _, profiles, db = discovery_dependencies
+    profiles[0].tags = [" Music ", "music"]
+    profiles[1].tags = ["art"]
+    scoring_inputs = []
+
+    def capture_collaboration_score(**kwargs):
+        scoring_inputs.append(kwargs)
+        return score_collaboration(**kwargs)
+
+    monkeypatch.setattr(
+        "api.graphql.calculate_collaboration_score",
+        capture_collaboration_score,
+    )
+
+    await discover_with_dependencies(viewer, db)
+
+    assert [
+        (item["shared_interests"], item["complementary_interests"])
+        for item in scoring_inputs
+    ] == [(1, 0), (0, 2)]
 
 
 @pytest.mark.asyncio
@@ -550,6 +800,27 @@ async def test_discover_creators_excludes_private_unfollowed_creator(discovery_d
     result = await discover_with_dependencies(viewer, db)
 
     assert [edge.node.user.id for edge in result.edges] == [creators[1].id]
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_excludes_invitation_restricted_creator(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, creators, _, db = discovery_dependencies
+
+    async def get_restricted_ids(self, initiator_id, target_ids):
+        return {creators[0].id} if creators[0].id in target_ids else set()
+
+    monkeypatch.setattr(
+        "repositories.social_repository.FeedSafetyRepository.get_invitation_restricted_user_ids",
+        get_restricted_ids,
+    )
+
+    result = await discover_with_dependencies(viewer, db)
+
+    assert [edge.node.user.id for edge in result.edges] == [creators[1].id]
+
 
 @pytest.mark.asyncio
 async def test_discovered_creator_id_becomes_pending_collaboration_participant(monkeypatch, eligibility_dependencies):

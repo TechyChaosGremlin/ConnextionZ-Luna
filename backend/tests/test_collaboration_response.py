@@ -321,6 +321,89 @@ async def test_cancel_collaboration_tracks_cancelled_event(monkeypatch, _stub_an
 
 
 @pytest.mark.asyncio
+async def test_update_collaboration_tracks_proposed_to_accepted_event(monkeypatch, _stub_analytics):
+    user = make_user()
+    collab = make_collab(initiator_id=user.id)
+    collab.proposed_at = None
+    collab.completed_at = None
+    patch_repo(monkeypatch, None, collab)
+
+    async def fake_get_accepted_participants(self, collaboration):
+        return [make_participant(uuid.uuid4(), accepted=True)]
+
+    monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_accepted_participants",
+        fake_get_accepted_participants,
+    )
+    ctx = make_ctx(user)
+    monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
+
+    await _update_collaboration(
+        ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="accepted")),
+    )
+
+    assert _stub_analytics[0]["event_type"] == EventType.COLLAB_ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_update_collaboration_tracks_proposed_to_declined_event(monkeypatch, _stub_analytics):
+    user = make_user()
+    collab = make_collab(initiator_id=user.id)
+    collab.proposed_at = None
+    collab.completed_at = None
+    patch_repo(monkeypatch, None, collab)
+    ctx = make_ctx(user)
+    monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
+
+    await _update_collaboration(
+        ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="declined")),
+    )
+
+    assert _stub_analytics[0]["event_type"] == EventType.COLLAB_DECLINED
+
+
+@pytest.mark.asyncio
+async def test_collaboration_lifecycle_tracks_ordered_event_sequence(monkeypatch, _stub_analytics):
+    invitee = make_user()
+    initiator = make_user(username="initiator")
+    participant = make_participant(invitee.id)
+    collab = make_collab(initiator_id=initiator.id)
+    collab.proposed_at = None
+    collab.completed_at = None
+    participant.collaboration_id = collab.id
+    patch_repo(monkeypatch, participant, collab)
+    invitee_ctx = make_ctx(invitee)
+    initiator_ctx = make_ctx(initiator)
+    monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
+
+    await _accept_collaboration(invitee_ctx, collab.id)
+    assert collab.status == CollaborationStatus.ACCEPTED
+
+    await _update_collaboration(
+        initiator_ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="in_progress")),
+    )
+    assert collab.status == CollaborationStatus.IN_PROGRESS
+
+    await _update_collaboration(
+        initiator_ctx,
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="completed")),
+    )
+    assert collab.status == CollaborationStatus.COMPLETED
+    assert [event["event_type"] for event in _stub_analytics] == [
+        EventType.COLLAB_ACCEPTED,
+        EventType.COLLAB_STARTED,
+        EventType.COLLAB_COMPLETED,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_start_collaboration_tracks_started_event(monkeypatch, _stub_analytics):
     user = make_user()
     collab = make_collab(initiator_id=user.id, status=CollaborationStatus.ACCEPTED)

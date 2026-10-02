@@ -24,7 +24,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api.graphql import AppContext, _feed, _follow, _unfollow
+from api.graphql import (
+    AppContext,
+    FeedAlgorithm,
+    FeedFilter,
+    Query,
+    _feed,
+    _follow,
+    _unfollow,
+)
 from app.models.content import ContentStatus
 from app.models.user import AccountStatus, User, UserRole
 
@@ -126,6 +134,9 @@ class FakeFollowGraph:
     async def get_following_ids(self, follower_id):
         return [b for (a, b) in self.edges if a == follower_id]
 
+    async def get_follower_ids(self, following_id):
+        return [a for (a, b) in self.edges if b == following_id]
+
     async def count_followers(self, user_id):
         return sum(1 for (_, b) in self.edges if b == user_id)
 
@@ -151,6 +162,10 @@ def follow_graph(monkeypatch):
     monkeypatch.setattr(
         "repositories.social_repository.FollowRepository.get_following_ids",
         lambda self, follower_id: graph.get_following_ids(follower_id),
+    )
+    monkeypatch.setattr(
+        "repositories.social_repository.FollowRepository.get_follower_ids",
+        lambda self, following_id: graph.get_follower_ids(following_id),
     )
     monkeypatch.setattr(
         "repositories.social_repository.FollowRepository.count_followers",
@@ -378,6 +393,16 @@ def stub_post_engagement_rates(monkeypatch, rates: dict):
     monkeypatch.setattr(
         "repositories.analytics_repository.AnalyticsRepository.post_engagement_rates",
         fake_post_engagement_rates,
+    )
+
+
+def stub_recent_post_engagement(monkeypatch, signals: dict):
+    async def fake_recent_post_engagement(self, post_ids, since):
+        return {post_id: value for post_id, value in signals.items() if post_id in set(post_ids)}
+
+    monkeypatch.setattr(
+        "repositories.analytics_repository.AnalyticsRepository.recent_post_engagement",
+        fake_recent_post_engagement,
     )
 
 
@@ -1213,3 +1238,155 @@ async def test_for_you_not_interested_post_demoted_below_consumed_posts(
     page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
 
     assert [item.id for item in page.items] == [unseen_id, completed_id, flagged_id]
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "handler_name"),
+    [
+        (FeedAlgorithm.VIRAL, "_viral_feed"),
+        (FeedAlgorithm.ORGANIC, "_organic_feed"),
+        (FeedAlgorithm.PAID, "_paid_feed"),
+        (FeedAlgorithm.COMMUNITY, "_community_feed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_feed_algorithm_selector_dispatches_to_matching_handler(
+    monkeypatch, follow_graph, algorithm, handler_name
+):
+    viewer = make_user("viewer")
+    ctx = make_ctx(viewer)
+    expected_page = object()
+    calls = []
+
+    async def fake_handler(*args):
+        calls.append(args)
+        return expected_page
+
+    monkeypatch.setattr(f"api.graphql.{handler_name}", fake_handler)
+
+    result = await Query().feed(
+        SimpleNamespace(context=ctx),
+        filter=FeedFilter(algorithm=algorithm),
+    )
+
+    assert result is expected_page
+    assert len(calls) == 1
+    assert calls[0][0] is ctx
+
+
+@pytest.mark.asyncio
+async def test_feed_without_algorithm_keeps_for_you_default(monkeypatch, follow_graph):
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    post_id = _ordered_post_ids(1)[0]
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, [make_post(creator.id, post_id)])
+    stub_hidden_creators(monkeypatch)
+
+    page = await Query().feed(SimpleNamespace(context=make_ctx(viewer)))
+
+    assert [item.id for item in page.items] == [post_id]
+
+
+@pytest.mark.asyncio
+async def test_viral_feed_ranks_recent_momentum_above_stale_lifetime_engagement(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    recent_creator = make_user("recent")
+    stale_creator = make_user("stale")
+    recent_id, stale_id = _ordered_post_ids(2)
+    recent_post = make_post(recent_creator.id, recent_id)
+    stale_post = make_post(
+        stale_creator.id,
+        stale_id,
+        view_count=100_000,
+        like_count=10_000,
+        share_count=1_000,
+        save_count=1_000,
+    )
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, [stale_post, recent_post])
+    stub_hidden_creators(monkeypatch)
+    stub_recent_post_engagement(
+        monkeypatch,
+        {
+            recent_id: {
+                "views": 25,
+                "completions": 12,
+                "rewatches": 4,
+                "likes": 8,
+                "saves": 5,
+                "shares": 6,
+            },
+        },
+    )
+
+    page = await Query().feed(
+        SimpleNamespace(context=make_ctx(viewer)),
+        filter=FeedFilter(algorithm=FeedAlgorithm.VIRAL),
+    )
+
+    assert [item.id for item in page.items] == [recent_id, stale_id]
+
+
+@pytest.mark.asyncio
+async def test_recent_post_engagement_aggregates_only_after_cutoff():
+    from app.models.analytics import SignalType
+    from repositories.analytics_repository import AnalyticsRepository
+
+    post_id = uuid.uuid4()
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(
+        all=lambda: [
+            (post_id, SignalType.SHARE, 3),
+            (post_id, SignalType.VIEW, 8),
+        ]
+    )
+
+    signals = await AnalyticsRepository(db).recent_post_engagement([post_id], since)
+
+    statement = db.execute.await_args.args[0]
+    compiled = statement.compile()
+    assert "interaction_signals.created_at >= " in str(compiled)
+    assert since in compiled.params.values()
+    assert signals == {post_id: {"shares": 3.0, "views": 8.0}}
+
+
+@pytest.mark.asyncio
+async def test_community_feed_prioritizes_relationships_over_general_popularity(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    followed_creator = make_user("followed")
+    mutual_creator = make_user("mutual")
+    affinity_creator = make_user("affinity")
+    now = datetime.now(timezone.utc)
+    followed_id, mutual_id, affinity_id = _ordered_post_ids(3)
+    posts = [
+        make_post(followed_creator.id, followed_id, created_at=now),
+        make_post(mutual_creator.id, mutual_id, created_at=now),
+        make_post(
+            affinity_creator.id,
+            affinity_id,
+            created_at=now,
+            view_count=100_000,
+            like_count=10_000,
+            share_count=1_000,
+            save_count=1_000,
+        ),
+    ]
+    stub_feed_posts(monkeypatch, posts)
+    stub_creator_affinity(monkeypatch, {affinity_creator.id: 100.0})
+    stub_hidden_creators(monkeypatch)
+    await follow_graph.follow(viewer.id, followed_creator.id)
+    await follow_graph.follow(viewer.id, mutual_creator.id)
+    await follow_graph.follow(mutual_creator.id, viewer.id)
+
+    page = await Query().feed(
+        SimpleNamespace(context=make_ctx(viewer)),
+        filter=FeedFilter(algorithm=FeedAlgorithm.COMMUNITY),
+    )
+
+    assert [item.id for item in page.items] == [mutual_id, followed_id, affinity_id]

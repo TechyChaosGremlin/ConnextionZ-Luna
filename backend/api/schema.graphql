@@ -100,10 +100,10 @@ enum SortDirection {
 }
 
 enum FeedAlgorithm {
-  PERSONALIZED
-  TRENDING
-  RECENT
-  FOLLOWING
+  VIRAL
+  ORGANIC
+  PAID
+  COMMUNITY
 }
 
 # ── Pagination (Relay Connection Spec) ───────────────────────────────────────

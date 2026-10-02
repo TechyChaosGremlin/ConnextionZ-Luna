@@ -231,10 +231,10 @@ class SortDirection(Enum):
 
 @strawberry.enum
 class FeedAlgorithm(Enum):
-    PERSONALIZED = "PERSONALIZED"
-    TRENDING = "TRENDING"
-    RECENT = "RECENT"
-    FOLLOWING = "FOLLOWING"
+    VIRAL = "VIRAL"
+    ORGANIC = "ORGANIC"
+    PAID = "PAID"
+    COMMUNITY = "COMMUNITY"
 
 
 # ── Pagination Types (Relay Connection Spec) ──────────────────────────────────
@@ -1466,9 +1466,11 @@ class Query:
         cursor: Optional[str] = None,
         limit: int = 10,
         following: bool = False,
+        filter: Optional[FeedFilter] = None,
     ) -> FeedPageType:
         """Personalized feed for the authenticated user."""
-        return await _feed(info.context, cursor, limit, following)
+        algorithm = filter.algorithm if filter is not None else None
+        return await _feed(info.context, cursor, limit, following, algorithm)
 
     @strawberry.field
     async def post(self, info: StrawberryInfo[AppContext, None], id: UUIDScalar) -> Optional[PostType]:
@@ -2484,7 +2486,9 @@ def _decode_for_you_cursor(cursor):
     return ranked_ids, last_id
 
 
-async def _feed(ctx, cursor, limit, following) -> FeedPageType:
+async def _feed(
+    ctx, cursor, limit, following, algorithm: FeedAlgorithm | None = None
+) -> FeedPageType:
     """Personalized feed for the authenticated user (legacy cursor-page shape)."""
     from uuid import UUID as UUID_type
     from repositories.content_repository import PostRepository
@@ -2505,6 +2509,18 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
                 before_id = UUID_type(cursor)
             except ValueError:
                 raise ValueError("Invalid feed cursor")
+
+    if algorithm is not None:
+        followed_ids = await follow_repo.get_following_ids(user.id)
+        algorithm_handlers = {
+            FeedAlgorithm.VIRAL: _viral_feed,
+            FeedAlgorithm.ORGANIC: _organic_feed,
+            FeedAlgorithm.PAID: _paid_feed,
+            FeedAlgorithm.COMMUNITY: _community_feed,
+        }
+        return await algorithm_handlers[algorithm](
+            ctx, user, followed_ids, before_id, limit, cursor
+        )
 
     if not following:
         followed_ids = await follow_repo.get_following_ids(user.id)
@@ -2549,6 +2565,239 @@ async def _feed(ctx, cursor, limit, following) -> FeedPageType:
     from services.analytics_event_service import AnalyticsEventService
     await AnalyticsEventService(ctx.db).track_impressions_bulk(
         user=user, posts=posts, session_id=ctx.session_id
+    )
+    try:
+        await ctx.db.commit()
+    except Exception:
+        pass
+
+    return FeedPageType(items=items, next_cursor=next_cursor)
+
+
+async def _organic_feed(ctx, user, followed_ids, before_id, limit, cursor):
+    """Keep Organic on the existing For You candidate and ranking behavior."""
+    return await _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor)
+
+
+async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
+    from datetime import timedelta, timezone
+    from repositories.content_repository import PostRepository
+    from repositories.profile_repository import ProfileRepository
+    from repositories.social_repository import FeedSafetyRepository
+    from repositories.analytics_repository import AnalyticsRepository
+    from repositories.feed_ranking import (
+        FOR_YOU_DISCOVERY_LOOKBACK_DAYS,
+        FOR_YOU_DISCOVERY_POOL_SIZE,
+        VIRAL_MOMENTUM_WINDOW_HOURS,
+        score_viral_post,
+    )
+
+    now = datetime.now(timezone.utc)
+    discovery_since = now - timedelta(days=FOR_YOU_DISCOVERY_LOOKBACK_DAYS)
+    momentum_since = now - timedelta(hours=VIRAL_MOMENTUM_WINDOW_HOURS)
+    excluded_creator_ids = list(followed_ids) + [user.id]
+    candidates = await PostRepository(ctx.db).get_discovery_pool(
+        exclude_user_ids=excluded_creator_ids,
+        since=discovery_since,
+        limit=FOR_YOU_DISCOVERY_POOL_SIZE,
+    )
+
+    candidate_creator_ids = {post.user_id for post in candidates}
+    hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
+        user.id, list(candidate_creator_ids)
+    )
+    profiles = {
+        profile.user_id: profile
+        for profile in await ProfileRepository(ctx.db).get_multiple_by_user_ids(
+            list(candidate_creator_ids)
+        )
+    }
+    following_ids = set(followed_ids) | {user.id}
+    visible = [
+        post
+        for post in candidates
+        if _feed_item_is_visible(
+            post,
+            viewer_id=user.id,
+            hidden_creator_ids=hidden_creator_ids,
+            profiles=profiles,
+            following_ids=following_ids,
+        )
+    ]
+
+    recent_signals = await AnalyticsRepository(ctx.db).recent_post_engagement(
+        [post.id for post in visible], momentum_since
+    )
+    ranked = [
+        post
+        for post, _score in sorted(
+            (
+                (post, score_viral_post(recent_signals.get(post.id, {})))
+                for post in visible
+            ),
+            key=lambda item: (item[1], str(item[0].id)),
+            reverse=True,
+        )
+    ]
+
+    snapshot_ids: list | None = None
+    start_index = 0
+    if cursor is not None:
+        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
+        if snapshot_ids:
+            ranked_by_id = {post.id: post for post in ranked}
+            ranked = [ranked_by_id[post_id] for post_id in snapshot_ids if post_id in ranked_by_id]
+        for index, post in enumerate(ranked):
+            if post.id == last_id:
+                start_index = index + 1
+                break
+
+    page = ranked[start_index : start_index + limit + 1]
+    has_more = len(page) > limit
+    if has_more:
+        page = page[:limit]
+
+    items = [await _post_to_feed_item(ctx, post) for post in page]
+    next_cursor = (
+        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        if has_more and page
+        else None
+    )
+    from services.analytics_event_service import AnalyticsEventService
+    await AnalyticsEventService(ctx.db).track_impressions_bulk(
+        user=user, posts=page, session_id=ctx.session_id
+    )
+    try:
+        await ctx.db.commit()
+    except Exception:
+        pass
+
+    return FeedPageType(items=items, next_cursor=next_cursor)
+
+
+async def _paid_feed(ctx, user, followed_ids, before_id, limit, cursor):
+    raise NotImplementedError("Paid feed ranking is not implemented")
+
+
+async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
+    from datetime import datetime, timezone
+    from repositories.content_repository import PostRepository
+    from repositories.profile_repository import ProfileRepository
+    from repositories.social_repository import FeedSafetyRepository, FollowRepository
+    from repositories.analytics_repository import AnalyticsRepository
+    from repositories.feed_ranking import (
+        COMMUNITY_AFFINITY_POOL_SIZE,
+        COMMUNITY_FOLLOW_POOL_SIZE,
+        score_community_post,
+    )
+
+    followed_creator_ids = set(followed_ids)
+    mutual_creator_ids = followed_creator_ids & set(
+        await FollowRepository(ctx.db).get_follower_ids(user.id)
+    )
+    affinity_pairs = await AnalyticsRepository(ctx.db).creator_affinity(user.id)
+    affinity = dict(affinity_pairs)
+    affinity_creator_ids = [
+        creator_id
+        for creator_id, score in affinity_pairs
+        if score > 0 and creator_id not in followed_creator_ids and creator_id != user.id
+    ]
+
+    post_repo = PostRepository(ctx.db)
+    followed_pool = (
+        await post_repo.get_feed(
+            user_ids=list(followed_creator_ids), limit=COMMUNITY_FOLLOW_POOL_SIZE
+        )
+        if followed_creator_ids
+        else []
+    )
+    affinity_pool = (
+        await post_repo.get_feed(
+            user_ids=affinity_creator_ids, limit=COMMUNITY_AFFINITY_POOL_SIZE
+        )
+        if affinity_creator_ids
+        else []
+    )
+    candidates = list(
+        {
+            post.id: post
+            for pool in (followed_pool, affinity_pool)
+            for post in pool
+        }.values()
+    )
+
+    candidate_creator_ids = {post.user_id for post in candidates}
+    hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
+        user.id, list(candidate_creator_ids)
+    )
+    profiles = {
+        profile.user_id: profile
+        for profile in await ProfileRepository(ctx.db).get_multiple_by_user_ids(
+            list(candidate_creator_ids)
+        )
+    }
+    following_ids = followed_creator_ids | {user.id}
+    visible = [
+        post
+        for post in candidates
+        if _feed_item_is_visible(
+            post,
+            viewer_id=user.id,
+            hidden_creator_ids=hidden_creator_ids,
+            profiles=profiles,
+            following_ids=following_ids,
+        )
+    ]
+
+    scored = [
+        (
+            post,
+            score_community_post(
+                is_followed=post.user_id in followed_creator_ids,
+                is_mutual=post.user_id in mutual_creator_ids,
+                creator_affinity=affinity.get(post.user_id, 0.0),
+            ),
+        )
+        for post in visible
+    ]
+
+    def community_sort_key(item):
+        post, score = item
+        created_at = getattr(post, "created_at", None)
+        if created_at is None:
+            created_at = datetime.min.replace(tzinfo=timezone.utc)
+        elif created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return score, created_at, str(post.id)
+
+    ranked = [post for post, _score in sorted(scored, key=community_sort_key, reverse=True)]
+
+    snapshot_ids: list | None = None
+    start_index = 0
+    if cursor is not None:
+        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
+        if snapshot_ids:
+            ranked_by_id = {post.id: post for post in ranked}
+            ranked = [ranked_by_id[post_id] for post_id in snapshot_ids if post_id in ranked_by_id]
+        for index, post in enumerate(ranked):
+            if post.id == last_id:
+                start_index = index + 1
+                break
+
+    page = ranked[start_index : start_index + limit + 1]
+    has_more = len(page) > limit
+    if has_more:
+        page = page[:limit]
+
+    items = [await _post_to_feed_item(ctx, post) for post in page]
+    next_cursor = (
+        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        if has_more and page
+        else None
+    )
+    from services.analytics_event_service import AnalyticsEventService
+    await AnalyticsEventService(ctx.db).track_impressions_bulk(
+        user=user, posts=page, session_id=ctx.session_id
     )
     try:
         await ctx.db.commit()
@@ -3316,6 +3565,8 @@ async def _live_streams(ctx, first, after) -> LiveStreamConnection:
                 viewer_count=s.viewer_count,
                 started_at=s.started_at,
                 ended_at=s.ended_at,
+                created_at=s.created_at,
+                updated_at=s.updated_at,
             ),
             cursor=str(s.id),
         )
@@ -3330,7 +3581,7 @@ async def _live_streams(ctx, first, after) -> LiveStreamConnection:
         end_cursor=edges[-1].cursor if edges else None,
     )
     
-    return LiveStreamConnection(edges=edges, page_info=page_info)
+    return LiveStreamConnection(edges=edges, page_info=page_info, total_count=len(streams))
 
 
 async def _live_stream(ctx, id) -> Optional[LiveStreamType]:
@@ -3368,6 +3619,8 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
     """Discover creators matching tags, interests, or free-text query."""
     if not ctx.user:
         raise ValueError("Authentication required")
+    if first < 1 or first > 100:
+        raise ValueError("first must be between 1 and 100")
     
     from uuid import UUID as UUID_type
     from repositories.profile_repository import ProfileRepository
@@ -3419,45 +3672,54 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         except ValueError:
             raise ValueError("Invalid cursor")
 
-    # Get profiles (simplified discovery - would use algorithm in production)
-    profiles = await repo.get_all(
-        skip=skip,
-        limit=first + 1,
-    )
+    # Score the full eligible set before paginating so pages follow relevance order.
+    batch_size = max(first + 1, 20)
+    eligible_profiles = []
+    invite_eligibility = CollaborationInviteEligibilityService(ctx.db)
+    scan_offset = 0
 
-    candidate_ids = [profile.user_id for profile in profiles]
+    while True:
+        profiles = await repo.get_all(
+            skip=scan_offset,
+            limit=batch_size,
+            order_by="id",
+        )
+        if not profiles:
+            break
 
-    hidden_creator_ids = await safety_repo.get_hidden_creator_ids(
-        ctx.user.id,
-        candidate_ids,
-    )
+        candidate_ids = [profile.user_id for profile in profiles]
+        hidden_creator_ids = await safety_repo.get_hidden_creator_ids(
+            ctx.user.id,
+            candidate_ids,
+        )
 
-    profiles = [
-        profile
-        for profile in profiles
-        if profile.user_id not in hidden_creator_ids
-    ]
-    # Filter by tags if provided
-    if tags:
-        profiles = [p for p in profiles if p.tags and any(tag in p.tags for tag in tags)]
-    
-    # Filter by query if provided
-    if query:
-        profiles = [p for p in profiles if query.lower() in (p.display_name or "").lower() or 
-                   query.lower() in (p.bio or "").lower()]
-    
-    # Check if there are more results
-    has_next_page = len(profiles) > first
-    if has_next_page:
-        profiles = profiles[:first]
-    
+        for profile in profiles:
+            if profile.user_id == ctx.user.id or profile.user_id in hidden_creator_ids:
+                continue
+            if tags and not (profile.tags and any(tag in profile.tags for tag in tags)):
+                continue
+            if query and query.lower() not in (profile.display_name or "").lower() and query.lower() not in (profile.bio or "").lower():
+                continue
+
+            try:
+                validated_users = await invite_eligibility.validate_participant_users(
+                    ctx.user,
+                    [profile.user_id],
+                )
+            except (ValueError, PermissionError):
+                continue
+
+            profile_user = validated_users.get(profile.user_id)
+            if profile_user is not None:
+                    eligible_profiles.append((profile, profile_user))
+
+        scan_offset += len(profiles)
+        if len(profiles) < batch_size:
+            break
+
     # Build edges
     edges = []
-    invite_eligibility = CollaborationInviteEligibilityService(ctx.db)
-
-    scoring_profiles = [
-        profile for profile in profiles if profile.user_id != ctx.user.id
-    ]
+    scoring_profiles = [profile for profile, _ in eligible_profiles]
     scoring_user_ids = [profile.user_id for profile in scoring_profiles]
     follow_states = await follow_repo.are_following_each_other_for_users(
         ctx.user.id,
@@ -3471,22 +3733,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         scoring_user_ids,
     )
 
-    for profile in profiles:
-        if profile.user_id == ctx.user.id:
-            continue
-
-        try:
-            validated_users = await invite_eligibility.validate_participant_users(
-                ctx.user,
-                [profile.user_id],
-            )
-        except (ValueError, PermissionError):
-            continue
-
-        profile_user = validated_users.get(profile.user_id)
-        if profile_user is None:
-            continue
-
+    for profile, profile_user in eligible_profiles:
         last_post_at, recent_post_count = activity_map.get(
             profile.user_id,
             (None, 0),
@@ -3523,13 +3770,24 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
 
         viewer_tags_list = list(viewer_tags or [])
         profile_tags_list = list(profile_tags or [])
+        viewer_interest_set = {
+            tag.strip().lower()
+            for tag in viewer_tags_list
+            if isinstance(tag, str) and tag.strip()
+        }
+        creator_interest_set = {
+            tag.strip().lower()
+            for tag in profile_tags_list
+            if isinstance(tag, str) and tag.strip()
+        }
 
         interest_score = calculate_interest_match(
             viewer_tags_list,
             profile_tags_list,
         )
 
-        shared_interests = len(set(viewer_tags_list) & set(profile_tags_list))
+        shared_interests = len(viewer_interest_set & creator_interest_set)
+        complementary_interests = len(viewer_interest_set ^ creator_interest_set)
 
         pairwise_history = collaboration_histories.get(profile.user_id, [])
 
@@ -3557,6 +3815,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
             open_to_collab=profile.open_to_collab,
             status_compatible=profile_user.status == ctx.user.status,
             shared_interests=shared_interests,
+            complementary_interests=complementary_interests,
             positive_history=positive_history,
         )
 
@@ -3591,7 +3850,7 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         edges.append(
             CreatorCardEdge(
                 node=creator_card,
-                cursor=str(skip + len(edges) + 1),
+                cursor="",
             )
             )
 
@@ -3602,20 +3861,25 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
             str(edge.node.profile.id),
         ),
     )
-        
-    
+
+    for rank, edge in enumerate(edges, start=1):
+        edge.cursor = str(rank)
+
+    page_edges = edges[skip : skip + first]
+    has_next_page = skip + first < len(edges)
+
     # Build page info
     page_info = PageInfo(
         has_next_page=has_next_page,
         has_previous_page=False,
-        start_cursor=edges[0].cursor if edges else None,
-        end_cursor=str(skip + len(profiles)) if edges else None,
+        start_cursor=page_edges[0].cursor if page_edges else None,
+        end_cursor=page_edges[-1].cursor if page_edges else None,
     )
 
     return CreatorCardConnection(
-        edges=edges,
+        edges=page_edges,
         page_info=page_info,
-        total_count=len(edges),
+        total_count=len(page_edges),
     )
 
 
@@ -4585,6 +4849,7 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
                 setattr(collab, field, value)
 
         status = getattr(input, "status", None)
+        next_status = None
         if status is not None:
             next_status = status.value
             if next_status == "accepted":
@@ -4605,10 +4870,15 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
         await repo.update(collab)
         if status is not None and (
             (
+                previous_state[0].value == CollaborationStatus.PROPOSED.value
+                and next_status == CollaborationStatus.ACCEPTED.value
+            )
+            or (
                 previous_state[0].value == CollaborationStatus.ACCEPTED.value
                 and next_status == CollaborationStatus.IN_PROGRESS.value
             )
             or next_status in (
+                CollaborationStatus.DECLINED.value,
                 CollaborationStatus.CANCELLED.value,
                 CollaborationStatus.COMPLETED.value,
             )
@@ -4617,10 +4887,14 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
             from services.analytics_event_service import AnalyticsEventService
 
             event_type = (
-                EventType.COLLAB_STARTED
+                EventType.COLLAB_ACCEPTED
+                if next_status == CollaborationStatus.ACCEPTED.value
+                else EventType.COLLAB_STARTED
                 if next_status == CollaborationStatus.IN_PROGRESS.value
                 else EventType.COLLAB_COMPLETED
                 if next_status == CollaborationStatus.COMPLETED.value
+                else EventType.COLLAB_DECLINED
+                if next_status == CollaborationStatus.DECLINED.value
                 else EventType.COLLAB_CANCELLED
             )
             await AnalyticsEventService(ctx.db).track_event(

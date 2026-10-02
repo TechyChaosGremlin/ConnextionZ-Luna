@@ -318,6 +318,44 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                 bucket["rewatches"] += float(cnt)
         return out
 
+    async def recent_post_engagement(
+        self, post_ids: list[uuid.UUID], since: datetime
+    ) -> dict[uuid.UUID, dict[str, float]]:
+        """Aggregate post interaction events since a cutoff for Viral ranking."""
+        if not post_ids:
+            return {}
+
+        stmt = (
+            select(
+                InteractionSignal.post_id,
+                InteractionSignal.signal_type,
+                func.count().label("cnt"),
+            )
+            .where(
+                InteractionSignal.post_id.in_(post_ids),
+                InteractionSignal.created_at >= since,
+            )
+            .group_by(InteractionSignal.post_id, InteractionSignal.signal_type)
+        )
+        result = await self.db.execute(stmt)
+
+        out: dict[uuid.UUID, dict[str, float]] = {}
+        signal_names = {
+            SignalType.VIEW: "views",
+            SignalType.COMPLETION: "completions",
+            SignalType.REWATCH: "rewatches",
+            SignalType.LIKE: "likes",
+            SignalType.UNLIKE: "unlikes",
+            SignalType.SAVE: "saves",
+            SignalType.UNSAVE: "unsaves",
+            SignalType.SHARE: "shares",
+        }
+        for post_id, signal_type, count in result.all():
+            name = signal_names.get(signal_type)
+            if name is not None:
+                out.setdefault(post_id, {})[name] = float(count or 0)
+        return out
+
     async def user_interest_tags(self, user_id: uuid.UUID, limit: int = 20) -> list[str]:
         """The viewer's demonstrated interest topics.
 

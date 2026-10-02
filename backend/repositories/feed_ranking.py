@@ -31,6 +31,9 @@ FOR_YOU_DISCOVERY_POOL_SIZE = 150
 FOR_YOU_DISCOVERY_LOOKBACK_DAYS = 14
 FOR_YOU_AFFINITY_POOL_SIZE = 40
 FOR_YOU_INTEREST_POOL_SIZE = 60
+VIRAL_MOMENTUM_WINDOW_HOURS = 24
+COMMUNITY_FOLLOW_POOL_SIZE = 100
+COMMUNITY_AFFINITY_POOL_SIZE = 40
 
 # ── Diversity ────────────────────────────────────────────────────────────────
 MAX_CONSECUTIVE_PER_CREATOR = 2
@@ -75,6 +78,21 @@ SHORT_WATCH_PENALTY = 25.0    # demotes a rapid-skipped post more than a long pa
 # already-consumed post — but never the whole creator, and never hard-excludes
 # the post (demote, not censor), so cold-start pools never go empty.
 NOT_INTERESTED_PENALTY = 60.0
+
+# Recent-event weights for the separate Viral strategy. Shares are the
+# clearest available spread signal; lifetime counters do not enter this score.
+VIRAL_VIEW_WEIGHT = 1.0
+VIRAL_COMPLETION_WEIGHT = 2.0
+VIRAL_REWATCH_WEIGHT = 2.0
+VIRAL_LIKE_WEIGHT = 2.0
+VIRAL_SAVE_WEIGHT = 3.0
+VIRAL_SHARE_WEIGHT = 5.0
+
+# Community scores prioritize explicit relationships over interaction affinity.
+COMMUNITY_FOLLOW_SCORE = 50.0
+COMMUNITY_MUTUAL_FOLLOW_SCORE = 50.0
+COMMUNITY_AFFINITY_CAP = 100.0
+COMMUNITY_AFFINITY_SCORE_MAX = 25.0
 
 
 @dataclass(frozen=True)
@@ -143,6 +161,42 @@ def build_engagement(raw: dict, post: Any) -> PostEngagementSignals:
         completion_rate=_normalized_rate(completions, views),
         rewatch_rate=_normalized_rate(rewatches, views),
     )
+
+
+def score_viral_post(recent_signals: dict[str, float]) -> float:
+    """Score recent momentum using only timestamp-windowed interaction events."""
+    net_likes = max(
+        float(recent_signals.get("likes", 0.0) or 0.0)
+        - float(recent_signals.get("unlikes", 0.0) or 0.0),
+        0.0,
+    )
+    net_saves = max(
+        float(recent_signals.get("saves", 0.0) or 0.0)
+        - float(recent_signals.get("unsaves", 0.0) or 0.0),
+        0.0,
+    )
+    return (
+        max(float(recent_signals.get("views", 0.0) or 0.0), 0.0) * VIRAL_VIEW_WEIGHT
+        + max(float(recent_signals.get("completions", 0.0) or 0.0), 0.0)
+        * VIRAL_COMPLETION_WEIGHT
+        + max(float(recent_signals.get("rewatches", 0.0) or 0.0), 0.0)
+        * VIRAL_REWATCH_WEIGHT
+        + net_likes * VIRAL_LIKE_WEIGHT
+        + net_saves * VIRAL_SAVE_WEIGHT
+        + max(float(recent_signals.get("shares", 0.0) or 0.0), 0.0)
+        * VIRAL_SHARE_WEIGHT
+    )
+
+
+def score_community_post(
+    *, is_followed: bool, is_mutual: bool, creator_affinity: float
+) -> float:
+    """Rank by current follow relationships, reciprocity, and viewer affinity."""
+    followed_score = COMMUNITY_FOLLOW_SCORE if is_followed else 0.0
+    mutual_score = COMMUNITY_MUTUAL_FOLLOW_SCORE if is_mutual else 0.0
+    affinity = max(0.0, min(creator_affinity, COMMUNITY_AFFINITY_CAP))
+    affinity_score = affinity / COMMUNITY_AFFINITY_CAP * COMMUNITY_AFFINITY_SCORE_MAX
+    return followed_score + mutual_score + affinity_score
 
 
 def score_post(
