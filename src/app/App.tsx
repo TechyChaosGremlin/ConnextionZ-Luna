@@ -922,7 +922,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [goNext, goPrev]);
 
-  const handleLogout = useCallback(() => { endSession(); setAccount(null); setScreen("feed"); }, []);
+  const handleLogout = useCallback(() => { void endSession(); setAccount(null); setScreen("feed"); }, []);
   // `deleteAccount` has already ended the session by the time this runs.
   const handleDeleted = useCallback(() => { setShowDeleteModal(false); setAccount(null); setScreen("feed"); }, []);
 

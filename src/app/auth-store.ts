@@ -1,43 +1,15 @@
-import { AUTH_LOGIN_ENDPOINT, GRAPHQL_ENDPOINT } from "./api-config";
-import { getProfileValidationError, normalizeProfilePatch } from "./profile-validation";
+import {
+  AUTH_LOGIN_ENDPOINT,
+  AUTH_LOGOUT_ENDPOINT,
+  AUTH_REFRESH_ENDPOINT,
+  AUTH_REGISTER_ENDPOINT,
+  GRAPHQL_ENDPOINT,
+} from "./api-config.ts";
+import { getProfileValidationError, normalizeProfilePatch } from "./profile-validation.ts";
 
 // ─── ACCOUNT STORE ───────────────────────────────────────────────────────────
-//
-// ⚠️  PROTOTYPE CREDENTIAL STUB — THIS IS NOT AUTHENTICATION.
-//
-// This module exists so the UI behaves correctly: wrong passwords are rejected,
-// reset links expire, provider accounts are linked. It is NOT a security
-// boundary. Everything runs in the browser, so the account list (passwords and
-// reset tokens included) is readable in devtools and every check here can be
-// bypassed by editing client state.
-//
-// ── Replacing this with a real backend ──────────────────────────────────────
-// Keep the exported function signatures and the UI needs no changes.
-//
-//   signIn()             → POST /auth/login          (server verifies argon2/bcrypt hash)
-//   register()           → POST /auth/register
-//   signInWithProvider() → OAuth, see PROVIDER NOTES below
-//   requestPasswordReset() → POST /auth/forgot       (server emails a signed, single-use link)
-//   resetPassword()      → POST /auth/reset          (server validates token + expiry)
-//
-// ── PROVIDER NOTES ──────────────────────────────────────────────────────────
-// `signInWithProvider` is the seam for real OAuth. What each provider needs:
-//
-//   Google — Google Identity Services. Create an OAuth 2.0 Client ID in Google
-//     Cloud Console, add your origin to Authorized JavaScript origins, load
-//     https://accounts.google.com/gsi/client, and call google.accounts.id
-//     .initialize({ client_id, callback }). The callback receives a JWT
-//     credential which the SERVER must verify against Google's JWKS before a
-//     session is issued. Never trust it client-side.
-//
-//   Apple — Sign in with Apple. Requires a paid Apple Developer account, a
-//     Services ID, a registered return URL and a .p8 private key. AppleID.auth
-//     .signIn() can return an id_token in the browser, but the token exchange
-//     is signed with your private key and MUST happen server-side. There is no
-//     legitimate client-only Apple flow.
-//
-// Until those exist, `signInWithProvider` records a provider-linked account
-// locally so the rest of the app can be built and tested against it.
+// The backend verifies credentials and issues JWTs. Browser storage holds only
+// non-secret account metadata and tab-scoped access/refresh tokens.
 
 export type Provider = "google" | "apple";
 
@@ -63,8 +35,9 @@ export interface Account {
   firstName: string;
   lastName: string;
   email: string;
-  /** Absent for accounts created via a provider that never set one. */
+  /** Retained only for migrating legacy local records; never written back. */
   password?: string;
+  hasPassword?: boolean;
   /** Providers linked to this account, in addition to any password. */
   providers: Provider[];
   role?: "admin" | "creator" | "user" | "guest";
@@ -74,40 +47,12 @@ export interface Account {
 
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 
-interface ResetToken {
-  token: string;
-  email: string;
-  expiresAt: number;
-  usedAt?: number;
-}
-
 const ACCOUNTS_KEY = "connextionz.accounts";
-const RESETS_KEY = "connextionz.resets";
 const SESSION_KEY = "connextionz.session";
 const ACCESS_TOKEN_KEY = "connextionz.accessToken";
-
-/** Matches the "expires in 15 minutes" copy shown on the Reset Sent screen. */
-export const RESET_TTL_MS = 15 * 60 * 1000;
+const REFRESH_TOKEN_KEY = "connextionz.refreshToken";
 
 export const PROVIDER_LABEL: Record<Provider, string> = { google: "Google", apple: "Apple" };
-
-/** Seed account so the prototype is usable without registering first. */
-export const DEMO_ACCOUNT: Account = {
-  firstName: "Maya",
-  lastName: "Chen",
-  email: "demo@connextionz.app",
-  password: "collab2026",
-  providers: [],
-  profile: {
-    username: "maya.creates",
-    displayName: "Maya Chen",
-    bio: "Producer & visual creator. Always down for a studio session 🎧",
-    avatarColor: "#00AEEF",
-    privateAccount: false,
-    location: "Los Angeles, CA",
-    website: "connextionz.app/maya",
-  },
-};
 
 /** A handle derived from the email local part — "maya.chen@x.com" → "maya.chen". */
 const handleFromEmail = (email: string) =>
@@ -151,30 +96,45 @@ function write(key: string, value: unknown) {
 
 function loadAccounts(): Account[] {
   const list = read<Account[]>(ACCOUNTS_KEY, []);
-  if (!Array.isArray(list)) return [DEMO_ACCOUNT];
-  // Normalise older records and guarantee the demo account always exists.
+  if (!Array.isArray(list)) return [];
   const accounts = list
     .filter((a): a is Account => !!a && typeof a.email === "string")
-    .map((a) => ({ ...a, providers: Array.isArray(a.providers) ? a.providers : [] }));
-  return accounts.some((a) => normalize(a.email) === DEMO_ACCOUNT.email)
-    ? accounts
-    : [DEMO_ACCOUNT, ...accounts];
+    .map(({ password, ...account }) => ({
+      ...account,
+      hasPassword: account.hasPassword ?? password !== undefined,
+      providers: Array.isArray(account.providers) ? account.providers : [],
+    }));
+  if (list.some((account) => account?.password !== undefined)) saveAccounts(accounts);
+  return accounts;
 }
 
-const saveAccounts = (a: Account[]) => write(ACCOUNTS_KEY, a);
-const loadResets = () => read<ResetToken[]>(RESETS_KEY, []).filter((t) => !!t && !!t.token);
-const saveResets = (t: ResetToken[]) => write(RESETS_KEY, t);
+const saveAccounts = (accounts: Account[]) => write(
+  ACCOUNTS_KEY,
+  accounts.map(({ password: _password, ...account }) => account),
+);
 
 const findAccount = (accounts: Account[], email: string) =>
   accounts.find((a) => normalize(a.email) === normalize(email));
 
+function saveAccount(account: Account) {
+  const accounts = loadAccounts();
+  const index = accounts.findIndex((item) => normalize(item.email) === normalize(account.email));
+  if (index === -1) accounts.push(account);
+  else accounts[index] = account;
+  saveAccounts(accounts);
+}
+
 async function tryBackendUpdateProfile(
   patch: Partial<Profile>,
-): Promise<Result<Partial<Profile>> | null> {
+): Promise<Result<Partial<Profile>>> {
   try {
-    const response = await fetch(`${BACKEND_API_URL}/graphql`, {
+    const accessToken = getAccessToken();
+    const response = await fetch(GRAPHQL_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      },
       credentials: "include",
       body: JSON.stringify({
         query: `
@@ -194,7 +154,9 @@ async function tryBackendUpdateProfile(
       }),
     });
 
-    if (response.status === 401) return null;
+    if (response.status === 401) {
+      return { ok: false, error: "Your session has expired. Sign in again to continue." };
+    }
 
     const json = await response.json().catch(() => null);
     if (!response.ok || !json) {
@@ -224,183 +186,187 @@ async function tryBackendUpdateProfile(
       },
     };
   } catch {
+    return { ok: false, error: "Could not reach the server. Check your connection and try again." };
+  }
+}
+
+function tokenClaims(token: string): {
+  sub?: string; email?: string; username?: string; role?: Account["role"]; exp?: number;
+} | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="));
+    return JSON.parse(decoded) as {
+      sub?: string; email?: string; username?: string; role?: Account["role"]; exp?: number;
+    };
+  } catch {
     return null;
   }
 }
 
-/** Opaque, non-guessable enough for a prototype. A real backend signs these. */
-function makeToken(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function roleFromToken(token: string): Account["role"] | undefined {
-  try {
-    const payload = token.split(".")[1];
-    if (!payload) return undefined;
-    const decoded = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as { role?: Account["role"] };
-    return decoded.role;
-  } catch {
-    return undefined;
-  }
+async function responseError(response: Response, fallback: string): Promise<string> {
+  const body = await response.json().catch(() => null) as {
+    detail?: string | { message?: string; errors?: string[] };
+  } | null;
+  if (typeof body?.detail === "string") return body.detail;
+  if (body?.detail?.message) return body.detail.message;
+  if (body?.detail?.errors?.length) return body.detail.errors.join(" ");
+  return fallback;
 }
 
 // ─── SIGN IN ─────────────────────────────────────────────────────────────────
 
 export async function signIn(email: string, password: string): Promise<Result<Account>> {
-  sessionWrite(ACCESS_TOKEN_KEY, null);
-  let backendRole: Account["role"] | undefined;
+  clearAccessTokens();
   try {
-    const params = new URLSearchParams({ email: email.trim(), password });
+    const params = new URLSearchParams({ email: normalize(email), password });
     const response = await fetch(`${AUTH_LOGIN_ENDPOINT}?${params.toString()}`, {
       method: "POST",
       credentials: "include",
     });
-    if (response.ok) {
-      const payload = await response.json() as { access_token?: string };
-      if (payload.access_token) {
-        sessionWrite(ACCESS_TOKEN_KEY, payload.access_token);
-        backendRole = roleFromToken(payload.access_token);
-      }
+    if (!response.ok) {
+      return { ok: false, error: await responseError(response, "Incorrect email or password.") };
     }
+    const tokens = await response.json() as {
+      access_token?: string; refresh_token?: string; token_type?: string;
+    };
+    if (!tokens.access_token || !tokens.refresh_token || tokens.token_type?.toLowerCase() !== "bearer") {
+      return { ok: false, error: "The server returned an invalid sign-in response." };
+    }
+
+    const claims = tokenClaims(tokens.access_token);
+    if (!claims?.sub || !claims.email || !claims.username || !claims.role) {
+      return { ok: false, error: "The server returned an invalid access token." };
+    }
+    sessionWrite(ACCESS_TOKEN_KEY, tokens.access_token);
+    sessionWrite(REFRESH_TOKEN_KEY, tokens.refresh_token);
+
+    const profileResponse = await fetch(GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${tokens.access_token}`,
+      },
+      credentials: "include",
+      body: JSON.stringify({
+        query: `query CurrentAccount {
+          me { username displayName avatarUrl avatarColor bio location website privateAccount }
+        }`,
+      }),
+    });
+    if (!profileResponse.ok) {
+      clearAccessTokens();
+      return { ok: false, error: await responseError(profileResponse, "Could not load your account.") };
+    }
+    const profilePayload = await profileResponse.json() as {
+      data?: { me?: {
+        username: string; displayName: string; avatarColor?: string | null;
+        bio?: string | null; location?: string | null; website?: string | null; privateAccount?: boolean;
+      } | null };
+      errors?: { message?: string }[];
+    };
+    const backendProfile = profilePayload.data?.me;
+    if (profilePayload.errors?.length || !backendProfile) {
+      clearAccessTokens();
+      return {
+        ok: false,
+        error: profilePayload.errors?.[0]?.message || "Could not load your account.",
+      };
+    }
+
+    const displayName = backendProfile.displayName || backendProfile.username;
+    const [firstName = backendProfile.username, ...lastNames] = displayName.trim().split(/\s+/);
+    const account: Account = {
+      firstName,
+      lastName: lastNames.join(" "),
+      email: normalize(claims.email),
+      providers: [],
+      role: claims.role,
+      hasPassword: true,
+      profile: {
+        username: backendProfile.username,
+        displayName,
+        bio: backendProfile.bio ?? "",
+        avatarColor: backendProfile.avatarColor ?? "#00AEEF",
+        privateAccount: !!backendProfile.privateAccount,
+        location: backendProfile.location ?? "",
+        website: backendProfile.website ?? "",
+      },
+    };
+    saveAccount(account);
+    startSession(account.email);
+    return { ok: true, value: account };
   } catch {
-    // The local prototype account remains usable when the backend is offline.
+    clearAccessTokens();
+    return { ok: false, error: "Could not reach the authentication server. Try again." };
   }
-
-  await delay(900);
-  const account = findAccount(loadAccounts(), email);
-  if (account && backendRole) account.role = backendRole;
-
-  // An account created purely through a provider has no password to check.
-  // Say so explicitly — this is a usability dead end otherwise, and it leaks
-  // nothing an attacker could not learn by trying the provider button.
-  if (account && !account.password && account.providers.length) {
-    const names = account.providers.map((p) => PROVIDER_LABEL[p]).join(" or ");
-    return { ok: false, error: `This account uses ${names} sign-in. Continue with ${names} below.` };
-  }
-
-  // Identical message for unknown email and wrong password, so the form cannot
-  // be used to enumerate which addresses are registered.
-  if (!account || account.password !== password) {
-    return { ok: false, error: "Incorrect email or password. Please try again." };
-  }
-  return { ok: true, value: account };
 }
 
 export async function register(input: {
   firstName: string; lastName: string; email: string; password: string;
 }): Promise<Result<Account>> {
-  await delay(1100);
-  const accounts = loadAccounts();
+  const email = normalize(input.email);
+  const username = handleFromEmail(email).slice(0, 24) || "creator";
+  const params = new URLSearchParams({ email, username, password: input.password });
+  try {
+    const response = await fetch(`${AUTH_REGISTER_ENDPOINT}?${params.toString()}`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) {
+      return { ok: false, error: await responseError(response, "Could not create your account.") };
+    }
 
-  if (findAccount(accounts, input.email)) {
-    return { ok: false, error: "An account with this email already exists. Try logging in." };
+    const signedIn = await signIn(email, input.password);
+    if (!signedIn.ok) return signedIn;
+
+    const displayName = `${input.firstName.trim()} ${input.lastName.trim()}`.trim();
+    const account: Account = {
+      ...signedIn.value,
+      firstName: input.firstName.trim(),
+      lastName: input.lastName.trim(),
+      profile: {
+        ...profileOf(signedIn.value),
+        displayName: displayName || profileOf(signedIn.value).displayName,
+      },
+    };
+    saveAccount(account);
+    return { ok: true, value: account };
+  } catch {
+    return { ok: false, error: "Could not reach the authentication server. Try again." };
   }
-
-  const account: Account = { ...input, email: input.email.trim(), providers: [] };
-  saveAccounts([...accounts, account]);
-  return { ok: true, value: account };
 }
 
 // ─── PROVIDER SIGN IN ────────────────────────────────────────────────────────
 
-/**
- * Completes a provider sign-in for an identity the provider has already
- * confirmed. Real OAuth replaces the *caller* (which currently simulates the
- * provider's account chooser) — this linking logic stays as-is.
- *
- * First sign-in creates the account; later ones link the provider to the
- * existing account so a user who registered with a password keeps that access.
- */
+/** Provider OAuth is unavailable until a backend provider-verification flow exists. */
 export async function signInWithProvider(
   provider: Provider,
-  identity: { email: string; firstName: string; lastName: string },
+  _identity: { email: string; firstName: string; lastName: string },
 ): Promise<Result<Account>> {
-  await delay(700);
-  const accounts = loadAccounts();
-  const existing = findAccount(accounts, identity.email);
-
-  if (existing) {
-    if (!existing.providers.includes(provider)) {
-      existing.providers = [...existing.providers, provider];
-      saveAccounts(accounts);
-    }
-    return { ok: true, value: existing };
-  }
-
-  const account: Account = {
-    firstName: identity.firstName,
-    lastName: identity.lastName,
-    email: identity.email.trim(),
-    providers: [provider],
-  };
-  saveAccounts([...accounts, account]);
-  return { ok: true, value: account };
+  return { ok: false, error: `${PROVIDER_LABEL[provider]} sign-in is not configured yet.` };
 }
 
 // ─── PASSWORD RESET ──────────────────────────────────────────────────────────
 
-/**
- * Always reports success, even for unknown addresses, so the form cannot be
- * used to discover registered emails. `token` comes back only when an account
- * actually exists — a real backend emails it instead of returning it, and the
- * prototype UI surfaces it because no mail is sent.
- */
+/** Backend password-reset delivery and confirmation are not implemented yet. */
 export async function requestPasswordReset(
-  email: string,
+  _email: string,
 ): Promise<Result<{ token: string | null }>> {
-  await delay(1000);
-  const account = findAccount(loadAccounts(), email);
-  if (!account) return { ok: true, value: { token: null } };
-
-  const now = Date.now();
-  const token: ResetToken = {
-    token: makeToken(),
-    email: normalize(account.email),
-    expiresAt: now + RESET_TTL_MS,
-  };
-
-  // Drop this account's earlier tokens so only the newest link works, and
-  // discard anything long expired to keep storage from growing forever.
-  const kept = loadResets().filter(
-    (t) => t.email !== token.email && t.expiresAt > now - RESET_TTL_MS,
-  );
-  saveResets([...kept, token]);
-  return { ok: true, value: { token: token.token } };
+  return { ok: false, error: "Password reset is not available yet." };
 }
 
-export function verifyResetToken(token: string): Result<{ email: string }> {
-  const entry = loadResets().find((t) => t.token === token.trim());
-  if (!entry) return { ok: false, error: "This reset link is not valid. Request a new one." };
-  if (entry.usedAt) return { ok: false, error: "This reset link has already been used." };
-  if (entry.expiresAt <= Date.now()) return { ok: false, error: "This reset link has expired. Request a new one." };
-  return { ok: true, value: { email: entry.email } };
+export function verifyResetToken(_token: string): Result<{ email: string }> {
+  return { ok: false, error: "Password reset is not available yet." };
 }
 
-export async function resetPassword(token: string, newPassword: string): Promise<Result<Account>> {
-  await delay(1000);
-
-  const check = verifyResetToken(token);
-  if (!check.ok) return check;
-
-  const accounts = loadAccounts();
-  const account = findAccount(accounts, check.value.email);
-  if (!account) return { ok: false, error: "That account no longer exists." };
-
-  if (account.password === newPassword) {
-    return { ok: false, error: "Choose a password you have not used before." };
-  }
-
-  account.password = newPassword;
-  saveAccounts(accounts);
-
-  // Single use: burn the token so the same link cannot be replayed.
-  const resets = loadResets();
-  const entry = resets.find((t) => t.token === token.trim());
-  if (entry) { entry.usedAt = Date.now(); saveResets(resets); }
-
-  return { ok: true, value: account };
+export async function resetPassword(
+  _token: string,
+  _newPassword: string,
+): Promise<Result<Account>> {
+  return { ok: false, error: "Password reset is not available yet." };
 }
 
 // ─── SESSION ─────────────────────────────────────────────────────────────────
@@ -415,26 +381,91 @@ export async function resetPassword(token: string, newPassword: string): Promise
 
 /** The signed-in account, or null when signed out / the account is gone. */
 export function getSession(): Account | null {
+  const accounts = loadAccounts();
   const email = sessionRead<string | null>(SESSION_KEY, null);
   if (!email || typeof email !== "string") return null;
-  return findAccount(loadAccounts(), email) ?? null;
+  if (!getAccessToken()) return null;
+  return findAccount(accounts, email) ?? null;
 }
 
 export function startSession(email: string) {
   sessionWrite(SESSION_KEY, normalize(email));
 }
 
-export function endSession() {
+export async function endSession(): Promise<void> {
+  const accessToken = getAccessToken();
   try {
     sessionStorage.removeItem(SESSION_KEY);
-    sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+    clearAccessTokens();
   } catch {
-    /* Storage disabled — nothing was persisted to clear. */
+    // Continue with remote revocation even if browser storage is unavailable.
+  }
+  try {
+    if (accessToken) {
+      await fetch(AUTH_LOGOUT_ENDPOINT, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        credentials: "include",
+      });
+    }
+  } catch {
+    // Always clear this tab's credentials, even when the backend is unreachable.
+  } finally {
+    try {
+      sessionStorage.removeItem(SESSION_KEY);
+      clearAccessTokens();
+    } catch {
+      // The current UI still transitions to the logged-out state.
+    }
   }
 }
 
 export function getAccessToken(): string | null {
   return sessionRead<string | null>(ACCESS_TOKEN_KEY, null);
+}
+
+export function getRefreshToken(): string | null {
+  return sessionRead<string | null>(REFRESH_TOKEN_KEY, null);
+}
+
+function clearAccessTokens() {
+  try {
+    sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+    sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+  } catch {
+    // Storage may be disabled; authentication will fail closed on the next request.
+  }
+}
+
+export function accessTokenNeedsRefresh(token = getAccessToken()): boolean {
+  if (!token) return false;
+  const exp = tokenClaims(token)?.exp;
+  return typeof exp === "number" && exp * 1000 <= Date.now() + 30_000;
+}
+
+export async function refreshAccessToken(): Promise<string | null> {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return null;
+  try {
+    const params = new URLSearchParams({ refresh_token: refreshToken });
+    const response = await fetch(`${AUTH_REFRESH_ENDPOINT}?${params.toString()}`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) {
+      clearAccessTokens();
+      return null;
+    }
+    const payload = await response.json() as { access_token?: string; token_type?: string };
+    if (!payload.access_token || payload.token_type?.toLowerCase() !== "bearer") {
+      clearAccessTokens();
+      return null;
+    }
+    sessionWrite(ACCESS_TOKEN_KEY, payload.access_token);
+    return payload.access_token;
+  } catch {
+    return null;
+  }
 }
 
 function sessionRead<T>(key: string, fallback: T): T {
@@ -477,26 +508,8 @@ export async function updateProfile(
   if (validationError) return { ok: false, error: validationError };
 
   const backend = await tryBackendUpdateProfile(normalizedPatch);
-  if (backend) {
-    if (!backend.ok) return backend;
-    account.profile = { ...profileOf(account), ...backend.value };
-    saveAccounts(accounts);
-    return { ok: true, value: account };
-  }
-
-  const next: Profile = { ...profileOf(account), ...normalizedPatch };
-  next.username = next.username.trim().replace(/^@/, "").toLowerCase();
-
-  if (!next.username) return { ok: false, error: "Pick a username." };
-  if (!/^[a-z0-9._]{3,24}$/.test(next.username)) {
-    return { ok: false, error: "Usernames are 3–24 characters: letters, numbers, dots and underscores." };
-  }
-  const taken = accounts.some(
-    (a) => normalize(a.email) !== normalize(email) && a.profile?.username === next.username,
-  );
-  if (taken) return { ok: false, error: "That username is already taken." };
-
-  account.profile = next;
+  if (!backend.ok) return backend;
+  account.profile = { ...profileOf(account), ...backend.value };
   saveAccounts(accounts);
   return { ok: true, value: account };
 }
@@ -510,52 +523,29 @@ export async function updateProfile(
  * have no password to confirm and are instead *setting* their first one.
  */
 export async function changePassword(
-  email: string,
-  current: string,
-  next: string,
+  _email: string,
+  _current: string,
+  _next: string,
 ): Promise<Result<Account>> {
-  await delay(900);
-  const accounts = loadAccounts();
-  const account = findAccount(accounts, email);
-  if (!account) return { ok: false, error: "That account no longer exists." };
-
-  if (account.password !== undefined && account.password !== current) {
-    return { ok: false, error: "Your current password is incorrect." };
-  }
-  if (next.length < 8) return { ok: false, error: "Password must be at least 8 characters." };
-  if (account.password === next) {
-    return { ok: false, error: "Choose a password you have not used before." };
-  }
-
-  account.password = next;
-  saveAccounts(accounts);
-
-  // Any outstanding reset link is now stale — a password change should
-  // invalidate links mailed before it, exactly as a real backend would.
-  saveResets(loadResets().filter((t) => t.email !== normalize(email)));
-  return { ok: true, value: account };
+  return { ok: false, error: "Password changes are not available yet." };
 }
 
 /** Whether this account is setting a first password rather than changing one. */
-export const hasPassword = (account: Account) => account.password !== undefined;
+export const hasPassword = (account: Account) => account.hasPassword ?? account.password !== undefined;
 
 // ─── ACCOUNT DELETION ────────────────────────────────────────────────────────
 
-/**
- * Removes the account and everything keyed to it, then ends the session.
- * Note: `loadAccounts()` re-seeds `DEMO_ACCOUNT`, so deleting the demo login
- * clears its data but keeps the prototype signable-in — deliberate, since
- * otherwise one tester could lock everyone out of the demo.
- */
+/** Remove the backend account and clear this browser's cached identity. */
 export async function deleteAccount(email: string): Promise<Result<null>> {
-  await delay(1400);
-
-  // If the backend session is active, delete there first so server data
-  // (profile, posts, follows) is removed instead of just local draft state.
+  const accessToken = getAccessToken();
+  if (!accessToken) return { ok: false, error: "Sign in again before deleting your account." };
   try {
     const response = await fetch(GRAPHQL_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
       credentials: "include",
       body: JSON.stringify({
         query: "mutation DeleteAccount { deleteAccount }",
@@ -566,20 +556,14 @@ export async function deleteAccount(email: string): Promise<Result<null>> {
       errors?: Array<{ message?: string }>;
     };
     if (response.ok && body.data?.deleteAccount === true && !body.errors?.length) {
-      endSession();
+      saveAccounts(loadAccounts().filter((account) => normalize(account.email) !== normalize(email)));
+      await endSession();
       return { ok: true, value: null };
     }
     let message = "The account could not be deleted. Try again.";
     if (body.errors?.[0]?.message) message = body.errors[0].message;
     return { ok: false, error: message };
   } catch {
-    // Backend not reachable: continue with local prototype deletion behavior.
+    return { ok: false, error: "Could not reach the server. Try again." };
   }
-
-  const accounts = loadAccounts();
-  const remaining = accounts.filter((a) => normalize(a.email) !== normalize(email));
-  saveAccounts(remaining);
-  saveResets(loadResets().filter((t) => t.email !== normalize(email)));
-  endSession();
-  return { ok: true, value: null };
 }

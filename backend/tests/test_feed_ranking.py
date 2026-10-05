@@ -43,6 +43,24 @@ from repositories.feed_ranking import (
 NOW = datetime.now(timezone.utc)
 
 
+def test_viral_score_uses_recent_weighted_events_and_net_toggles():
+    assert feed_ranking.score_viral_post({}) == 0.0
+    assert feed_ranking.score_viral_post({
+        "views": 1, "completions": 1, "rewatches": 1,
+        "likes": 3, "unlikes": 2, "saves": 2, "unsaves": 1, "shares": 1,
+    }) == 15.0
+    assert feed_ranking.score_viral_post({"likes": 1, "unlikes": 5, "saves": 1, "unsaves": 5}) == 0.0
+
+
+def test_community_relationship_tiers_cannot_be_overturned_by_affinity():
+    mutual = feed_ranking.score_community_post(is_followed=True, is_mutual=True, creator_affinity=0.0)
+    direct_max = feed_ranking.score_community_post(is_followed=True, is_mutual=False, creator_affinity=1e9)
+    direct_min = feed_ranking.score_community_post(is_followed=True, is_mutual=False, creator_affinity=0.0)
+    affinity_max = feed_ranking.score_community_post(is_followed=False, is_mutual=False, creator_affinity=1e9)
+    assert mutual > direct_max >= direct_min > affinity_max > 0.0
+    assert feed_ranking.score_community_post(is_followed=False, is_mutual=False, creator_affinity=-100.0) == 0.0
+
+
 def make_ranking_post(
     *,
     age_hours: float = 0.0,

@@ -73,6 +73,15 @@ export interface DashboardData {
   best?: ContentRow;
   quality: {
     uniqueViewers: number;
+    uniqueCompleters: number;
+    profileViews: number;
+    uniqueProfileViewers: number;
+    feedImpressions: number;
+    uniqueImpressionViewers: number;
+    videoSkips: number;
+    videoSkipRate: number | null;
+    likeRate: number | null;
+    commentRate: number | null;
     saves: number;
     avgWatchTime: number | null;
     completionRate: number | null;
@@ -91,8 +100,12 @@ const METRIC_LABELS: Record<MetricKey, string> = {
 
 export interface CreatorAnalyticsResponse {
   creatorAnalytics: {
-    totalViews: number; uniqueViewers: number; totalLikes: number; totalComments: number;
+    totalViews: number; uniqueViewers: number; uniqueCompleters: number; totalLikes: number; totalComments: number;
+    likeRate: number | null; commentRate: number | null;
     totalShares: number; totalSaves: number; followerGrowth: number; newFollowers: number;
+    profileViews: number; uniqueProfileViewers: number; profileViewsGrowthPct: number | null;
+    feedImpressions: number; uniqueImpressionViewers: number; feedImpressionsGrowthPct: number | null;
+    videoSkips: number; videoSkipRate: number | null;
     lostFollowers: number; avgWatchTime: number | null; completionRate: number | null;
     engagementRate: number; totalPosts: number; activeCollaborations: number; completedCollaborations: number;
     totalCollaborationRequests: number; pendingCollaborations: number; acceptedCollaborations: number;
@@ -120,7 +133,9 @@ export async function fetchCreatorAnalytics(range: Range): Promise<Result<Creato
   return graphqlRequestResult<CreatorAnalyticsResponse>(`
     query CreatorAnalytics($period: AnalyticsPeriod!) {
       creatorAnalytics(period: $period) {
-        totalPosts totalViews uniqueViewers totalLikes totalComments totalShares totalSaves
+        totalPosts totalViews uniqueViewers uniqueCompleters totalLikes likeRate totalComments commentRate totalShares totalSaves
+        profileViews uniqueProfileViewers profileViewsGrowthPct
+        feedImpressions uniqueImpressionViewers feedImpressionsGrowthPct videoSkips videoSkipRate
         followerGrowth newFollowers lostFollowers avgWatchTime completionRate engagementRate
         activeCollaborations completedCollaborations
         totalCollaborationRequests pendingCollaborations acceptedCollaborations declinedCollaborations cancelledCollaborations
@@ -211,6 +226,15 @@ export async function fetchDashboard(range: Range): Promise<Result<DashboardData
       ],
       collab, content, best: content[0], quality: {
         uniqueViewers: summary.uniqueViewers,
+        uniqueCompleters: summary.uniqueCompleters,
+        profileViews: summary.profileViews,
+        uniqueProfileViewers: summary.uniqueProfileViewers,
+        feedImpressions: summary.feedImpressions,
+        uniqueImpressionViewers: summary.uniqueImpressionViewers,
+        videoSkips: summary.videoSkips,
+        videoSkipRate: summary.videoSkipRate,
+        likeRate: summary.likeRate,
+        commentRate: summary.commentRate,
         saves: summary.totalSaves,
         avgWatchTime: summary.avgWatchTime,
         completionRate: summary.completionRate,

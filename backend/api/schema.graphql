@@ -513,19 +513,47 @@ type AnalyticsSummary {
   # Content
   totalPosts: Int!
   totalViews: Int!
+  totalNotInterested: Int!
+  uniqueNotInterestedUsers: Int!
   totalLikes: Int!
+  uniqueLikers: Int!
+  totalUnlikes: Int!
+  uniqueUnlikers: Int!
+  totalCompletions: Int!
+  likeRate: Float
   totalComments: Int!
+  uniqueCommenters: Int!
+  commentRate: Float
   totalShares: Int!
+  uniqueSharers: Int!
   totalSaves: Int!
+  uniqueSavers: Int!
+  totalUnsaves: Int!
+  uniqueUnsavers: Int!
+  profileViews: Int!
+  uniqueProfileViewers: Int!
+  uniqueProfileViewerRate: Float
+  feedImpressions: Int!
+  uniqueImpressionViewers: Int!
+  videoSkips: Int!
+  videoSkipRate: Float
   uniqueViewers: Int!
+  uniqueViewerRate: Float
   totalUploads: Int!
   totalPublishedVideos: Int!
+  totalWatchTime: Float!
   avgWatchTime: Float
   completionRate: Float
+  uniqueCompleters: Int!
+  uniqueCompletionRate: Float
+  uniqueRewatchers: Int!
+  uniqueRewatchRate: Float
 
   # Audience
+  currentFollowers: Int!
   followerGrowth: Int!
   newFollowers: Int!
+    uniqueNewFollowers: Int!
   lostFollowers: Int!
 
   # Earnings / Collaboration
@@ -549,6 +577,8 @@ type AnalyticsSummary {
   likesGrowthPct: Float
   commentsGrowthPct: Float
   sharesGrowthPct: Float
+  profileViewsGrowthPct: Float
+  feedImpressionsGrowthPct: Float
   followersGrowthPct: Float
 
   # Per-post analytics

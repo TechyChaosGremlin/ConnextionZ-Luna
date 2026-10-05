@@ -38,8 +38,9 @@ from api.graphql import (
     _track_post_watch,
     _unfollow,
 )
-from app.models.analytics import AnalyticsEvent, EventType
+from app.models.analytics import AnalyticsEvent, EventType, SignalType
 from app.models.user import AccountStatus, User, UserRole
+from repositories.analytics_repository import AnalyticsRepository
 from services.analytics_event_service import AnalyticsEventService
 
 
@@ -575,3 +576,32 @@ async def test_primary_action_succeeds_even_if_analytics_recording_fails(monkeyp
     assert result.liked is True
     assert result.likes == 1
     ctx.db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_creator_affinity_nets_reversals_and_ignores_post_dismissals():
+    viewer_id = uuid.uuid4()
+    engaged_creator_id = uuid.uuid4()
+    dismissed_creator_id = uuid.uuid4()
+    result = SimpleNamespace(
+        all=lambda: [
+            (engaged_creator_id, SignalType.VIEW, 1.0),
+            (engaged_creator_id, SignalType.WATCH_DURATION, 12.0),
+            (engaged_creator_id, SignalType.LIKE, 1.0),
+            (engaged_creator_id, SignalType.UNLIKE, 1.0),
+            (engaged_creator_id, SignalType.SAVE, 1.0),
+            (engaged_creator_id, SignalType.UNSAVE, 1.0),
+            (engaged_creator_id, SignalType.SHARE, 1.0),
+            (engaged_creator_id, SignalType.FOLLOW, 1.0),
+            (engaged_creator_id, SignalType.UNFOLLOW, 1.0),
+            (engaged_creator_id, SignalType.NOT_INTERESTED, 1.0),
+            (dismissed_creator_id, SignalType.NOT_INTERESTED, 3.0),
+        ]
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    affinity = await AnalyticsRepository(db).creator_affinity(viewer_id)
+
+    assert affinity == [(engaged_creator_id, 14.0)]
+    assert dismissed_creator_id not in dict(affinity)
+    db.execute.assert_awaited_once()

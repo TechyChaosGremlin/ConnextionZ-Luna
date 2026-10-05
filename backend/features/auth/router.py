@@ -11,8 +11,10 @@ Provides endpoints for:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -82,7 +84,7 @@ async def register(
         username=username,
         hashed_password=hashed_password,
         role=UserRole.USER,  # Default role
-        status=AccountStatus.PENDING_VERIFICATION,
+        status=AccountStatus.ACTIVE,
     )
 
     await user_repo.create(new_user)
@@ -91,7 +93,7 @@ async def register(
     return {
         "message": "User registered successfully",
         "user_id": str(new_user.id),
-        "status": "pending_verification",
+        "status": "active",
     }
 
 
@@ -221,18 +223,26 @@ async def logout(
     Returns:
         Success message
     """
-    from features.auth.jwt import decode_token, get_token_payload
+    from features.auth.jwt import ACCESS_TOKEN_TYPE, JWTError, blacklist_token, decode_token
 
     token = credentials.credentials
-    payload = get_token_payload(token)
+    try:
+        payload = decode_token(token)
+    except JWTError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token") from exc
+    if payload.get("type") != ACCESS_TOKEN_TYPE:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
 
     jti = payload.get("jti")
     exp = payload.get("exp")
 
-    if jti and exp:
-        # Blacklist token (placeholder - needs Redis)
-        # await redis_service.blacklist_token(jti, datetime.fromtimestamp(exp))
-        pass
+    if not jti or not exp:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
+    if not await blacklist_token(jti, datetime.fromtimestamp(float(exp), timezone.utc)):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Logout could not revoke this token. Try again.",
+        )
 
     return {"message": "Logged out successfully"}
 

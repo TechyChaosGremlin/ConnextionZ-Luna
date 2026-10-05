@@ -11,13 +11,19 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import TypedDict
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.analytics import InteractionSignal, SignalType
 from repositories.base import BaseRepository
 from repositories.feed_ranking import ViewerPostSignals
+
+
+class UniqueViewerCounts(TypedDict):
+    total: int
+    by_post: dict[uuid.UUID, int]
 
 
 class AnalyticsRepository(BaseRepository[InteractionSignal]):
@@ -131,6 +137,101 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
             }
         return totals
 
+    async def unique_viewer_counts(
+        self,
+        *,
+        creator_id: uuid.UUID,
+        post_ids: list[uuid.UUID] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> UniqueViewerCounts:
+        """Return distinct viewers across a creator and optionally per post.
+
+        Both first views and rewatches count as viewing activity, while each
+        user is counted once per scope.
+        """
+        filters = [
+            InteractionSignal.creator_id == creator_id,
+            InteractionSignal.signal_type.in_([SignalType.VIEW, SignalType.REWATCH]),
+        ]
+        if start is not None:
+            filters.append(InteractionSignal.created_at >= start)
+        if end is not None:
+            filters.append(InteractionSignal.created_at <= end)
+
+        total_stmt = select(
+            literal(None, type_=InteractionSignal.post_id.type).label("post_id"),
+            func.count(func.distinct(InteractionSignal.user_id)).label("unique_viewers"),
+        ).where(*filters)
+
+        stmt = total_stmt
+        if post_ids:
+            post_stmt = (
+                select(
+                    InteractionSignal.post_id,
+                    func.count(func.distinct(InteractionSignal.user_id)).label("unique_viewers"),
+                )
+                .where(*filters, InteractionSignal.post_id.in_(post_ids))
+                .group_by(InteractionSignal.post_id)
+            )
+            stmt = union_all(total_stmt, post_stmt)
+
+        result = await self.db.execute(stmt)
+        total = 0
+        by_post: dict[uuid.UUID, int] = {}
+        for row in result.all():
+            if row.post_id is None:
+                total = int(row.unique_viewers or 0)
+            else:
+                by_post[row.post_id] = int(row.unique_viewers or 0)
+        return {"total": total, "by_post": by_post}
+
+    async def unique_signal_actor_count(
+        self,
+        *,
+        creator_id: uuid.UUID,
+        signal_type: SignalType,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Count distinct users producing one signal type for a creator in a period."""
+        stmt = select(func.count(func.distinct(InteractionSignal.user_id))).where(
+            InteractionSignal.creator_id == creator_id,
+            InteractionSignal.signal_type == signal_type,
+            InteractionSignal.created_at >= start,
+            InteractionSignal.created_at <= end,
+        )
+        result = await self.db.execute(stmt)
+        return int(result.scalar_one() or 0)
+
+    async def unique_signal_actor_counts(
+        self,
+        *,
+        creator_id: uuid.UUID,
+        signal_types: list[SignalType],
+        start: datetime,
+        end: datetime,
+    ) -> dict[SignalType, int]:
+        """Count distinct actors grouped by signal type for one creator period."""
+        if not signal_types:
+            return {}
+
+        stmt = (
+            select(
+                InteractionSignal.signal_type,
+                func.count(func.distinct(InteractionSignal.user_id)).label("actors"),
+            )
+            .where(
+                InteractionSignal.creator_id == creator_id,
+                InteractionSignal.signal_type.in_(signal_types),
+                InteractionSignal.created_at >= start,
+                InteractionSignal.created_at <= end,
+            )
+            .group_by(InteractionSignal.signal_type)
+        )
+        result = await self.db.execute(stmt)
+        return {row.signal_type: int(row.actors or 0) for row in result.all()}
+
     async def daily_signal_totals(
         self,
         *,
@@ -198,13 +299,23 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
     async def creator_affinity(self, user_id: uuid.UUID, limit: int = 20) -> list[tuple[uuid.UUID, float]]:
         """Creators this user engages with most, weighted by signal value."""
         result = await self.db.execute(
-            select(InteractionSignal.creator_id, func.sum(InteractionSignal.value).label("score"))
+            select(
+                InteractionSignal.creator_id,
+                InteractionSignal.signal_type,
+                func.sum(InteractionSignal.value).label("total"),
+            )
             .where(InteractionSignal.user_id == user_id)
-            .group_by(InteractionSignal.creator_id)
-            .order_by(func.sum(InteractionSignal.value).desc())
-            .limit(limit)
+            .group_by(InteractionSignal.creator_id, InteractionSignal.signal_type)
         )
-        return [(row[0], float(row[1])) for row in result.all()]
+        scores: dict[uuid.UUID, float] = {}
+        negative_types = {SignalType.UNLIKE, SignalType.UNSAVE, SignalType.UNFOLLOW}
+        for creator_id, signal_type, total in result.all():
+            if signal_type == SignalType.NOT_INTERESTED:
+                continue
+            multiplier = -1.0 if signal_type in negative_types else 1.0
+            scores[creator_id] = scores.get(creator_id, 0.0) + multiplier * float(total or 0.0)
+
+        return sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
 
     async def viewer_post_history(
         self, user_id: uuid.UUID, post_ids: list[uuid.UUID]

@@ -28,9 +28,8 @@ export default function ForgotPassword({
     setError("");
     const result = await requestPasswordReset(email);
     setLoading(false);
-    // Succeeds even for unknown addresses so the form cannot be used to
-    // discover which emails are registered — the token is simply null.
-    onSent(email, result.ok ? result.value.token : null);
+    if (!result.ok) { setError(result.error); return; }
+    onSent(email, result.value.token);
   };
 
   return (

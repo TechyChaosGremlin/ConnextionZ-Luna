@@ -22,9 +22,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api.graphql import AppContext, _creator_analytics, _creator_video_analytics, _post_analytics
+from api.graphql import AppContext, _creator_analytics, _creator_video_analytics, _post_analytics, schema
 from app.models.collaboration import CollaborationStatus
-from app.models.analytics import SignalType
+from app.models.analytics import EventType, SignalType
+from repositories.analytics_repository import AnalyticsRepository
+from repositories.analytics_event_repository import AnalyticsEventRepository
 from services.creator_analytics_service import CreatorAnalyticsService
 
 
@@ -58,7 +60,145 @@ def make_post(user_id, **overrides) -> SimpleNamespace:
     return SimpleNamespace(**defaults)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "signal_type",
+    [SignalType.SHARE, SignalType.LIKE, SignalType.SAVE, SignalType.NOT_INTERESTED],
+)
+@pytest.mark.parametrize("actor_count", [4, 0])
+async def test_unique_signal_actor_aggregate_counts_distinct_users(signal_type, actor_count):
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(scalar_one=lambda: actor_count)
+    repository = AnalyticsRepository(db)
+    creator_id = uuid.uuid4()
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+
+    result = await repository.unique_signal_actor_count(
+        creator_id=creator_id,
+        signal_type=signal_type,
+        start=start,
+        end=end,
+    )
+
+    assert result == actor_count
+    query = db.execute.await_args.args[0]
+    statement = str(query)
+    assert "count(distinct(interaction_signals.user_id))" in statement
+    assert "interaction_signals.creator_id =" in statement
+    assert "interaction_signals.signal_type =" in statement
+    assert "interaction_signals.created_at >=" in statement
+    assert "interaction_signals.created_at <=" in statement
+    assert query.compile().params == {
+        "creator_id_1": creator_id,
+        "signal_type_1": signal_type,
+        "created_at_1": start,
+        "created_at_2": end,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rows, expected",
+    [
+        (
+            [
+                SimpleNamespace(signal_type=SignalType.UNLIKE, actors=2),
+                SimpleNamespace(signal_type=SignalType.REWATCH, actors=4),
+            ],
+            {SignalType.UNLIKE: 2, SignalType.REWATCH: 4},
+        ),
+        ([], {}),
+    ],
+)
+async def test_unique_signal_actor_counts_groups_by_signal_type(rows, expected):
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(all=lambda: rows)
+    repository = AnalyticsRepository(db)
+    creator_id = uuid.uuid4()
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+
+    result = await repository.unique_signal_actor_counts(
+        creator_id=creator_id,
+        signal_types=[SignalType.UNLIKE, SignalType.REWATCH],
+        start=start,
+        end=end,
+    )
+
+    assert result == expected
+    query = db.execute.await_args.args[0]
+    statement = str(query)
+    assert "count(distinct(interaction_signals.user_id))" in statement
+    assert "interaction_signals.creator_id =" in statement
+    assert "interaction_signals.signal_type IN" in statement
+    assert "interaction_signals.created_at >=" in statement
+    assert "interaction_signals.created_at <=" in statement
+    params = query.compile().params
+    assert creator_id in params.values()
+    assert start in params.values()
+    assert end in params.values()
+
+
+@pytest.mark.asyncio
+async def test_unique_commenters_aggregate_counts_distinct_users():
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(scalar_one=lambda: 3)
+    from repositories.content_repository import CommentRepository
+
+    repository = CommentRepository(db)
+    result = await repository.count_unique_commenters_for_creator(
+        uuid.uuid4(),
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 8, tzinfo=timezone.utc),
+    )
+
+    assert result == 3
+    statement = str(db.execute.await_args.args[0])
+    assert "count(distinct(comments.user_id))" in statement
+    assert "JOIN posts ON comments.post_id = posts.id" in statement
+
+
 class TestCreatorAnalytics:
+    @pytest.fixture(autouse=True)
+    def stub_unique_viewer_counts(self, monkeypatch):
+        async def empty_counts(self, *, creator_id, post_ids=None, start=None, end=None):
+            return {"total": 0, "by_post": {}}
+
+        monkeypatch.setattr(AnalyticsRepository, "unique_viewer_counts", empty_counts)
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_signal_actor_count",
+            AsyncMock(return_value=0),
+        )
+
+        async def empty_actor_counts(
+            self, *, creator_id, signal_types, start, end
+        ):
+            return {}
+
+        monkeypatch.setattr(
+            AnalyticsRepository, "unique_signal_actor_counts", empty_actor_counts
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_unique_commenters_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "profile_viewer_counts_for_creator",
+            AsyncMock(return_value={"total": 0, "unique_viewers": 0}),
+        )
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "post_event_totals_for_creator",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers",
+            AsyncMock(return_value=0),
+        )
+
     @pytest.mark.asyncio
     async def test_requires_auth(self):
         ctx = AppContext(db=AsyncMock(), current_user=None)
@@ -77,7 +217,16 @@ class TestCreatorAnalytics:
         values = {
             "total_posts": 0, "total_uploads": 0, "total_published_videos": 0,
             "total_views": 0, "unique_viewers": 0, "total_likes": 0, "total_comments": 0,
-            "total_shares": 0, "total_saves": 0, "new_followers": 0, "lost_followers": 0,
+            "unique_commenters": 0,
+            "like_rate": None, "comment_rate": None,
+            "total_shares": 0, "unique_sharers": 0,
+            "total_saves": 0, "profile_views": 0,
+            "unique_profile_viewers": 0, "unique_profile_viewer_rate": None,
+            "profile_views_growth_pct": None, "feed_impressions": 0,
+            "unique_impression_viewers": 0,
+            "feed_impressions_growth_pct": None, "video_skips": 0,
+            "video_skip_rate": None, "current_followers": 0,
+            "new_followers": 0, "lost_followers": 0,
             "follower_growth": 0, "avg_watch_time": None, "completion_rate": None,
             "engagement_rate": 0.0, "views_growth_pct": None, "likes_growth_pct": None,
             "comments_growth_pct": None, "shares_growth_pct": None, "followers_growth_pct": None,
@@ -114,7 +263,16 @@ class TestCreatorAnalytics:
         values = {
             "total_posts": 0, "total_uploads": 0, "total_published_videos": 0,
             "total_views": 0, "unique_viewers": 0, "total_likes": 0, "total_comments": 0,
-            "total_shares": 0, "total_saves": 0, "new_followers": 0, "lost_followers": 0,
+            "unique_commenters": 0,
+            "like_rate": None, "comment_rate": None,
+            "total_shares": 0, "unique_sharers": 0,
+            "total_saves": 0, "profile_views": 0,
+            "unique_profile_viewers": 0, "unique_profile_viewer_rate": None,
+            "profile_views_growth_pct": None, "feed_impressions": 0,
+            "unique_impression_viewers": 0,
+            "feed_impressions_growth_pct": None, "video_skips": 0,
+            "video_skip_rate": None, "current_followers": 0,
+            "new_followers": 0, "lost_followers": 0,
             "follower_growth": 0, "avg_watch_time": None, "completion_rate": None,
             "engagement_rate": 0.0, "views_growth_pct": None, "likes_growth_pct": None,
             "comments_growth_pct": None, "shares_growth_pct": None, "followers_growth_pct": None,
@@ -179,11 +337,19 @@ class TestCreatorAnalytics:
             SignalType.SHARE: {"count": 1, "total": 1.0},
             SignalType.WATCH_DURATION: {"count": 10, "total": 500.0},
             SignalType.COMPLETION: {"count": 4, "total": 4.0},
+            SignalType.NOT_INTERESTED: {"count": 3, "total": 3.0},
         }
 
         async def fake_signal_totals(self, *, creator_id=None, post_id=None, start=None, end=None):
             assert creator_id == ctx.user.id
             return signals
+
+        async def fake_unique_viewer_counts(
+            self, *, creator_id, post_ids=None, start=None, end=None
+        ):
+            if post_ids is not None:
+                return {"total": 6, "by_post": {posts[0].id: 7, posts[1].id: 2}}
+            return {"total": 6, "by_post": {}}
 
         async def fake_count_for_creator(self, creator_id, start=None, end=None):
             return 3
@@ -198,6 +364,7 @@ class TestCreatorAnalytics:
             "repositories.analytics_repository.AnalyticsRepository.signal_totals",
             fake_signal_totals,
         )
+        monkeypatch.setattr(AnalyticsRepository, "unique_viewer_counts", fake_unique_viewer_counts)
         monkeypatch.setattr(
             "repositories.content_repository.CommentRepository.count_for_creator",
             fake_count_for_creator,
@@ -215,15 +382,21 @@ class TestCreatorAnalytics:
 
         assert result.total_posts == 2
         assert result.total_views == 10  # VIEW + REWATCH
+        assert result.total_rewatches == 2
+        assert result.rewatch_rate == pytest.approx(20.0)
+        assert result.unique_viewers == 6
         assert result.total_likes == 11
         assert result.total_shares == 1
         assert result.total_comments == 3
         assert result.follower_growth == 7
         assert result.new_followers == 7
         assert result.lost_followers == 0
+        assert result.total_watch_time == 500.0
+        assert result.total_not_interested == 3
         assert result.engagement_rate == pytest.approx((11 + 3 + 1) / 10 * 100)
         assert len(result.top_posts) == 2
         assert result.top_posts[0].likes == 10  # highest-engagement post first
+        assert result.top_posts[0].unique_viewers == 7
 
     @pytest.mark.asyncio
     async def test_no_views_gives_zero_engagement_rate(self, monkeypatch):
@@ -261,6 +434,10 @@ class TestCreatorAnalytics:
         result = await _creator_analytics(ctx, period)
 
         assert result.total_views == 0
+        assert result.total_rewatches == 0
+        assert result.rewatch_rate is None
+        assert result.save_rate is None
+        assert result.total_watch_time == 0.0
         assert result.engagement_rate == 0.0
         assert result.top_posts == []
 
@@ -281,6 +458,7 @@ class TestCreatorAnalytics:
             SignalType.UNSAVE: {"count": 1, "total": 1.0},
             SignalType.LIKE: {"count": 5, "total": 5.0},
             SignalType.UNLIKE: {"count": 1, "total": 1.0},
+            SignalType.NOT_INTERESTED: {"count": 2, "total": 2.0},
         }
 
         async def fake_signal_totals(self, *, creator_id=None, post_id=None, start=None, end=None):
@@ -305,6 +483,8 @@ class TestCreatorAnalytics:
         assert result.follower_growth == 12
         assert result.total_likes == 4
         assert result.total_saves == 1
+        assert result.total_not_interested == 2
+        assert result.save_rate == pytest.approx(10.0)
 
     @pytest.mark.asyncio
     async def test_creator_video_analytics_authorization(self):
@@ -336,6 +516,7 @@ class TestCreatorAnalytics:
             SignalType.SAVE: {"count": 3, "total": 3.0},
             SignalType.FOLLOW: {"count": 5, "total": 5.0},
             SignalType.UNFOLLOW: {"count": 1, "total": 1.0},
+            SignalType.NOT_INTERESTED: {"count": 2, "total": 2.0},
         }
 
         async def fake_signal_totals(*args, **kwargs):
@@ -379,12 +560,18 @@ class TestCreatorAnalytics:
 
         assert overview["total_posts"] == 1
         assert overview["total_views"] == 25
+        assert overview["total_rewatches"] == 5
+        assert overview["rewatch_rate"] == pytest.approx(20.0)
         assert overview["total_likes"] == 8
         assert overview["total_shares"] == 2
+        assert overview["share_rate"] == pytest.approx(8.0)
         assert overview["total_saves"] == 3
+        assert overview["save_rate"] == pytest.approx(12.0)
         assert overview["new_followers"] == 5
         assert overview["lost_followers"] == 1
         assert overview["follower_growth"] == 4
+        assert overview["total_watch_time"] == 500.0
+        assert overview["total_not_interested"] == 2
         assert overview["avg_watch_time"] == pytest.approx(500.0 / 25)
         assert overview["completion_rate"] == pytest.approx(10 / 25 * 100)
         assert len(overview["top_posts"]) == 1
@@ -437,6 +624,1014 @@ class TestCreatorAnalytics:
         assert overview["comments_growth_pct"] == 100.0
         assert overview["shares_growth_pct"] == 100.0
         assert overview["followers_growth_pct"] == 100.0
+
+    @pytest.mark.asyncio
+    async def test_profile_views_are_scoped_to_period_and_growth(self, monkeypatch):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 5, 8, tzinfo=timezone.utc)
+        service = CreatorAnalyticsService(AsyncMock())
+
+        monkeypatch.setattr(service, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(service.analytics_repo, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            service.analytics_repo,
+            "unique_viewer_counts",
+            AsyncMock(return_value={"total": 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        async def profile_viewer_counts(self, requested_creator_id, period_start, period_end):
+            assert requested_creator_id == creator_id
+            return {
+                "total": 12 if period_start == start else 8,
+                "unique_viewers": 9 if period_start == start else 7,
+            }
+
+        async def post_event_totals(self, requested_creator_id, period_start, period_end):
+            assert requested_creator_id == creator_id
+            return {
+                EventType.VIDEO_VIEWED: {"count": 10, "unique_users": 8},
+                EventType.VIDEO_IMPRESSION: {
+                    "count": 120 if period_start == start else 80,
+                    "unique_users": 45 if period_start == start else 30,
+                },
+                EventType.VIDEO_SKIPPED: {"count": 2, "unique_users": 2},
+            }
+
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "profile_viewer_counts_for_creator",
+            profile_viewer_counts,
+        )
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "post_event_totals_for_creator",
+            post_event_totals,
+        )
+
+        values = await service.overview(creator_id, start, end)
+
+        assert values["profile_views"] == 12
+        assert values["unique_profile_viewers"] == 9
+        assert values["profile_views_growth_pct"] == 50.0
+        assert values["feed_impressions"] == 120
+        assert values["unique_impression_viewers"] == 45
+        assert values["feed_impressions_growth_pct"] == 50.0
+        assert values["video_skips"] == 2
+        assert values["video_skip_rate"] == 20.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "profile_view_counts, expected_rate",
+        [({"total": 5, "unique_viewers": 3}, 60.0), ({"total": 0, "unique_viewers": 0}, None)],
+    )
+    async def test_graphql_exposes_profile_view_metrics(
+        self, monkeypatch, profile_view_counts, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_viewer_counts",
+            AsyncMock(return_value={"total": 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "profile_viewer_counts_for_creator",
+            AsyncMock(side_effect=[
+                profile_view_counts,
+                {"total": 0, "unique_viewers": 0},
+            ]),
+        )
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "post_event_totals_for_creator",
+            AsyncMock(side_effect=[
+                {
+                    EventType.VIDEO_IMPRESSION: {"count": 50, "unique_users": 30},
+                    EventType.VIDEO_VIEWED: {"count": 100, "unique_users": 80},
+                    EventType.VIDEO_SKIPPED: {"count": 25, "unique_users": 25},
+                },
+                {},
+            ]),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { profileViews uniqueProfileViewers uniqueProfileViewerRate profileViewsGrowthPct feedImpressions uniqueImpressionViewers feedImpressionsGrowthPct videoSkips videoSkipRate } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {
+            "creatorAnalytics": {
+                "profileViews": profile_view_counts["total"],
+                "uniqueProfileViewers": profile_view_counts["unique_viewers"],
+                "uniqueProfileViewerRate": expected_rate,
+                "profileViewsGrowthPct": 100.0 if profile_view_counts["total"] else None,
+                "feedImpressions": 50,
+                "uniqueImpressionViewers": 30,
+                "feedImpressionsGrowthPct": 100.0,
+                "videoSkips": 25,
+                "videoSkipRate": 25.0,
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "profile_view_counts, expected_rate",
+        [({"total": 5, "unique_viewers": 3}, 60.0), ({"total": 0, "unique_viewers": 0}, None)],
+    )
+    @pytest.mark.asyncio
+    async def test_legacy_graphql_exposes_profile_view_metrics(
+        self, monkeypatch, profile_view_counts, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_viewer_counts",
+            AsyncMock(return_value={"total": 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            AnalyticsEventRepository,
+            "profile_viewer_counts_for_creator",
+            AsyncMock(return_value=profile_view_counts),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { profileViews uniqueProfileViewers uniqueProfileViewerRate } }''',
+            context_value=AppContext(
+                db=AsyncMock(), current_user=SimpleNamespace(id=creator_id)
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {
+            "creatorAnalytics": {
+                "profileViews": profile_view_counts["total"],
+                "uniqueProfileViewers": profile_view_counts["unique_viewers"],
+                "uniqueProfileViewerRate": expected_rate,
+            }
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "has_data, expected_views, expected_viewers, expected_rate",
+        [(True, 10, 3, 30.0), (False, 0, 0, None)],
+    )
+    async def test_graphql_exposes_unique_viewer_rate_from_service(
+        self, monkeypatch, has_data, expected_views, expected_viewers, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+
+        async def signal_totals(self, **kwargs):
+            if kwargs["start"] == start and has_data:
+                return {
+                    SignalType.VIEW: {"count": 8, "total": 8.0},
+                    SignalType.REWATCH: {"count": 2, "total": 2.0},
+                }
+            return {}
+
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", signal_totals)
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_viewer_counts",
+            AsyncMock(side_effect=[
+                {"total": expected_viewers, "by_post": {}},
+                {"total": 0, "by_post": {}},
+            ]),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { totalViews uniqueViewers uniqueViewerRate } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "totalViews": expected_views,
+            "uniqueViewers": expected_viewers,
+            "uniqueViewerRate": expected_rate,
+        }}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "has_data, expected_views, expected_viewers, expected_rate",
+        [(True, 10, 3, 30.0), (False, 0, 0, None)],
+    )
+    async def test_legacy_graphql_exposes_unique_viewer_rate(
+        self, monkeypatch, has_data, expected_views, expected_viewers, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+
+        async def signal_totals(self, **kwargs):
+            if has_data:
+                return {SignalType.VIEW: {"count": 8, "total": 8.0},
+                        SignalType.REWATCH: {"count": 2, "total": 2.0}}
+            return {}
+
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", signal_totals)
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_viewer_counts",
+            AsyncMock(return_value={"total": expected_viewers, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { totalViews uniqueViewers uniqueViewerRate } }''',
+            context_value=AppContext(
+                db=AsyncMock(), current_user=SimpleNamespace(id=creator_id)
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "totalViews": expected_views,
+            "uniqueViewers": expected_viewers,
+            "uniqueViewerRate": expected_rate,
+        }}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("current_followers", [42, 0])
+    async def test_graphql_exposes_current_followers_from_service(
+        self, monkeypatch, current_followers
+    ):
+        creator_id = uuid.uuid4()
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers",
+            AsyncMock(return_value=current_followers),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { currentFollowers } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {"currentFollowers": current_followers}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("current_followers", [42, 0])
+    async def test_legacy_graphql_exposes_current_followers(
+        self, monkeypatch, current_followers
+    ):
+        creator_id = uuid.uuid4()
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers",
+            AsyncMock(return_value=current_followers),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { currentFollowers } }''',
+            context_value=AppContext(
+                db=AsyncMock(), current_user=SimpleNamespace(id=creator_id)
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {"currentFollowers": current_followers}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize("unique_likers", [4, 0])
+    async def test_graphql_exposes_unique_likers(
+        self, monkeypatch, legacy, unique_likers
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            AnalyticsRepository, "signal_totals",
+            AsyncMock(return_value={
+                SignalType.LIKE: {"count": 9, "total": 9.0},
+                SignalType.UNLIKE: {"count": 9, "total": 9.0},
+            } if unique_likers else {}),
+        )
+
+        async def unique_actor_count(self, **kwargs):
+            assert kwargs["creator_id"] == creator_id
+            assert kwargs["start"] == start
+            assert kwargs["end"] == end
+            return unique_likers if kwargs["signal_type"] == SignalType.LIKE else 0
+
+        actor_count = AsyncMock(side_effect=unique_actor_count)
+
+        async def count_actors(self, **kwargs):
+            return await actor_count(self, **kwargs)
+
+        monkeypatch.setattr(AnalyticsRepository, "unique_signal_actor_count", count_actors)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { uniqueLikers totalLikes uniqueSharers } }''',
+            context_value=AppContext(
+                db=AsyncMock() if legacy else object(),
+                current_user=SimpleNamespace(id=creator_id),
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "uniqueLikers": unique_likers, "totalLikes": 0, "uniqueSharers": 0,
+        }}
+        like_calls = [
+            call for call in actor_count.await_args_list
+            if call.kwargs["signal_type"] == SignalType.LIKE
+        ]
+        assert len(like_calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize("unique_savers", [4, 0])
+    async def test_graphql_exposes_unique_savers(self, monkeypatch, legacy, unique_savers):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            AnalyticsRepository, "signal_totals",
+            AsyncMock(return_value={
+                SignalType.SAVE: {"count": 9, "total": 9.0},
+                SignalType.UNSAVE: {"count": 9, "total": 9.0},
+            } if unique_savers else {}),
+        )
+
+        async def unique_actor_count(**kwargs):
+            assert kwargs["creator_id"] == creator_id
+            assert kwargs["start"] == start
+            assert kwargs["end"] == end
+            return unique_savers if kwargs["signal_type"] == SignalType.SAVE else 0
+
+        actor_count = AsyncMock(side_effect=unique_actor_count)
+        monkeypatch.setattr(AnalyticsRepository, "unique_signal_actor_count", actor_count)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { uniqueSavers totalSaves } }''',
+            context_value=AppContext(
+                db=AsyncMock() if legacy else object(),
+                current_user=SimpleNamespace(id=creator_id),
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "uniqueSavers": unique_savers, "totalSaves": 0,
+        }}
+        save_calls = [
+            call for call in actor_count.await_args_list
+            if call.kwargs["signal_type"] == SignalType.SAVE
+        ]
+        assert len(save_calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize("has_data", [True, False])
+    async def test_graphql_exposes_remaining_signal_actor_metrics(
+        self, monkeypatch, legacy, has_data
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "signal_totals",
+            AsyncMock(return_value={
+                SignalType.VIEW: {"count": 6, "total": 6.0},
+                SignalType.REWATCH: {"count": 4, "total": 4.0},
+                SignalType.COMPLETION: {"count": 6, "total": 6.0},
+                SignalType.UNLIKE: {"count": 5, "total": 5.0},
+                SignalType.UNSAVE: {"count": 3, "total": 3.0},
+                SignalType.FOLLOW: {"count": 7, "total": 7.0},
+                SignalType.NOT_INTERESTED: {"count": 8, "total": 8.0},
+            } if has_data else {}),
+        )
+
+        actor_values = {
+            SignalType.UNLIKE: 3,
+            SignalType.UNSAVE: 2,
+            SignalType.REWATCH: 4,
+            SignalType.COMPLETION: 5,
+            SignalType.FOLLOW: 6,
+            SignalType.NOT_INTERESTED: 4,
+        }
+
+        async def check_actor_counts(**kwargs):
+            assert kwargs["creator_id"] == creator_id
+            assert kwargs["start"] == start
+            assert kwargs["end"] == end
+            return actor_values if has_data else {}
+
+        actor_counts = AsyncMock(side_effect=check_actor_counts)
+
+        async def unique_actor_counts(self, **kwargs):
+            return await actor_counts(**kwargs)
+
+        monkeypatch.setattr(
+            AnalyticsRepository, "unique_signal_actor_counts", unique_actor_counts
+        )
+        async def unique_viewers(self, *, creator_id, post_ids=None, start=None, end=None):
+            return {"total": 10 if has_data else 0, "by_post": {}}
+
+        monkeypatch.setattr(AnalyticsRepository, "unique_viewer_counts", unique_viewers)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) {
+                totalUnlikes uniqueUnlikers totalUnsaves uniqueUnsavers
+                uniqueRewatchers uniqueRewatchRate totalCompletions uniqueCompleters uniqueCompletionRate
+                uniqueNewFollowers uniqueNotInterestedUsers totalNotInterested
+            } }''',
+            context_value=AppContext(
+                db=AsyncMock() if legacy else object(),
+                current_user=SimpleNamespace(id=creator_id),
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "totalUnlikes": 5 if has_data else 0,
+            "uniqueUnlikers": 3 if has_data else 0,
+            "totalUnsaves": 3 if has_data else 0,
+            "uniqueUnsavers": 2 if has_data else 0,
+            "uniqueRewatchers": 4 if has_data else 0,
+            "uniqueRewatchRate": 40.0 if has_data else None,
+            "totalCompletions": 6 if has_data else 0,
+            "uniqueCompleters": 5 if has_data else 0,
+            "uniqueCompletionRate": 50.0 if has_data else None,
+            "uniqueNewFollowers": 6 if has_data else 0,
+            "uniqueNotInterestedUsers": 4 if has_data else 0,
+            "totalNotInterested": 8 if has_data else 0,
+        }}
+        actor_counts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy", [False, True])
+    @pytest.mark.parametrize(
+        "completions, views, expected_rate",
+        [(4, 10, 40.0), (0, 10, 0.0), (0, 0, None)],
+    )
+    async def test_graphql_exposes_total_completions(
+        self, monkeypatch, legacy, completions, views, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+
+        async def signal_totals(self, **kwargs):
+            assert kwargs["creator_id"] == creator_id
+            if kwargs["start"] != start:
+                return {SignalType.COMPLETION: {"count": 100, "total": 100.0}}
+            assert kwargs["end"] == end
+            if not views:
+                return {}
+            return {
+                SignalType.VIEW: {"count": views - 2, "total": 999.0},
+                SignalType.REWATCH: {"count": 2, "total": 999.0},
+                SignalType.COMPLETION: {"count": completions, "total": 999.0},
+            }
+
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", signal_totals)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { totalCompletions totalViews completionRate } }''',
+            context_value=AppContext(
+                db=AsyncMock() if legacy else object(),
+                current_user=SimpleNamespace(id=creator_id),
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "totalCompletions": completions,
+            "totalViews": views,
+            "completionRate": expected_rate,
+        }}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unique_sharers", [4, 0])
+    async def test_graphql_exposes_unique_sharers_from_service(
+        self, monkeypatch, unique_sharers
+    ):
+        creator_id = uuid.uuid4()
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_signal_actor_count",
+            AsyncMock(return_value=unique_sharers),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { uniqueSharers } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {"uniqueSharers": unique_sharers}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unique_sharers", [4, 0])
+    async def test_legacy_graphql_exposes_unique_sharers(
+        self, monkeypatch, unique_sharers
+    ):
+        creator_id = uuid.uuid4()
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            AnalyticsRepository,
+            "unique_signal_actor_count",
+            AsyncMock(return_value=unique_sharers),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { uniqueSharers } }''',
+            context_value=AppContext(
+                db=AsyncMock(), current_user=SimpleNamespace(id=creator_id)
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {"uniqueSharers": unique_sharers}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unique_commenters", [5, 0])
+    async def test_graphql_exposes_unique_commenters_from_service(
+        self, monkeypatch, unique_commenters
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        unique_commenter_count = AsyncMock(return_value=unique_commenters)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_unique_commenters_for_creator",
+            unique_commenter_count,
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { uniqueCommenters } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {"uniqueCommenters": unique_commenters}}
+        unique_commenter_count.assert_awaited_once_with(creator_id, start, end)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unique_commenters", [5, 0])
+    async def test_legacy_graphql_exposes_unique_commenters(
+        self, monkeypatch, unique_commenters
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            "repositories.content_repository.PostRepository.get_by_user_id",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        unique_commenter_count = AsyncMock(return_value=unique_commenters)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_unique_commenters_for_creator",
+            unique_commenter_count,
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.social_repository.FollowRepository.count_followers_since",
+            AsyncMock(return_value=0),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { uniqueCommenters } }''',
+            context_value=AppContext(
+                db=AsyncMock(), current_user=SimpleNamespace(id=creator_id)
+            ),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {"uniqueCommenters": unique_commenters}}
+        unique_commenter_count.assert_awaited_once_with(creator_id, start, end)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "views, rewatches, unique_viewers, expected_rate",
+        [(8, 2, 3, 20.0), (0, 4, 1, 100.0), (5, 0, 2, 0.0), (0, 0, 0, None)],
+    )
+    async def test_creator_rewatch_rate_uses_event_counts(
+        self, monkeypatch, views, rewatches, unique_viewers, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        service = CreatorAnalyticsService(AsyncMock())
+
+        async def signal_totals(**kwargs):
+            assert kwargs == {"creator_id": creator_id, "start": start, "end": end}
+            return {
+                SignalType.VIEW: {"count": views, "total": 999.0},
+                SignalType.REWATCH: {"count": rewatches, "total": 999.0},
+            }
+
+        async def viewer_counts(**kwargs):
+            return {"total": unique_viewers, "by_post": {}}
+
+        monkeypatch.setattr(service.analytics_repo, "signal_totals", signal_totals)
+        monkeypatch.setattr(service.analytics_repo, "unique_viewer_counts", viewer_counts)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator", AsyncMock(return_value=0)
+        )
+        values = await service._period_totals(creator_id, start, end)
+
+        assert values["views"] == views + rewatches
+        assert values["rewatches"] == rewatches
+        assert values["unique_viewers"] == unique_viewers
+        assert values["rewatch_rate"] == expected_rate
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "views, rewatches, saves, unsaves, expected_rate",
+        [(8, 2, 5, 2, 30.0), (8, 2, 1, 3, 0.0), (5, 0, 0, 0, 0.0),
+         (0, 0, 0, 0, None), (0, 0, 3, 0, None)],
+    )
+    async def test_creator_save_rate_uses_net_events(
+        self, monkeypatch, views, rewatches, saves, unsaves, expected_rate
+    ):
+        service = CreatorAnalyticsService(AsyncMock())
+        signals = {
+            SignalType.VIEW: {"count": views, "total": 999.0},
+            SignalType.REWATCH: {"count": rewatches, "total": 999.0},
+            SignalType.SAVE: {"count": saves, "total": 999.0},
+            SignalType.UNSAVE: {"count": unsaves, "total": 999.0},
+        }
+        monkeypatch.setattr(service.analytics_repo, "signal_totals", AsyncMock(return_value=signals))
+        monkeypatch.setattr(
+            service.analytics_repo, "unique_viewer_counts",
+            AsyncMock(return_value={"total": 1 if views + rewatches else 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator", AsyncMock(return_value=0)
+        )
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        values = await service._period_totals(uuid.uuid4(), start, start + timedelta(days=7))
+
+        assert values["saves"] == max(0, saves - unsaves)
+        assert values["save_rate"] == expected_rate
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "views, rewatches, shares, expected_rate",
+        [(8, 2, 3, 30.0), (0, 4, 1, 25.0), (5, 0, 0, 0.0),
+         (0, 0, 0, None), (0, 0, 3, None), (1, 0, 2, 200.0)],
+    )
+    async def test_creator_share_rate_uses_event_counts(
+        self, monkeypatch, views, rewatches, shares, expected_rate
+    ):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        service = CreatorAnalyticsService(AsyncMock())
+
+        async def signal_totals(**kwargs):
+            assert kwargs == {"creator_id": creator_id, "start": start, "end": end}
+            return {
+                SignalType.VIEW: {"count": views, "total": 999.0},
+                SignalType.REWATCH: {"count": rewatches, "total": 999.0},
+                SignalType.SHARE: {"count": shares, "total": 999.0},
+            }
+
+        monkeypatch.setattr(service.analytics_repo, "signal_totals", signal_totals)
+        monkeypatch.setattr(
+            service.analytics_repo, "unique_viewer_counts",
+            AsyncMock(return_value={"total": 1 if views + rewatches else 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator", AsyncMock(return_value=0)
+        )
+        values = await service._period_totals(creator_id, start, end)
+
+        assert values["shares"] == shares
+        assert values["share_rate"] == expected_rate
+
+    @pytest.mark.asyncio
+    async def test_creator_like_and_comment_rates_use_net_interactions(self, monkeypatch):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        service = CreatorAnalyticsService(AsyncMock())
+        monkeypatch.setattr(
+            service.analytics_repo,
+            "signal_totals",
+            AsyncMock(return_value={
+                SignalType.VIEW: {"count": 8, "total": 8.0},
+                SignalType.REWATCH: {"count": 2, "total": 2.0},
+                SignalType.LIKE: {"count": 5, "total": 5.0},
+                SignalType.UNLIKE: {"count": 3, "total": 3.0},
+            }),
+        )
+        monkeypatch.setattr(
+            service.analytics_repo,
+            "unique_viewer_counts",
+            AsyncMock(return_value={"total": 4, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=2),
+        )
+
+        values = await service._period_totals(creator_id, start, end)
+
+        assert values["likes"] == 2
+        assert values["like_rate"] == 20.0
+        assert values["comments"] == 2
+        assert values["comment_rate"] == 20.0
+
+    @pytest.mark.asyncio
+    async def test_like_and_comment_rates_are_none_without_views(self, monkeypatch):
+        service = CreatorAnalyticsService(AsyncMock())
+        monkeypatch.setattr(service.analytics_repo, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            service.analytics_repo,
+            "unique_viewer_counts",
+            AsyncMock(return_value={"total": 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=3),
+        )
+
+        values = await service._period_totals(
+            uuid.uuid4(),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 8, tzinfo=timezone.utc),
+        )
+
+        assert values["like_rate"] is None
+        assert values["comment_rate"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("has_data", [True, False])
+    async def test_graphql_creator_engagement_rates_from_service(self, monkeypatch, has_data):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        signals = {
+            SignalType.VIEW: {"count": 8, "total": 8.0},
+            SignalType.REWATCH: {"count": 2, "total": 2.0},
+            SignalType.WATCH_DURATION: {"count": 10, "total": 150.0},
+            SignalType.SAVE: {"count": 5, "total": 5.0},
+            SignalType.UNSAVE: {"count": 2, "total": 2.0},
+            SignalType.SHARE: {"count": 4, "total": 999.0},
+            SignalType.NOT_INTERESTED: {"count": 3, "total": 3.0},
+        } if has_data else {}
+
+        async def signal_totals(self, **kwargs):
+            assert kwargs["creator_id"] == creator_id
+            if kwargs["start"] == start:
+                assert kwargs["end"] == end
+                return signals
+            assert kwargs["end"] == start
+            return {}
+
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", signal_totals)
+        monkeypatch.setattr(
+            AnalyticsRepository, "unique_viewer_counts",
+            AsyncMock(return_value={"total": 1 if has_data else 0, "by_post": {}}),
+        )
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator", AsyncMock(return_value=0)
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { totalViews uniqueViewers totalRewatches totalNotInterested rewatchRate totalLikes likeRate totalComments commentRate totalSaves saveRate totalShares shareRate } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {"creatorAnalytics": {
+            "totalViews": 10 if has_data else 0,
+            "uniqueViewers": 1 if has_data else 0,
+            "totalRewatches": 2 if has_data else 0,
+            "totalNotInterested": 3 if has_data else 0,
+            "rewatchRate": 20.0 if has_data else None,
+            "totalLikes": 0,
+            "likeRate": 0.0 if has_data else None,
+            "totalComments": 0,
+            "commentRate": 0.0 if has_data else None,
+            "totalSaves": 3 if has_data else 0,
+            "saveRate": 30.0 if has_data else None,
+            "totalShares": 4 if has_data else 0,
+            "shareRate": 40.0 if has_data else None,
+        }}
+
+        watch_result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { totalWatchTime } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+        assert watch_result.errors is None
+        assert watch_result.data == {
+            "creatorAnalytics": {"totalWatchTime": 150.0 if has_data else 0.0}
+        }
 
     @pytest.mark.asyncio
     async def test_creator_service_collaboration_status_metrics(self, monkeypatch):
@@ -670,3 +1865,28 @@ class TestPostAnalytics:
 
         assert result.avg_watch_time is None
         assert result.completion_rate is None
+
+
+class TestAnalyticsRepository:
+    @pytest.mark.asyncio
+    async def test_unique_viewer_counts_returns_creator_and_per_post_distinct_totals(self):
+        post_id = uuid.uuid4()
+
+        class Result:
+            def all(self):
+                return [
+                    SimpleNamespace(post_id=None, unique_viewers=3),
+                    SimpleNamespace(post_id=post_id, unique_viewers=2),
+                ]
+
+        db = AsyncMock()
+        db.execute.return_value = Result()
+        repository = AnalyticsRepository(db)
+
+        result = await repository.unique_viewer_counts(
+            creator_id=uuid.uuid4(), post_ids=[post_id]
+        )
+
+        statement = str(db.execute.await_args.args[0])
+        assert "count(distinct(interaction_signals.user_id))" in statement
+        assert result == {"total": 3, "by_post": {post_id: 2}}

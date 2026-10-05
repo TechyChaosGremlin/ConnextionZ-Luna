@@ -226,6 +226,7 @@ function Overview({
 
       <div className="grid grid-cols-2 gap-3 mb-4">
         <QualityCard label="Unique viewers" value={formatCount(data.quality.uniqueViewers)} t={t} />
+        <QualityCard label="Unique completers" value={formatCount(data.quality.uniqueCompleters)} t={t} />
         <QualityCard label="Saves" value={formatCount(data.quality.saves)} t={t} />
         <QualityCard label="Avg watch time" value={data.quality.avgWatchTime == null ? "Unavailable" : `${data.quality.avgWatchTime.toFixed(1)}s`} t={t} />
         <QualityCard label="Completion rate" value={data.quality.completionRate == null ? "Unavailable" : `${data.quality.completionRate.toFixed(1)}%`} t={t} />

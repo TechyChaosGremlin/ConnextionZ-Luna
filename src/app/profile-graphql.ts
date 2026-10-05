@@ -121,8 +121,13 @@ export type GraphQLProfile = {
   playlists?: GraphQLPlaylist[] | null;
 };
 
-import { BACKEND_API_URL, GRAPHQL_ENDPOINT } from "./api-config";
-import { getAccessToken, type Result } from "./auth-store";
+import { BACKEND_API_URL, GRAPHQL_ENDPOINT } from "./api-config.ts";
+import {
+  accessTokenNeedsRefresh,
+  getAccessToken,
+  refreshAccessToken,
+  type Result,
+} from "./auth-store.ts";
 
 
 async function uploadFile(file: Blob, filename: string, kind: "media" | "avatar"): Promise<Record<string, unknown> | null> {
@@ -501,17 +506,30 @@ export async function fetchTrendingSounds(genre?: string): Promise<GraphQLSound[
  */
 export async function graphqlRequestResult<T>(query: string, variables?: Record<string, unknown>): Promise<Result<T>> {
   let res: Response;
+  let accessToken = getAccessToken();
+  if (accessTokenNeedsRefresh(accessToken)) {
+    accessToken = await refreshAccessToken();
+    if (!accessToken) {
+      return { ok: false, error: "Your session has expired. Sign in again to continue." };
+    }
+  }
+
+  const send = (token: string | null) => fetch(GRAPHQL_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    credentials: "include",
+    body: JSON.stringify({ query, variables }),
+  });
+
   try {
-    const accessToken = getAccessToken();
-    res = await fetch(GRAPHQL_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-      },
-      credentials: "include",  // Include cookies for session auth
-      body: JSON.stringify({ query, variables }),
-    });
+    res = await send(accessToken);
+    if (res.status === 401) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) res = await send(refreshed);
+    }
   } catch (error) {
     console.warn("GraphQL unavailable", error);
     return { ok: false, error: "Could not reach the server. Check your connection and try again." };

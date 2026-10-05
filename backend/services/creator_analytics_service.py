@@ -12,10 +12,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.analytics import SignalType
+from app.models.analytics import EventType, SignalType
 from app.models.collaboration import CollaborationStatus
 from app.models.content import ContentStatus, Post
 from repositories.analytics_repository import AnalyticsRepository
+from repositories.analytics_event_repository import AnalyticsEventRepository
 from repositories.collaboration_repository import CollaborationRepository
 from repositories.content_repository import CommentRepository
 
@@ -49,13 +50,32 @@ class CreatorAnalyticsService:
         signals = await self.analytics_repo.signal_totals(
             creator_id=creator_id, start=start, end=end
         )
+        unique_viewers = await self.analytics_repo.unique_viewer_counts(
+            creator_id=creator_id, start=start, end=end
+        )
+        profile_viewers = await AnalyticsEventRepository(self.db).profile_viewer_counts_for_creator(
+            creator_id, start, end
+        )
+        post_event_totals = await AnalyticsEventRepository(self.db).post_event_totals_for_creator(
+            creator_id, start, end
+        )
+        impression_totals = post_event_totals.get(EventType.VIDEO_IMPRESSION, {})
+        skip_totals = post_event_totals.get(EventType.VIDEO_SKIPPED, {})
+        view_totals = post_event_totals.get(EventType.VIDEO_VIEWED, {})
+        feed_impressions = impression_totals.get("count", 0)
+        unique_impression_viewers = impression_totals.get("unique_users", 0)
+        video_skips = skip_totals.get("count", 0)
+        video_views = view_totals.get("count", 0)
 
         def signal_cnt(*types: SignalType) -> int:
             return sum(int(signals.get(t, {}).get("count", 0)) for t in types)
 
         views = signal_cnt(SignalType.VIEW, SignalType.REWATCH)
+        rewatches = signal_cnt(SignalType.REWATCH)
         likes = max(0, signal_cnt(SignalType.LIKE) - signal_cnt(SignalType.UNLIKE))
+        unlikes = signal_cnt(SignalType.UNLIKE)
         saves = max(0, signal_cnt(SignalType.SAVE) - signal_cnt(SignalType.UNSAVE))
+        unsaves = signal_cnt(SignalType.UNSAVE)
         shares = signal_cnt(SignalType.SHARE)
         gained = signal_cnt(SignalType.FOLLOW)
         lost = signal_cnt(SignalType.UNFOLLOW)
@@ -74,16 +94,40 @@ class CreatorAnalyticsService:
         engagements = likes + total_comments + shares + saves
         return {
             "views": views,
-            "unique_viewers": signal_cnt(SignalType.VIEW),
+            "rewatches": rewatches,
+            "total_not_interested": signal_cnt(SignalType.NOT_INTERESTED),
+            "rewatch_rate": rewatches / views * 100 if views > 0 else None,
+            "unique_viewers": unique_viewers["total"],
+            "unique_viewer_rate": (
+                unique_viewers["total"] / views * 100 if views > 0 else None
+            ),
+            "profile_views": profile_viewers["total"],
+            "unique_profile_viewers": profile_viewers["unique_viewers"],
+            "unique_profile_viewer_rate": (
+                profile_viewers["unique_viewers"] / profile_viewers["total"] * 100
+                if profile_viewers["total"] > 0
+                else None
+            ),
+            "feed_impressions": feed_impressions,
+            "unique_impression_viewers": unique_impression_viewers,
+            "video_skips": video_skips,
+            "video_skip_rate": video_skips / video_views * 100 if video_views > 0 else None,
             "likes": likes,
+            "unlikes": unlikes,
+            "like_rate": likes / views * 100 if views > 0 else None,
             "comments": total_comments,
+            "comment_rate": total_comments / views * 100 if views > 0 else None,
             "shares": shares,
+            "share_rate": shares / views * 100 if views > 0 else None,
             "saves": saves,
+                        "unsaves": unsaves,
+            "save_rate": saves / views * 100 if views > 0 else None,
             "new_followers": gained,
             "lost_followers": lost,
             "follower_growth": gained - lost,
             "completions": completions,
             "watch_sec": watch_sec,
+            "total_watch_time": watch_sec,
             "engagements": engagements,
             "avg_watch_time": watch_sec / views if views > 0 else None,
             "completion_rate": completions / views * 100 if views > 0 else None,
@@ -159,7 +203,48 @@ class CreatorAnalyticsService:
         current = await self._period_totals(creator_id, start, end)
         period_length = end - start
         previous = await self._period_totals(creator_id, start - period_length, start)
+        try:
+            unique_commenters = await CommentRepository(
+                self.db
+            ).count_unique_commenters_for_creator(creator_id, start, end)
+        except Exception:
+            unique_commenters = 0
+        unique_sharers = await self.analytics_repo.unique_signal_actor_count(
+            creator_id=creator_id,
+            signal_type=SignalType.SHARE,
+            start=start,
+            end=end,
+        )
+        unique_likers = await self.analytics_repo.unique_signal_actor_count(
+            creator_id=creator_id,
+            signal_type=SignalType.LIKE,
+            start=start,
+            end=end,
+        )
+        unique_savers = await self.analytics_repo.unique_signal_actor_count(
+            creator_id=creator_id,
+            signal_type=SignalType.SAVE,
+            start=start,
+            end=end,
+        )
+        unique_actor_counts = await self.analytics_repo.unique_signal_actor_counts(
+            creator_id=creator_id,
+            signal_types=[
+                SignalType.UNLIKE,
+                SignalType.UNSAVE,
+                SignalType.REWATCH,
+                SignalType.COMPLETION,
+                SignalType.FOLLOW,
+                SignalType.NOT_INTERESTED,
+            ],
+            start=start,
+            end=end,
+        )
+        unique_viewers = current["unique_viewers"]
         collaborations = await self._collaboration_totals(creator_id, start, end)
+        from repositories.social_repository import FollowRepository
+
+        current_followers = await FollowRepository(self.db).count_followers(creator_id)
 
         top_video_perf = await self.video_performance(creator_id, start, end)
         top_video_perf.sort(key=lambda item: item["engagement_rate"], reverse=True)
@@ -169,16 +254,64 @@ class CreatorAnalyticsService:
             "total_uploads": len(posts),
             "total_published_videos": len(posts),
             "total_views": current["views"],
+            "total_rewatches": current["rewatches"],
+            "total_not_interested": current["total_not_interested"],
+            "rewatch_rate": current["rewatch_rate"],
             "unique_viewers": current["unique_viewers"],
+            "unique_viewer_rate": current["unique_viewer_rate"],
+            "profile_views": current["profile_views"],
+            "unique_profile_viewers": current["unique_profile_viewers"],
+            "unique_profile_viewer_rate": current["unique_profile_viewer_rate"],
+            "feed_impressions": current["feed_impressions"],
+            "unique_impression_viewers": current["unique_impression_viewers"],
+            "profile_views_growth_pct": self._growth_pct(
+                current["profile_views"], previous["profile_views"]
+            ),
+            "feed_impressions_growth_pct": self._growth_pct(
+                current["feed_impressions"], previous["feed_impressions"]
+            ),
+            "video_skips": current["video_skips"],
+            "video_skip_rate": current["video_skip_rate"],
             "total_likes": current["likes"],
+            "total_unlikes": current["unlikes"],
+            "unique_likers": unique_likers,
+            "unique_unlikers": unique_actor_counts.get(SignalType.UNLIKE, 0),
+            "like_rate": current["like_rate"],
             "total_comments": current["comments"],
+            "unique_commenters": unique_commenters,
+            "comment_rate": current["comment_rate"],
             "total_shares": current["shares"],
+            "unique_sharers": unique_sharers,
+            "share_rate": current["share_rate"],
             "total_saves": current["saves"],
+            "total_unsaves": current["unsaves"],
+            "unique_savers": unique_savers,
+            "unique_unsavers": unique_actor_counts.get(SignalType.UNSAVE, 0),
+            "save_rate": current["save_rate"],
             "new_followers": current["new_followers"],
             "lost_followers": current["lost_followers"],
             "follower_growth": current["follower_growth"],
+            "current_followers": current_followers,
+            "total_watch_time": current["total_watch_time"],
             "avg_watch_time": current["avg_watch_time"],
+            "total_completions": current["completions"],
             "completion_rate": current["completion_rate"],
+            "unique_completers": unique_actor_counts.get(SignalType.COMPLETION, 0),
+            "unique_completion_rate": (
+                unique_actor_counts.get(SignalType.COMPLETION, 0) / unique_viewers * 100
+                if unique_viewers > 0
+                else None
+            ),
+            "unique_rewatchers": unique_actor_counts.get(SignalType.REWATCH, 0),
+            "unique_rewatch_rate": (
+                unique_actor_counts.get(SignalType.REWATCH, 0) / unique_viewers * 100
+                if unique_viewers > 0
+                else None
+            ),
+            "unique_new_followers": unique_actor_counts.get(SignalType.FOLLOW, 0),
+            "unique_not_interested_users": unique_actor_counts.get(
+                SignalType.NOT_INTERESTED, 0
+            ),
             "engagement_rate": current["engagement_rate"],
             "views_growth_pct": self._growth_pct(current["views"], previous["views"]),
             "likes_growth_pct": self._growth_pct(current["likes"], previous["likes"]),
@@ -196,6 +329,9 @@ class CreatorAnalyticsService:
 
         post_ids = [p.id for p in posts]
         per_post_signals = await self.analytics_repo.per_post_signal_totals(
+            creator_id=creator_id, post_ids=post_ids, start=start, end=end
+        )
+        unique_viewers = await self.analytics_repo.unique_viewer_counts(
             creator_id=creator_id, post_ids=post_ids, start=start, end=end
         )
 
@@ -228,7 +364,7 @@ class CreatorAnalyticsService:
             result.append({
                 "post": post,
                 "views": final_views,
-                "unique_viewers": cnt(SignalType.VIEW) or final_views,
+                "unique_viewers": unique_viewers["by_post"].get(post.id, 0),
                 "likes": final_likes,
                 "comments": comments,
                 "shares": final_shares,

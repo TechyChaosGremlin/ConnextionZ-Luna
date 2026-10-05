@@ -48,6 +48,18 @@ class PostRepository(BaseRepository[Post]):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_feed_snapshot(self, post_ids: list[uuid.UUID]) -> list[Post]:
+        if not post_ids:
+            return []
+        result = await self.db.execute(
+            select(Post).where(
+                Post.id.in_(post_ids),
+                Post.status == ContentStatus.PUBLISHED,
+                Post.deleted_at.is_(None),
+            )
+        )
+        return list(result.scalars().all())
+
     async def get_by_user_id(
         self,
         user_id: uuid.UUID,
@@ -416,6 +428,27 @@ class CommentRepository(BaseRepository[Comment]):
             stmt = stmt.where(Comment.created_at <= end)
         result = await self.db.execute(stmt)
         return result.scalar_one()
+
+    async def count_unique_commenters_for_creator(
+        self,
+        creator_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Count distinct commenters on a creator's posts within a period."""
+        stmt = (
+            select(func.count(func.distinct(Comment.user_id)))
+            .select_from(Comment)
+            .join(Post, Comment.post_id == Post.id)
+            .where(
+                Post.user_id == creator_id,
+                Comment.deleted_at.is_(None),
+                Comment.created_at >= start,
+                Comment.created_at <= end,
+            )
+        )
+        result = await self.db.execute(stmt)
+        return int(result.scalar_one() or 0)
 
     async def soft_delete(self, comment_id: uuid.UUID) -> bool:
         """

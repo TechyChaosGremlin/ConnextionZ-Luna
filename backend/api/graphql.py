@@ -840,17 +840,49 @@ class AnalyticsSummaryType:
 
     total_posts: int = 0
     total_views: int = 0
+    total_rewatches: int = 0
+    total_not_interested: int = 0
+    unique_not_interested_users: int = 0
+    rewatch_rate: Optional[float] = None
     total_likes: int = 0
+    unique_likers: int = 0
+    total_unlikes: int = 0
+    unique_unlikers: int = 0
+    like_rate: Optional[float] = None
     total_comments: int = 0
+    unique_commenters: int = 0
+    comment_rate: Optional[float] = None
     total_shares: int = 0
+    unique_sharers: int = 0
+    share_rate: Optional[float] = None
     total_saves: int = 0
+    unique_savers: int = 0
+    total_unsaves: int = 0
+    unique_unsavers: int = 0
+    save_rate: Optional[float] = None
+    unique_viewer_rate: Optional[float] = None
+    profile_views: int = 0
+    unique_profile_viewers: int = 0
+    unique_profile_viewer_rate: Optional[float] = None
+    feed_impressions: int = 0
+    unique_impression_viewers: int = 0
+    video_skips: int = 0
+    video_skip_rate: Optional[float] = None
     unique_viewers: int = 0
     total_uploads: int = 0
     total_published_videos: int = 0
+    total_watch_time: float = 0.0
     avg_watch_time: Optional[float] = None
+    total_completions: int = 0
     completion_rate: Optional[float] = None
+    unique_completers: int = 0
+    unique_completion_rate: Optional[float] = None
+    unique_rewatchers: int = 0
+    unique_rewatch_rate: Optional[float] = None
+    unique_new_followers: int = 0
 
     follower_growth: int = 0
+    current_followers: int = 0
     new_followers: int = 0
     lost_followers: int = 0
 
@@ -873,6 +905,8 @@ class AnalyticsSummaryType:
     likes_growth_pct: Optional[float] = None
     comments_growth_pct: Optional[float] = None
     shares_growth_pct: Optional[float] = None
+    profile_views_growth_pct: Optional[float] = None
+    feed_impressions_growth_pct: Optional[float] = None
     followers_growth_pct: Optional[float] = None
 
     top_posts: Optional[List[PostAnalyticsType]] = None
@@ -2277,6 +2311,7 @@ async def _register(ctx: AppContext, input: RegisterInput) -> AuthPayloadType:
     from features.auth.password import hash_password, check_password_strength
     from features.auth.jwt import create_access_token, create_refresh_token
     from repositories.user_repository import UserRepository
+    from app.models.user import AccountStatus as ModelAccountStatus, UserRole as ModelUserRole
 
     is_valid, errors = check_password_strength(input.password)
     if not is_valid:
@@ -2292,8 +2327,8 @@ async def _register(ctx: AppContext, input: RegisterInput) -> AuthPayloadType:
         email=input.email,
         username=input.username,
         hashed_password=hash_password(input.password),
-        role="user",
-        status="pending_verification",
+        role=ModelUserRole.USER,
+        status=ModelAccountStatus.ACTIVE,
     )
     await user_repo.create(new_user)
     await ctx.db.commit()
@@ -2452,6 +2487,50 @@ def _feed_item_is_visible(
     return visibility != "followers" or post.user_id in following_ids
 
 
+async def _visible_direct_read_posts(ctx, posts):
+    from app.models.content import ContentStatus
+    from repositories.profile_repository import ProfileRepository
+    from repositories.social_repository import FeedSafetyRepository, FollowRepository
+
+    if not posts:
+        return []
+    viewer_id = ctx.current_user.id if ctx.current_user else None
+    creator_ids = list({post.user_id for post in posts})
+    profiles = {
+        profile.user_id: profile
+        for profile in await ProfileRepository(ctx.db).get_multiple_by_user_ids(creator_ids)
+    }
+    following_ids = set()
+    hidden_creator_ids = set()
+    if viewer_id is not None:
+        following_ids = set(await FollowRepository(ctx.db).get_following_ids(viewer_id))
+        hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
+            viewer_id, creator_ids
+        )
+
+    visible_posts = []
+    for post in posts:
+        if getattr(post, "deleted_at", None) is not None:
+            continue
+        if getattr(post, "moderation_status", "approved") != "approved":
+            continue
+        if post.user_id in hidden_creator_ids:
+            continue
+        owner_unpublished = (
+            post.user_id == viewer_id
+            and post.status in (ContentStatus.DRAFT, ContentStatus.SCHEDULED)
+        )
+        if owner_unpublished or _feed_item_is_visible(
+            post,
+            viewer_id=viewer_id,
+            hidden_creator_ids=hidden_creator_ids,
+            profiles=profiles,
+            following_ids=following_ids,
+        ):
+            visible_posts.append(post)
+    return visible_posts
+
+
 _FOR_YOU_CURSOR_PREFIX = "fy1."
 
 
@@ -2481,9 +2560,48 @@ def _decode_for_you_cursor(cursor):
         return None, UUID_type(cursor)
     body = cursor[len(_FOR_YOU_CURSOR_PREFIX):]
     last_str, _, snapshot_str = body.partition(".")
-    last_id = UUID_type(last_str)
-    ranked_ids = [UUID_type(part) for part in snapshot_str.split(",") if part]
+    try:
+        last_id = UUID_type(last_str)
+        ranked_ids = [UUID_type(part) for part in snapshot_str.split(",")]
+    except ValueError:
+        raise ValueError("Invalid feed cursor") from None
+    if (
+        last_id not in ranked_ids
+        or len(set(ranked_ids)) != len(ranked_ids)
+        or len(ranked_ids) > 350
+    ):
+        raise ValueError("Invalid feed cursor")
     return ranked_ids, last_id
+
+
+async def _restore_feed_snapshot(post_repo, candidates, cursor):
+    if cursor is None:
+        return candidates
+    snapshot_ids, _last_id = _decode_for_you_cursor(cursor)
+    if snapshot_ids is None:
+        return candidates
+    candidates_by_id = {post.id: post for post in candidates}
+    missing_ids = [post_id for post_id in snapshot_ids if post_id not in candidates_by_id]
+    if missing_ids:
+        candidates_by_id.update(
+            (post.id, post) for post in await post_repo.get_feed_snapshot(missing_ids)
+        )
+    return [candidates_by_id[post_id] for post_id in snapshot_ids if post_id in candidates_by_id]
+
+
+def _resume_ranked_feed(ranked, cursor):
+    if cursor is None:
+        return ranked, 0
+    snapshot_ids, last_id = _decode_for_you_cursor(cursor)
+    if snapshot_ids is not None:
+        ranked_by_id = {post.id: post for post in ranked}
+        anchor_index = snapshot_ids.index(last_id) + 1
+        start_index = sum(post_id in ranked_by_id for post_id in snapshot_ids[:anchor_index])
+        return [ranked_by_id[post_id] for post_id in snapshot_ids if post_id in ranked_by_id], start_index
+    for index, post in enumerate(ranked):
+        if post.id == last_id:
+            return ranked, index + 1
+    raise ValueError("Invalid feed cursor")
 
 
 async def _feed(
@@ -2497,6 +2615,10 @@ async def _feed(
     
 
     user = ctx.require_auth()
+    if limit <= 0:
+        raise ValueError("Feed limit must be positive")
+    if algorithm is not None and not isinstance(algorithm, FeedAlgorithm):
+        raise ValueError("Invalid feed algorithm")
     post_repo = PostRepository(ctx.db)
     follow_repo = FollowRepository(ctx.db)
 
@@ -2601,6 +2723,7 @@ async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
         since=discovery_since,
         limit=FOR_YOU_DISCOVERY_POOL_SIZE,
     )
+    candidates = await _restore_feed_snapshot(PostRepository(ctx.db), candidates, cursor)
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -2640,17 +2763,7 @@ async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
         )
     ]
 
-    snapshot_ids: list | None = None
-    start_index = 0
-    if cursor is not None:
-        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
-        if snapshot_ids:
-            ranked_by_id = {post.id: post for post in ranked}
-            ranked = [ranked_by_id[post_id] for post_id in snapshot_ids if post_id in ranked_by_id]
-        for index, post in enumerate(ranked):
-            if post.id == last_id:
-                start_index = index + 1
-                break
+    ranked, start_index = _resume_ranked_feed(ranked, cursor)
 
     page = ranked[start_index : start_index + limit + 1]
     has_more = len(page) > limit
@@ -2725,6 +2838,9 @@ async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
             for post in pool
         }.values()
     )
+    candidates = await _restore_feed_snapshot(post_repo, candidates, cursor)
+    eligible_creator_ids = followed_creator_ids | set(affinity_creator_ids)
+    candidates = [post for post in candidates if post.user_id in eligible_creator_ids]
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -2772,17 +2888,7 @@ async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
 
     ranked = [post for post, _score in sorted(scored, key=community_sort_key, reverse=True)]
 
-    snapshot_ids: list | None = None
-    start_index = 0
-    if cursor is not None:
-        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
-        if snapshot_ids:
-            ranked_by_id = {post.id: post for post in ranked}
-            ranked = [ranked_by_id[post_id] for post_id in snapshot_ids if post_id in ranked_by_id]
-        for index, post in enumerate(ranked):
-            if post.id == last_id:
-                start_index = index + 1
-                break
+    ranked, start_index = _resume_ranked_feed(ranked, cursor)
 
     page = ranked[start_index : start_index + limit + 1]
     has_more = len(page) > limit
@@ -2893,6 +2999,7 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
             for post in pool
         }.values()
     )
+    candidates = await _restore_feed_snapshot(post_repo, candidates, cursor)
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -2946,18 +3053,7 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
     # and no cross-page duplicates even if engagement changes mid-pagination.
     # Backward-compatible: a legacy plain post-id cursor still works (we fall
     # back to locating that post in the freshly computed ranking).
-    snapshot_ids: list | None = None
-    start_index = 0
-    if cursor is not None:
-        snapshot_ids, last_id = _decode_for_you_cursor(cursor)
-        if snapshot_ids:
-            # Replay the snapshot: keep only posts still present/visible now.
-            ranked_by_id = {post.id: post for post in ranked}
-            ranked = [ranked_by_id[pid] for pid in snapshot_ids if pid in ranked_by_id]
-        for i, post in enumerate(ranked):
-            if post.id == last_id:
-                start_index = i + 1
-                break
+    ranked, start_index = _resume_ranked_feed(ranked, cursor)
 
     page = ranked[start_index : start_index + limit + 1]
     has_more = len(page) > limit
@@ -3001,7 +3097,10 @@ async def _post(ctx, id) -> Optional[PostType]:
     
     if not post:
         return None
-    
+
+    if not await _visible_direct_read_posts(ctx, [post]):
+        return None
+
     return _post_to_gql(post)
 
 
@@ -3034,7 +3133,9 @@ async def _user_posts(ctx, user_id, first, after) -> PostConnection:
         limit=first + 1,  # Fetch one extra to check hasNextPage
         before_id=before_id,
     )
-    
+
+    posts = await _visible_direct_read_posts(ctx, posts)
+
     # Check if there are more results
     has_next_page = len(posts) > first
     if has_next_page:
@@ -4095,21 +4196,55 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
         total_uploads=values["total_uploads"],
         total_published_videos=values["total_published_videos"],
         total_views=values["total_views"],
+        total_rewatches=values.get("total_rewatches", 0),
+        total_not_interested=values.get("total_not_interested", 0),
+        unique_not_interested_users=values.get("unique_not_interested_users", 0),
+        rewatch_rate=values.get("rewatch_rate"),
         unique_viewers=values["unique_viewers"],
         total_likes=values["total_likes"],
+        unique_likers=values.get("unique_likers", 0),
+        total_unlikes=values.get("total_unlikes", 0),
+        unique_unlikers=values.get("unique_unlikers", 0),
+        like_rate=values["like_rate"],
         total_comments=values["total_comments"],
+        unique_commenters=values["unique_commenters"],
+        comment_rate=values["comment_rate"],
         total_shares=values["total_shares"],
+        unique_sharers=values["unique_sharers"],
+        share_rate=values.get("share_rate"),
         total_saves=values["total_saves"],
+        unique_savers=values.get("unique_savers", 0),
+        total_unsaves=values.get("total_unsaves", 0),
+        unique_unsavers=values.get("unique_unsavers", 0),
+        save_rate=values.get("save_rate"),
+        unique_viewer_rate=values.get("unique_viewer_rate"),
+        profile_views=values["profile_views"],
+        unique_profile_viewers=values["unique_profile_viewers"],
+        unique_profile_viewer_rate=values["unique_profile_viewer_rate"],
+        feed_impressions=values["feed_impressions"],
+        unique_impression_viewers=values["unique_impression_viewers"],
+        video_skips=values["video_skips"],
+        video_skip_rate=values["video_skip_rate"],
         follower_growth=values["follower_growth"],
+        current_followers=values["current_followers"],
         new_followers=values["new_followers"],
         lost_followers=values["lost_followers"],
+        total_watch_time=values.get("total_watch_time", 0.0),
         avg_watch_time=values["avg_watch_time"],
+        total_completions=values.get("total_completions", 0),
         completion_rate=values["completion_rate"],
+        unique_completers=values.get("unique_completers", 0),
+        unique_completion_rate=values.get("unique_completion_rate"),
+        unique_rewatchers=values.get("unique_rewatchers", 0),
+        unique_rewatch_rate=values.get("unique_rewatch_rate"),
+        unique_new_followers=values.get("unique_new_followers", 0),
         engagement_rate=values["engagement_rate"],
         views_growth_pct=values["views_growth_pct"],
         likes_growth_pct=values["likes_growth_pct"],
         comments_growth_pct=values["comments_growth_pct"],
         shares_growth_pct=values["shares_growth_pct"],
+        profile_views_growth_pct=values["profile_views_growth_pct"],
+        feed_impressions_growth_pct=values["feed_impressions_growth_pct"],
         followers_growth_pct=values["followers_growth_pct"],
         total_collaboration_requests=values["total_collaboration_requests"],
         pending_collaborations=values["pending_collaborations"],
@@ -4168,6 +4303,7 @@ async def _legacy_creator_analytics(ctx, period) -> AnalyticsSummaryType:
     from repositories.content_repository import PostRepository, CommentRepository
     from repositories.social_repository import FollowRepository
     from repositories.analytics_repository import AnalyticsRepository
+    from repositories.analytics_event_repository import AnalyticsEventRepository
     from app.models.analytics import SignalType
 
     user = ctx.require_auth()
@@ -4180,14 +4316,55 @@ async def _legacy_creator_analytics(ctx, period) -> AnalyticsSummaryType:
     signals = await AnalyticsRepository(ctx.db).signal_totals(
         creator_id=user.id, start=start, end=end
     )
+    unique_viewers = await AnalyticsRepository(ctx.db).unique_viewer_counts(
+        creator_id=user.id,
+        post_ids=[post.id for post in posts],
+        start=start,
+        end=end,
+    )
+    profile_viewers = await AnalyticsEventRepository(ctx.db).profile_viewer_counts_for_creator(
+        user.id, start, end
+    )
 
     def signal_count(*types: "SignalType") -> int:
         return sum(int(signals.get(t, {}).get("count", 0)) for t in types)
 
     total_views = signal_count(SignalType.VIEW, SignalType.REWATCH)
     total_shares = signal_count(SignalType.SHARE)
+    unique_sharers = await AnalyticsRepository(ctx.db).unique_signal_actor_count(
+        creator_id=user.id,
+        signal_type=SignalType.SHARE,
+        start=start,
+        end=end,
+    )
     total_likes = max(0, signal_count(SignalType.LIKE) - signal_count(SignalType.UNLIKE))
+    unique_likers = await AnalyticsRepository(ctx.db).unique_signal_actor_count(
+        creator_id=user.id,
+        signal_type=SignalType.LIKE,
+        start=start,
+        end=end,
+    )
     total_saves = max(0, signal_count(SignalType.SAVE) - signal_count(SignalType.UNSAVE))
+    unique_savers = await AnalyticsRepository(ctx.db).unique_signal_actor_count(
+        creator_id=user.id,
+        signal_type=SignalType.SAVE,
+        start=start,
+        end=end,
+    )
+    unique_actor_counts = await AnalyticsRepository(ctx.db).unique_signal_actor_counts(
+        creator_id=user.id,
+        signal_types=[
+            SignalType.UNLIKE,
+            SignalType.UNSAVE,
+            SignalType.REWATCH,
+            SignalType.COMPLETION,
+            SignalType.FOLLOW,
+            SignalType.NOT_INTERESTED,
+        ],
+        start=start,
+        end=end,
+    )
+    unique_viewer_total = unique_viewers["total"]
     completions = signal_count(SignalType.COMPLETION)
     watch_duration = signals.get(SignalType.WATCH_DURATION, {})
     total_watch_time = float(watch_duration.get("total", 0.0))
@@ -4195,12 +4372,17 @@ async def _legacy_creator_analytics(ctx, period) -> AnalyticsSummaryType:
     avg_watch_time = total_watch_time / total_views if total_views > 0 else None
     completion_rate = (completions / total_views * 100) if total_views > 0 else None
 
-    total_comments = await CommentRepository(ctx.db).count_for_creator(
+    comment_repo = CommentRepository(ctx.db)
+    total_comments = await comment_repo.count_for_creator(
         user.id, start=start, end=end
+    )
+    unique_commenters = await comment_repo.count_unique_commenters_for_creator(
+        user.id, start, end
     )
 
     follow_repo = FollowRepository(ctx.db)
     new_followers = await follow_repo.count_followers_since(user.id, start=start, end=end)
+    current_followers = await follow_repo.count_followers(user.id)
     lost_followers = signal_count(SignalType.UNFOLLOW)
     follower_growth = new_followers - lost_followers
 
@@ -4215,6 +4397,7 @@ async def _legacy_creator_analytics(ctx, period) -> AnalyticsSummaryType:
         PostAnalyticsType(
             post=_post_to_gql(p),
             views=getattr(p, "view_count", 0),
+            unique_viewers=unique_viewers["by_post"].get(p.id, 0),
             likes=getattr(p, "like_count", 0),
             comments=getattr(p, "comment_count", 0),
             shares=getattr(p, "share_count", 0),
@@ -4228,13 +4411,55 @@ async def _legacy_creator_analytics(ctx, period) -> AnalyticsSummaryType:
         period_end=end,
         total_posts=total_posts,
         total_views=total_views,
+        total_rewatches=signal_count(SignalType.REWATCH),
+        total_not_interested=signal_count(SignalType.NOT_INTERESTED),
+        unique_not_interested_users=unique_actor_counts.get(
+            SignalType.NOT_INTERESTED, 0
+        ),
+        rewatch_rate=signal_count(SignalType.REWATCH) / total_views * 100 if total_views > 0 else None,
         total_likes=total_likes,
+        unique_likers=unique_likers,
+        total_unlikes=signal_count(SignalType.UNLIKE),
+        unique_unlikers=unique_actor_counts.get(SignalType.UNLIKE, 0),
         total_comments=total_comments,
+        unique_commenters=unique_commenters,
         total_shares=total_shares,
+        unique_sharers=unique_sharers,
         total_saves=total_saves,
+        unique_savers=unique_savers,
+        total_unsaves=signal_count(SignalType.UNSAVE),
+        unique_unsavers=unique_actor_counts.get(SignalType.UNSAVE, 0),
+        profile_views=profile_viewers["total"],
+        unique_profile_viewers=profile_viewers["unique_viewers"],
+        unique_profile_viewer_rate=(
+            profile_viewers["unique_viewers"] / profile_viewers["total"] * 100
+            if profile_viewers["total"] > 0
+            else None
+        ),
+        save_rate=total_saves / total_views * 100 if total_views > 0 else None,
+        unique_viewers=unique_viewer_total,
+        unique_viewer_rate=(
+            unique_viewer_total / total_views * 100 if total_views > 0 else None
+        ),
+        total_watch_time=total_watch_time,
         avg_watch_time=avg_watch_time,
+        total_completions=completions,
         completion_rate=completion_rate,
+        unique_completers=unique_actor_counts.get(SignalType.COMPLETION, 0),
+        unique_completion_rate=(
+            unique_actor_counts.get(SignalType.COMPLETION, 0) / unique_viewer_total * 100
+            if unique_viewer_total > 0
+            else None
+        ),
+        unique_rewatchers=unique_actor_counts.get(SignalType.REWATCH, 0),
+        unique_rewatch_rate=(
+            unique_actor_counts.get(SignalType.REWATCH, 0) / unique_viewer_total * 100
+            if unique_viewer_total > 0
+            else None
+        ),
+        unique_new_followers=unique_actor_counts.get(SignalType.FOLLOW, 0),
         follower_growth=follower_growth,
+        current_followers=current_followers,
         new_followers=new_followers,
         lost_followers=lost_followers,
         engagement_rate=engagement_rate,
@@ -5621,7 +5846,6 @@ async def _profile_to_detail(ctx, profile) -> ProfileDetailType:
     from repositories.user_repository import UserRepository
     from repositories.social_repository import FollowRepository, PlaylistRepository
     from repositories.content_repository import PostRepository
-    from app.models.content import ContentStatus
 
     user = await UserRepository(ctx.db).get_by_id(profile.user_id)
     follow_repo = FollowRepository(ctx.db)
@@ -5630,10 +5854,8 @@ async def _profile_to_detail(ctx, profile) -> ProfileDetailType:
     if ctx.current_user and user and ctx.current_user.id != user.id:
         is_following = await follow_repo.is_following(ctx.current_user.id, user.id)
 
-    viewer_is_owner = bool(ctx.current_user and user and ctx.current_user.id == user.id)
     posts = await PostRepository(ctx.db).get_by_user_id(profile.user_id, limit=12)
-    if not viewer_is_owner:
-        posts = [p for p in posts if p.status == ContentStatus.PUBLISHED]
+    posts = await _visible_direct_read_posts(ctx, posts)
     post_items = [await _post_to_legacy_post(ctx, p) for p in posts]
 
     playlists = await PlaylistRepository(ctx.db).get_by_profile_id(profile.id)
@@ -6351,8 +6573,8 @@ async def _not_interested(ctx, post_id) -> NotInterestedResultType:
     Records a real production signal (SignalType.NOT_INTERESTED) into the
     unified interaction-signal log. The recommendation system reads it via
     ``AnalyticsRepository.viewer_post_history`` to strongly demote this post
-    (demote, never hard-exclude) and — because the signal is creator-scoped —
-    to soften future recommendations from the same creator for this viewer.
+    (demote, never hard-exclude). Creator attribution is retained for analytics,
+    but this feedback does not reduce affinity for the creator's other posts.
     Idempotent per (user, post): a repeat tap does not stack signals.
     """
     from repositories.content_repository import PostRepository
@@ -6656,8 +6878,6 @@ def create_graphql_router(
     session_factory: Callable[[], AsyncSession],
 ) -> GraphQLRouter[AppContext]:
     """Create a FastAPI-compatible GraphQL router."""
-    from features.auth.jwt import decode_token, JWTError
-    from repositories.user_repository import UserRepository
 
     async def get_context(
         request: Request,
@@ -6677,15 +6897,7 @@ def create_graphql_router(
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[len("Bearer "):]
-            try:
-                payload = decode_token(token)
-                user_id = payload.get("sub")
-                session_id = payload.get("jti")
-                if user_id:
-                    user_repo = UserRepository(db)
-                    current_user = await user_repo.get_by_id(user_id)
-            except (JWTError, ValueError):
-                pass
+            current_user, session_id = await _graphql_user_from_token(db, token)
 
         return AppContext(db=db, current_user=current_user, session_id=session_id)
 
@@ -6695,3 +6907,28 @@ def create_graphql_router(
         graphql_ide="graphiql",
         subscription_protocols=["graphql-ws"],
     )
+
+
+async def _graphql_user_from_token(db, token: str) -> tuple[User | None, str | None]:
+    """Load only active, non-revoked access-token identities into GraphQL context."""
+    from features.auth.jwt import JWTError, decode_token, is_token_blacklisted
+    from repositories.user_repository import UserRepository
+
+    try:
+        payload = decode_token(token)
+    except (JWTError, ValueError):
+        return None, None
+
+    token_id = payload.get("jti")
+    user_id = payload.get("sub")
+    if payload.get("type") != "access" or not token_id or not user_id:
+        return None, None
+    try:
+        token_is_revoked = await is_token_blacklisted(token_id)
+    except RuntimeError:
+        return None, None
+    if token_is_revoked:
+        return None, None
+
+    user = await UserRepository(db).get_by_id(user_id)
+    return (user, token_id) if user is not None else (None, None)

@@ -1390,3 +1390,247 @@ async def test_community_feed_prioritizes_relationships_over_general_popularity(
     )
 
     assert [item.id for item in page.items] == [mutual_id, followed_id, affinity_id]
+
+
+@pytest.mark.parametrize("algorithm", [FeedAlgorithm.ORGANIC, FeedAlgorithm.VIRAL, FeedAlgorithm.COMMUNITY])
+@pytest.mark.asyncio
+async def test_ranked_feed_resumes_after_hidden_cursor_post(monkeypatch, follow_graph, algorithm):
+    viewer = make_user("viewer")
+    creators = [make_user(f"creator{index}") for index in range(5)]
+    posts = [make_post(creator.id, uuid.uuid4()) for creator in creators]
+    stub_feed_posts(monkeypatch, posts)
+    stub_discovery_pool(monkeypatch, posts)
+    stub_recent_post_engagement(monkeypatch, {})
+    stub_creator_affinity(monkeypatch, {creator.id: 1.0 for creator in creators})
+    ctx = make_ctx(viewer)
+    complete = await _feed(ctx, None, 10, False, algorithm)
+    expected_ids = [item.id for item in complete.items]
+    first = await _feed(ctx, None, 2, False, algorithm)
+    hidden_post = next(post for post in posts if post.id == first.items[-1].id)
+    hidden_post.moderation_status = "rejected"
+
+    second = await _feed(ctx, first.next_cursor, 2, False, algorithm)
+    third = await _feed(ctx, second.next_cursor, 2, False, algorithm)
+
+    assert [item.id for page in (first, second, third) for item in page.items] == expected_ids
+    assert third.next_cursor is None
+
+
+@pytest.mark.parametrize("algorithm", list(FeedAlgorithm))
+@pytest.mark.asyncio
+async def test_graphql_accepts_feed_algorithm_values(monkeypatch, follow_graph, algorithm):
+    from api.graphql import FeedPageType, schema
+
+    handler = AsyncMock(return_value=FeedPageType(items=[], next_cursor=None))
+    monkeypatch.setattr(f"api.graphql._{algorithm.value.lower()}_feed", handler)
+    result = await schema.execute(
+        "query($filter: FeedFilter) { feed(filter: $filter) { items { id } nextCursor } }",
+        variable_values={"filter": {"algorithm": algorithm.value}},
+        context_value=make_ctx(make_user("viewer")),
+    )
+    assert result.errors is None
+    handler.assert_awaited_once()
+
+
+@pytest.mark.parametrize("filter_value", [None, {}, {"algorithm": None}])
+@pytest.mark.asyncio
+async def test_graphql_missing_algorithm_preserves_default(monkeypatch, follow_graph, filter_value):
+    from api.graphql import FeedPageType, schema
+
+    handler = AsyncMock(return_value=FeedPageType(items=[], next_cursor=None))
+    monkeypatch.setattr("api.graphql._for_you_feed", handler)
+    result = await schema.execute(
+        "query($filter: FeedFilter) { feed(filter: $filter) { nextCursor } }",
+        variable_values={"filter": filter_value},
+        context_value=make_ctx(make_user("viewer")),
+    )
+    assert result.errors is None
+    handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_graphql_invalid_algorithm_never_dispatches(monkeypatch):
+    from api.graphql import schema
+
+    handler = AsyncMock()
+    monkeypatch.setattr("api.graphql._feed", handler)
+    result = await schema.execute(
+        "query($filter: FeedFilter) { feed(filter: $filter) { nextCursor } }",
+        variable_values={"filter": {"algorithm": "INVALID"}},
+        context_value=make_ctx(make_user("viewer")),
+    )
+    assert result.errors
+    assert "FeedAlgorithm" in result.errors[0].message
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_organic_delegates_unchanged_to_for_you(monkeypatch, follow_graph):
+    handler = AsyncMock(return_value=object())
+    monkeypatch.setattr("api.graphql._for_you_feed", handler)
+    ctx = make_ctx(make_user("viewer"))
+    result = await _feed(ctx, None, 7, True, FeedAlgorithm.ORGANIC)
+    assert result is handler.return_value
+    handler.assert_awaited_once_with(ctx, ctx.current_user, [], None, 7, None)
+
+
+@pytest.mark.asyncio
+async def test_paid_is_explicitly_unimplemented_without_fallback(monkeypatch, follow_graph):
+    from api.graphql import schema
+
+    handlers = [AsyncMock() for _ in range(4)]
+    for name, handler in zip(("_for_you_feed", "_organic_feed", "_viral_feed", "_community_feed"), handlers):
+        monkeypatch.setattr(f"api.graphql.{name}", handler)
+    result = await schema.execute(
+        "{ feed(filter: { algorithm: PAID }) { nextCursor } }",
+        context_value=make_ctx(make_user("viewer")),
+    )
+    assert result.errors
+    assert result.errors[0].message == "Paid feed ranking is not implemented"
+    assert result.errors[0].extensions["code"] == "NOT_IMPLEMENTED"
+    assert result.errors[0].extensions["statusCode"] == 501
+    for handler in handlers:
+        handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize("algorithm", [FeedAlgorithm.ORGANIC, FeedAlgorithm.VIRAL, FeedAlgorithm.COMMUNITY])
+@pytest.mark.asyncio
+async def test_ranked_feeds_share_visibility_and_safety_filters(monkeypatch, follow_graph, algorithm):
+    viewer = make_user("viewer")
+    creators = [make_user(f"creator{index}") for index in range(8)]
+    posts = [make_post(creator.id, uuid.uuid4()) for creator in creators]
+    posts[1].status = ContentStatus.DRAFT
+    posts[2].moderation_status = "rejected"
+    posts[3].visibility = "private"
+    posts[4].visibility = "followers"
+    private_profile = make_profile(creators[5])
+    private_profile.private_account = True
+
+    async def profiles(self, user_ids):
+        return [private_profile if creator.id == private_profile.user_id else make_profile(creator)
+                for creator in creators if creator.id in user_ids]
+
+    monkeypatch.setattr("repositories.profile_repository.ProfileRepository.get_multiple_by_user_ids", profiles)
+    stub_feed_posts(monkeypatch, posts)
+    stub_discovery_pool(monkeypatch, posts)
+    stub_recent_post_engagement(monkeypatch, {})
+    stub_creator_affinity(monkeypatch, {creator.id: 1.0 for creator in creators})
+    stub_hidden_creators(monkeypatch, {creators[6].id, creators[7].id})
+
+    page = await _feed(make_ctx(viewer), None, 10, False, algorithm)
+    assert [item.id for item in page.items] == [posts[0].id]
+
+
+@pytest.mark.parametrize("algorithm", [FeedAlgorithm.ORGANIC, FeedAlgorithm.VIRAL, FeedAlgorithm.COMMUNITY])
+@pytest.mark.asyncio
+async def test_ranked_feed_snapshot_survives_pool_and_score_drift(monkeypatch, follow_graph, algorithm):
+    viewer = make_user("viewer")
+    creators = [make_user(f"creator{index}") for index in range(6)]
+    original = [make_post(creator.id, uuid.uuid4()) for creator in creators[:5]]
+    candidates = list(original)
+    signals = {}
+    stub_feed_posts(monkeypatch, candidates)
+    stub_discovery_pool(monkeypatch, candidates)
+    stub_recent_post_engagement(monkeypatch, signals)
+    stub_creator_affinity(monkeypatch, {creator.id: 1.0 for creator in creators})
+
+    def forbidden_scorer(*args, **kwargs):
+        pytest.fail("Viral/Community must not use Organic scoring or lifetime engagement")
+
+    if algorithm != FeedAlgorithm.ORGANIC:
+        monkeypatch.setattr("repositories.feed_ranking.score_post", forbidden_scorer)
+        monkeypatch.setattr("repositories.analytics_repository.AnalyticsRepository.post_engagement_rates", forbidden_scorer)
+
+    async def restore(self, post_ids):
+        return [post for post in original if post.id in post_ids]
+
+    monkeypatch.setattr("repositories.content_repository.PostRepository.get_feed_snapshot", restore)
+    ctx = make_ctx(viewer)
+    complete = await _feed(ctx, None, 10, False, algorithm)
+    expected_ids = [item.id for item in complete.items]
+    first = await _feed(ctx, None, 2, False, algorithm)
+    candidates[:] = [make_post(creators[5].id, uuid.uuid4())]
+    signals[expected_ids[-1]] = {"shares": 10000}
+    stub_creator_affinity(monkeypatch, {creator.id: 100.0 - index for index, creator in enumerate(creators)})
+    second = await _feed(ctx, first.next_cursor, 2, False, algorithm)
+    third = await _feed(ctx, second.next_cursor, 2, False, algorithm)
+    assert [item.id for page in (first, second, third) for item in page.items] == expected_ids
+    assert third.next_cursor is None
+
+
+@pytest.mark.parametrize("algorithm", [FeedAlgorithm.ORGANIC, FeedAlgorithm.VIRAL, FeedAlgorithm.COMMUNITY])
+@pytest.mark.parametrize("cursor_kind", ["empty", "duplicate", "unknown_anchor", "legacy_unknown"])
+@pytest.mark.asyncio
+async def test_ranked_feeds_reject_invalid_snapshot_cursors(monkeypatch, follow_graph, algorithm, cursor_kind):
+    post_id = uuid.uuid4()
+    cursors = {
+        "empty": f"fy1.{post_id}.",
+        "duplicate": f"fy1.{post_id}.{post_id},{post_id}",
+        "unknown_anchor": f"fy1.{uuid.uuid4()}.{post_id}",
+        "legacy_unknown": str(post_id),
+    }
+    stub_feed_posts(monkeypatch, [])
+    stub_recent_post_engagement(monkeypatch, {})
+    with pytest.raises(ValueError, match="Invalid feed cursor"):
+        await _feed(make_ctx(make_user("viewer")), cursors[cursor_kind], 2, False, algorithm)
+
+
+@pytest.mark.asyncio
+async def test_viral_momentum_window_is_bounded_to_existing_24_hours(monkeypatch, follow_graph):
+    from repositories.feed_ranking import VIRAL_MOMENTUM_WINDOW_HOURS
+
+    creator = make_user("creator")
+    post = make_post(creator.id, uuid.uuid4())
+    stub_discovery_pool(monkeypatch, [post])
+    recent = AsyncMock(return_value={})
+    monkeypatch.setattr("repositories.analytics_repository.AnalyticsRepository.recent_post_engagement", recent)
+    before = datetime.now(timezone.utc)
+    await _feed(make_ctx(make_user("viewer")), None, 10, False, FeedAlgorithm.VIRAL)
+    after = datetime.now(timezone.utc)
+    post_ids, since = recent.await_args.args
+    assert post_ids == [post.id]
+    assert VIRAL_MOMENTUM_WINDOW_HOURS == 24
+    assert before - timedelta(hours=24) <= since <= after - timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_feed_snapshot_lookup_excludes_deleted_and_unpublished_posts():
+    from repositories.content_repository import PostRepository
+
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    post_id = uuid.uuid4()
+    assert await PostRepository(db).get_feed_snapshot([post_id]) == []
+    compiled = db.execute.await_args.args[0].compile()
+    assert "posts.deleted_at IS NULL" in str(compiled)
+    assert "posts.status =" in str(compiled)
+    assert ContentStatus.PUBLISHED in compiled.params.values()
+    assert [post_id] in compiled.params.values()
+
+
+@pytest.mark.parametrize(("algorithm", "limit", "message"), [
+    ("INVALID", 10, "Invalid feed algorithm"),
+    (FeedAlgorithm.VIRAL, 0, "Feed limit must be positive"),
+    (FeedAlgorithm.COMMUNITY, -1, "Feed limit must be positive"),
+])
+@pytest.mark.asyncio
+async def test_feed_rejects_invalid_direct_inputs(algorithm, limit, message):
+    ctx = make_ctx(make_user("viewer"))
+    with pytest.raises(ValueError, match=message):
+        await _feed(ctx, None, limit, False, algorithm)
+    ctx.db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_community_includes_only_positive_unfollowed_affinity(monkeypatch, follow_graph):
+    viewer = make_user("viewer")
+    creators = [make_user(f"creator{index}") for index in range(4)]
+    posts = [make_post(creator.id, uuid.uuid4()) for creator in creators]
+    stub_feed_posts(monkeypatch, posts + [make_post(viewer.id, uuid.uuid4())])
+    stub_creator_affinity(monkeypatch, {
+        creators[0].id: 0.0, creators[1].id: -10.0,
+        creators[2].id: 0.0, creators[3].id: 1.0, viewer.id: 100.0,
+    })
+    await follow_graph.follow(viewer.id, creators[0].id)
+    page = await _feed(make_ctx(viewer), None, 10, False, FeedAlgorithm.COMMUNITY)
+    assert [item.id for item in page.items] == [posts[0].id, posts[3].id]

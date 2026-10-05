@@ -149,8 +149,8 @@ async def is_token_blacklisted(jti: str) -> bool:
         if not redis_service.redis:
             await redis_service.connect()
         return await redis_service.is_token_blacklisted(jti)
-    except Exception:
-        return False
+    except Exception as exc:
+        raise RuntimeError("Token revocation store is unavailable") from exc
     finally:
         if redis_service.redis:
             try:
@@ -159,7 +159,7 @@ async def is_token_blacklisted(jti: str) -> bool:
                 pass
 
 
-async def blacklist_token(jti: str, exp: datetime) -> None:
+async def blacklist_token(jti: str, exp: datetime) -> bool:
     """
     Add a token to the blacklist.
 
@@ -174,8 +174,9 @@ async def blacklist_token(jti: str, exp: datetime) -> None:
         if not redis_service.redis:
             await redis_service.connect()
         await redis_service.blacklist_token(jti, exp)
+        return True
     except Exception:
-        return
+        return False
     finally:
         if redis_service.redis:
             try:
