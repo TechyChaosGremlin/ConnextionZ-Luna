@@ -45,3 +45,23 @@ class StreamStatusResponse(BaseModel):
 class StopStreamResponse(BaseModel):
     stream_id: uuid.UUID
     status: StreamSessionStatus
+
+
+class ViewerJoinRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_session_id: uuid.UUID
+
+
+class ViewerSessionUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ViewerSessionResponse(BaseModel):
+    viewer_session_id: uuid.UUID
+    stream_id: uuid.UUID
+    client_session_id: uuid.UUID
+    joined_at: datetime
+    lease_expires_at: datetime
+    left_at: datetime | None
+    is_active: bool

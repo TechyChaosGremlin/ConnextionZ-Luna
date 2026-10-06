@@ -20,6 +20,14 @@ from app.models.streaming import (
     StreamSessionStatus,
 )
 from app.models.user import User
+from app.rate_limits import (
+    STREAM_ACTION_LIMITS,
+    STREAM_START_ACTION,
+    STREAM_START_HOURLY_ACTION,
+    STREAM_STOP_ACTION,
+    ActionRateLimiter,
+    client_identity,
+)
 from features.streaming.ffmpeg import FFmpegError, FFmpegRunner
 from features.streaming.manager import StreamManager
 from features.streaming.schemas import (
@@ -56,6 +64,7 @@ stream_manager = StreamManager(
     runner=FFmpegRunner(settings.ffmpeg_path, settings.ffmpeg_startup_timeout_seconds),
     stop_timeout_seconds=settings.ffmpeg_stop_timeout_seconds,
 )
+stream_action_limiter = ActionRateLimiter(STREAM_ACTION_LIMITS)
 
 
 async def _persist_process_exit(
@@ -66,6 +75,7 @@ async def _persist_process_exit(
             select(StreamSession)
             .options(selectinload(StreamSession.destinations))
             .where(StreamSession.id == stream_id)
+            .with_for_update()
         )
         stream = result.scalar_one_or_none()
         if stream is None or stream.status in {
@@ -94,6 +104,10 @@ class StreamingService:
         self.manager = manager
 
     async def start(self, request: StartStreamRequest, owner: User) -> StreamResponse:
+        stream_action_limiter.consume(
+            client_identity(owner.id, ""),
+            {STREAM_START_ACTION: 1, STREAM_START_HOURLY_ACTION: 1},
+        )
         stream = StreamSession(
             id=generate_uuidv7(),
             owner_id=owner.id,
@@ -110,8 +124,7 @@ class StreamingService:
             for platform in request.platforms
         ]
         stream.destinations = destinations
-        self.db.add(stream)
-        await self.db.flush()
+        await StreamSessionRepository(self.db).reserve_live_slot(stream)
 
         urls_by_platform = _destination_urls()
         try:
@@ -167,10 +180,22 @@ class StreamingService:
 
     async def stop(self, stream_id: uuid.UUID, owner: User) -> StopStreamResponse:
         stream = await self._owned_stream(stream_id, owner.id)
+        stream_action_limiter.consume(client_identity(owner.id, ""), {STREAM_STOP_ACTION: 1})
         if stream.status in {StreamSessionStatus.ENDED, StreamSessionStatus.FAILED}:
             return StopStreamResponse(stream_id=stream.id, status=stream.status)
 
         stopped = await self.manager.stop(stream.id, owner.id)
+        # Do not hold the parent lock while the manager awaits its process-exit callback.
+        result = await self.db.execute(
+            select(StreamSession)
+            .options(selectinload(StreamSession.destinations))
+            .where(StreamSession.id == stream_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        stream = result.scalar_one()
+        if stream.status in {StreamSessionStatus.ENDED, StreamSessionStatus.FAILED}:
+            return StopStreamResponse(stream_id=stream.id, status=stream.status)
         ended_at = _utcnow()
         stream.status = StreamSessionStatus.ENDED if stopped else StreamSessionStatus.FAILED
         stream.ended_at = ended_at

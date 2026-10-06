@@ -429,6 +429,32 @@ class CommentRepository(BaseRepository[Comment]):
         result = await self.db.execute(stmt)
         return result.scalar_one()
 
+    async def daily_counts_for_creator(
+        self,
+        creator_id: uuid.UUID,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict]:
+        """Count non-deleted comments by UTC day, matching count_for_creator's scope."""
+        day = func.date(func.timezone("UTC", Comment.created_at)).label("day")
+        result = await self.db.execute(
+            select(day, func.count().label("comments"))
+            .select_from(Comment)
+            .join(Post, Comment.post_id == Post.id)
+            .where(
+                Post.user_id == creator_id,
+                Comment.deleted_at.is_(None),
+                Comment.created_at >= start.astimezone(timezone.utc),
+                Comment.created_at <= end.astimezone(timezone.utc),
+            )
+            .group_by(day)
+            .order_by(day)
+        )
+        return [
+            {"date": str(row.day), "comments": int(row.comments)}
+            for row in result.all()
+        ]
+
     async def count_unique_commenters_for_creator(
         self,
         creator_id: uuid.UUID,
@@ -449,6 +475,27 @@ class CommentRepository(BaseRepository[Comment]):
         )
         result = await self.db.execute(stmt)
         return int(result.scalar_one() or 0)
+
+    async def counts_by_post(
+        self,
+        post_ids: list[uuid.UUID],
+        start: datetime,
+        end: datetime,
+    ) -> dict[uuid.UUID, int]:
+        """Count non-deleted comments (including replies) per post within an inclusive period."""
+        if not post_ids:
+            return {}
+        result = await self.db.execute(
+            select(Comment.post_id, func.count().label("comments"))
+            .where(
+                Comment.post_id.in_(post_ids),
+                Comment.deleted_at.is_(None),
+                Comment.created_at >= start,
+                Comment.created_at <= end,
+            )
+            .group_by(Comment.post_id)
+        )
+        return {row.post_id: int(row.comments) for row in result.all()}
 
     async def soft_delete(self, comment_id: uuid.UUID) -> bool:
         """

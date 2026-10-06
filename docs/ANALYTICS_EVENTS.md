@@ -36,7 +36,7 @@ Defined in `backend/app/models/analytics.py::EventType`:
 | `COMMENT_CREATED`       | `createComment`/`addComment` mutation succeeds. |
 | `SHARE_CREATED`         | `sharePost` mutation succeeds. |
 | `SAVE_CREATED`          | `savePost` mutation succeeds. |
-| `FOLLOW_CREATED` / `FOLLOW_REMOVED` | `follow`/`unfollow` mutation succeeds. |
+| `FOLLOW_CREATED` / `FOLLOW_REMOVED` | `follow` creates a relationship / `unfollow` actually removes an existing relationship. Repeated no-op requests do not emit events. |
 | `PROFILE_VIEWED`        | The `profile` query resolves another user's profile (not the viewer's own). |
 | `VIDEO_UPLOADED`        | A video file finishes uploading via `POST /media/posts/{post_id}`. |
 | `VIDEO_PUBLISHED`       | A post's status becomes `published` (on create, or via `updatePost`/legacy update transitioning from a non-published status). |

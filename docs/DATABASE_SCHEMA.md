@@ -38,6 +38,7 @@
 10. [Notifications](#notifications)
 11. [Indexing Strategy](#indexing-strategy)
 12. [Migration Guide](#migration-guide)
+13. [Streaming Viewer Sessions](#streaming-viewer-sessions)
 
 ---
 
@@ -621,6 +622,64 @@ LIMIT 50;
 - `ix_notifications_user_id` — B-tree on `user_id`
 - `ix_notifications_type` — B-tree on `type`
 - `ix_notifications_is_read` — B-tree on `is_read` (unread count queries)
+
+---
+
+## Streaming Viewer Sessions
+
+### `stream_viewer_sessions`
+
+Revision `202` (parent `201`) adds the authenticated-only viewer-session
+persistence foundation. One row represents one continuous, lease-backed
+playback connection to the existing canonical `stream_sessions` broadcast.
+Multiple tabs, devices, and reconnects may produce multiple rows for one user.
+The revision itself is persistence-only. Authenticated REST join/heartbeat/leave
+collection now uses this table; audience aggregation is not enabled.
+
+| Column | Type | Constraints / meaning |
+|--------|------|-----------------------|
+| `id` | `UUID` | Primary key; application-generated UUIDv7 |
+| `stream_session_id` | `UUID` | NOT NULL; FK to `stream_sessions.id`, ON DELETE CASCADE |
+| `user_id` | `UUID` | NOT NULL; authenticated viewer FK to `users.id`, ON DELETE CASCADE |
+| `client_session_id` | `UUID` | NOT NULL; random connection-attempt key, reused only for join retries |
+| `joined_at` | `TIMESTAMPTZ` | NOT NULL; server-accepted join time |
+| `lease_expires_at` | `TIMESTAMPTZ` | NOT NULL; absolute presence deadline |
+| `left_at` | `TIMESTAMPTZ` | NULLABLE; finalized connection end |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL; database default `now()` |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL; database default `now()`, ORM update timestamp |
+
+**Constraints and indexes:**
+
+- `uq_stream_viewer_sessions_client_attempt`: unique
+  `(stream_session_id, user_id, client_session_id)` for join idempotency.
+  Its stream-leading index also covers broadcast-scoped lookups.
+- `ck_stream_viewer_sessions_lease_after_join`: `lease_expires_at > joined_at`.
+- `ck_stream_viewer_sessions_leave_within_lease`: `left_at IS NULL` or
+  `joined_at <= left_at <= lease_expires_at`.
+- `ix_stream_viewer_sessions_user_id`: B-tree on `user_id`.
+- `ix_stream_viewer_sessions_open_lease`: B-tree on
+  `(stream_session_id, lease_expires_at)` where `left_at IS NULL`.
+  The predicate is supported in PostgreSQL and SQLite.
+
+There is deliberately no uniqueness constraint on broadcast/user, active flag,
+status enum, stored duration, or aggregate counter. An unclosed row is not
+necessarily active: future collection must also check its deadline and the
+parent broadcast's active status. Expired/closed connections must not be revived;
+reconnects after expiry use a new attempt key and row. `AudienceService` owns
+server timestamps and parent lifecycle validation; its repository uses
+PostgreSQL parent-then-viewer locks, join conflict handling, and conditional
+updates. The REST database dependency commits the transaction or rolls it back.
+Deleting a broadcast or user cascades to these rows; user deletion therefore
+removes that user's historical audience contribution.
+
+Future metrics use half-open viewing intervals bounded by the broadcast,
+connection leave, and persisted lease deadline. Unique/concurrent viewers count
+distinct users; watch duration unions overlapping connections per user before
+summing; peak concurrency is derived from those merged intervals. Lease-backed
+presence is an estimate, not proof of playback or attention.
+
+Anonymous identity, external-platform audiences, `post_watches`, and
+`analytics_events` are outside this table's scope.
 
 ---
 

@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import Column, MetaData, Table, Uuid, create_engine, select
 
 from api.graphql import (
     AppContext,
@@ -39,6 +40,7 @@ from api.graphql import (
     _unfollow,
 )
 from app.models.analytics import AnalyticsEvent, EventType, SignalType
+from app.models.social import Follow
 from app.models.user import AccountStatus, User, UserRole
 from repositories.analytics_repository import AnalyticsRepository
 from services.analytics_event_service import AnalyticsEventService
@@ -312,7 +314,8 @@ async def test_like_created_event_only_on_new_like(spy_track_event, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_follow_created_event(spy_track_event, monkeypatch):
+@pytest.mark.parametrize("created", [True, False])
+async def test_follow_created_event(spy_track_event, monkeypatch, created):
     user = make_user("alice")
     target = make_user("bob")
     ctx = make_ctx(user)
@@ -321,7 +324,7 @@ async def test_follow_created_event(spy_track_event, monkeypatch):
         return target
 
     async def fake_follow(self, follower_id, followee_id):
-        return True
+        return created
 
     async def fake_count(self, user_id):
         return 1
@@ -338,12 +341,16 @@ async def test_follow_created_event(spy_track_event, monkeypatch):
 
     await _follow(ctx, target.username)
 
-    assert [c["event_type"] for c in spy_track_event] == [EventType.FOLLOW_CREATED]
-    assert spy_track_event[0]["target_user"] is target
+    assert [c["event_type"] for c in spy_track_event] == (
+        [EventType.FOLLOW_CREATED] if created else []
+    )
+    if created:
+        assert spy_track_event[0]["target_user"] is target
 
 
 @pytest.mark.asyncio
-async def test_unfollow_removed_event(spy_track_event, monkeypatch):
+@pytest.mark.parametrize("removed", [True, False])
+async def test_unfollow_removed_event(spy_track_event, monkeypatch, removed):
     user = make_user("alice")
     target = make_user("bob")
     ctx = make_ctx(user)
@@ -351,7 +358,11 @@ async def test_unfollow_removed_event(spy_track_event, monkeypatch):
     monkeypatch.setattr(
         "repositories.user_repository.UserRepository.get_by_username", AsyncMock(return_value=target)
     )
-    monkeypatch.setattr("repositories.social_repository.FollowRepository.unfollow", AsyncMock())
+    monkeypatch.setattr(
+        "repositories.social_repository.FollowRepository.unfollow", AsyncMock(return_value=removed)
+    )
+    record = AsyncMock()
+    monkeypatch.setattr(AnalyticsRepository, "record", record)
     monkeypatch.setattr(
         "repositories.social_repository.FollowRepository.count_followers", AsyncMock(return_value=0)
     )
@@ -363,9 +374,78 @@ async def test_unfollow_removed_event(spy_track_event, monkeypatch):
         AsyncMock(return_value=SimpleNamespace(follower_count=0, following_count=0)),
     )
 
-    await _unfollow(ctx, target.username)
+    result = await _unfollow(ctx, target.username)
 
-    assert [c["event_type"] for c in spy_track_event] == [EventType.FOLLOW_REMOVED]
+    assert result.following is False
+    ctx.db.commit.assert_awaited_once()
+    assert [c["event_type"] for c in spy_track_event] == (
+        [EventType.FOLLOW_REMOVED] if removed else []
+    )
+    if removed:
+        record.assert_awaited_once_with(
+            user_id=user.id, creator_id=target.id, signal_type=SignalType.UNFOLLOW
+        )
+        assert spy_track_event[0]["target_user"] is target
+    else:
+        record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initially_following", [True, False])
+async def test_repeated_unfollow_uses_actual_deletion_and_preserves_other_edges(
+    spy_track_event, monkeypatch, initially_following
+):
+    user, target, other_user, other_creator = [
+        make_user(name) for name in ("alice", "bob", "carol", "dave")
+    ]
+    engine = create_engine("sqlite:///:memory:")
+    metadata = MetaData()
+    follows = Table(
+        "follows", metadata,
+        Column("id", Uuid, primary_key=True),
+        Column("follower_id", Uuid, nullable=False),
+        Column("following_id", Uuid, nullable=False),
+    )
+    metadata.create_all(engine)
+    edges = [(other_user.id, target.id), (user.id, other_creator.id)]
+    if initially_following:
+        edges.append((user.id, target.id))
+    monkeypatch.setattr(
+        "repositories.user_repository.UserRepository.get_by_username", AsyncMock(return_value=target)
+    )
+    monkeypatch.setattr(
+        "repositories.profile_repository.ProfileRepository.get_by_user_id",
+        AsyncMock(return_value=SimpleNamespace(follower_count=0, following_count=0)),
+    )
+    record = AsyncMock()
+    monkeypatch.setattr(AnalyticsRepository, "record", record)
+    try:
+        with engine.connect() as connection:
+            connection.execute(follows.insert(), [
+                {"id": uuid.uuid4(), "follower_id": follower, "following_id": creator}
+                for follower, creator in edges
+            ])
+            ctx = make_ctx(user)
+
+            async def execute(statement):
+                return connection.execute(statement)
+
+            ctx.db.execute.side_effect = execute
+            first = await _unfollow(ctx, target.username)
+            second = await _unfollow(ctx, target.username)
+
+            assert first.following is second.following is False
+            assert first.followers == second.followers == 1
+            assert first.following_count == second.following_count == 1
+            assert [c["event_type"] for c in spy_track_event] == (
+                [EventType.FOLLOW_REMOVED] if initially_following else []
+            )
+            assert record.await_count == int(initially_following)
+            assert set(connection.execute(
+                select(Follow.follower_id, Follow.following_id)
+            ).all()) == {(other_user.id, target.id), (user.id, other_creator.id)}
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio

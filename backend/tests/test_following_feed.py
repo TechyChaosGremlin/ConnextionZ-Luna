@@ -126,7 +126,10 @@ class FakeFollowGraph:
         return True
 
     async def unfollow(self, follower_id, following_id):
+        if (follower_id, following_id) not in self.edges:
+            return False
         self.edges.discard((follower_id, following_id))
+        return True
 
     async def is_following(self, follower_id, following_id):
         return (follower_id, following_id) in self.edges

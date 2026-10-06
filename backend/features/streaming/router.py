@@ -9,12 +9,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session
 from app.models.user import User
+from app.rate_limits import ActionRateLimitExceeded, RATE_LIMIT_MESSAGE
 from features.auth.middleware import get_current_active_user
+from features.streaming.audience_service import AudienceService
 from features.streaming.schemas import (
     StartStreamRequest,
     StreamResponse,
     StreamStatusResponse,
     StopStreamResponse,
+    ViewerJoinRequest,
+    ViewerSessionResponse,
+    ViewerSessionUpdateRequest,
 )
 from features.streaming.service import StreamingService, StreamNotFoundError, StreamStartError
 
@@ -29,6 +34,12 @@ async def start_stream(
 ) -> StreamResponse:
     try:
         return await StreamingService(db).start(request, current_user)
+    except ActionRateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=RATE_LIMIT_MESSAGE,
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
     except StreamStartError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -56,6 +67,63 @@ async def get_stream_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stream not found") from exc
 
 
+@router.post("/{stream_id}/viewers/join", response_model=ViewerSessionResponse)
+async def join_stream_viewer(
+    stream_id: uuid.UUID,
+    request: ViewerJoinRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> ViewerSessionResponse:
+    try:
+        return await AudienceService(db).join(stream_id, request.client_session_id, current_user)
+    except ActionRateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=RATE_LIMIT_MESSAGE,
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+
+
+@router.post(
+    "/{stream_id}/viewers/{viewer_session_id}/heartbeat", response_model=ViewerSessionResponse
+)
+async def heartbeat_stream_viewer(
+    stream_id: uuid.UUID,
+    viewer_session_id: uuid.UUID,
+    request: ViewerSessionUpdateRequest | None = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> ViewerSessionResponse:
+    try:
+        return await AudienceService(db).heartbeat(stream_id, viewer_session_id, current_user)
+    except ActionRateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=RATE_LIMIT_MESSAGE,
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+
+
+@router.post(
+    "/{stream_id}/viewers/{viewer_session_id}/leave", response_model=ViewerSessionResponse
+)
+async def leave_stream_viewer(
+    stream_id: uuid.UUID,
+    viewer_session_id: uuid.UUID,
+    request: ViewerSessionUpdateRequest | None = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> ViewerSessionResponse:
+    try:
+        return await AudienceService(db).leave(stream_id, viewer_session_id, current_user)
+    except ActionRateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=RATE_LIMIT_MESSAGE,
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+
+
 @router.post("/{stream_id}/stop", response_model=StopStreamResponse)
 async def stop_stream(
     stream_id: uuid.UUID,
@@ -64,5 +132,11 @@ async def stop_stream(
 ) -> StopStreamResponse:
     try:
         return await StreamingService(db).stop(stream_id, current_user)
+    except ActionRateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=RATE_LIMIT_MESSAGE,
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
     except StreamNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stream not found") from exc

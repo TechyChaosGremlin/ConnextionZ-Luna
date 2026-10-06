@@ -19,6 +19,7 @@ from repositories.analytics_repository import AnalyticsRepository
 from repositories.analytics_event_repository import AnalyticsEventRepository
 from repositories.collaboration_repository import CollaborationRepository
 from repositories.content_repository import CommentRepository
+from repositories.stream_session_repository import StreamSessionRepository
 
 
 class CreatorAnalyticsService:
@@ -150,6 +151,31 @@ class CreatorAnalyticsService:
     def _collaboration_timestamp(cls, collaboration, field: str) -> datetime | None:
         return cls._parse_timestamp(getattr(collaboration, field, None))
 
+    async def _total_broadcast_duration(
+        self, creator_id: uuid.UUID, start: datetime, end: datetime
+    ) -> float:
+        _, duration_seconds = await self._stream_session_totals(creator_id, start, end)
+        return duration_seconds
+
+    async def _stream_session_totals(
+        self, creator_id: uuid.UUID, start: datetime, end: datetime
+    ) -> tuple[int, float]:
+        sessions = await StreamSessionRepository(self.db).get_ended_for_owner_in_period(
+            creator_id, start, end
+        )
+        ended_sessions = 0
+        duration_seconds = 0.0
+        for session in sessions:
+            started_at = self._parse_timestamp(session.started_at)
+            ended_at = self._parse_timestamp(session.ended_at)
+            if started_at is None or ended_at is None:
+                continue
+            duration = (ended_at - started_at).total_seconds()
+            if duration >= 0:
+                ended_sessions += 1
+                duration_seconds += duration
+        return ended_sessions, duration_seconds
+
     async def _collaboration_totals(
         self, creator_id: uuid.UUID, start: datetime, end: datetime
     ) -> dict:
@@ -201,6 +227,12 @@ class CreatorAnalyticsService:
     async def overview(self, creator_id: uuid.UUID, start: datetime, end: datetime) -> dict:
         posts = await self._posts(creator_id)
         current = await self._period_totals(creator_id, start, end)
+        total_ended_stream_sessions, total_broadcast_duration = await self._stream_session_totals(
+            creator_id, start, end
+        )
+        stream_destination_breakdown = await StreamSessionRepository(
+            self.db
+        ).ended_destination_counts_for_owner_in_period(creator_id, start, end)
         period_length = end - start
         previous = await self._period_totals(creator_id, start - period_length, start)
         try:
@@ -293,6 +325,9 @@ class CreatorAnalyticsService:
             "follower_growth": current["follower_growth"],
             "current_followers": current_followers,
             "total_watch_time": current["total_watch_time"],
+            "total_broadcast_duration": total_broadcast_duration,
+            "total_ended_stream_sessions": total_ended_stream_sessions,
+            "stream_destination_breakdown": stream_destination_breakdown,
             "avg_watch_time": current["avg_watch_time"],
             "total_completions": current["completions"],
             "completion_rate": current["completion_rate"],
@@ -334,6 +369,7 @@ class CreatorAnalyticsService:
         unique_viewers = await self.analytics_repo.unique_viewer_counts(
             creator_id=creator_id, post_ids=post_ids, start=start, end=end
         )
+        comment_counts = await CommentRepository(self.db).counts_by_post(post_ids, start, end)
 
         result = []
         for post in posts:
@@ -348,7 +384,7 @@ class CreatorAnalyticsService:
             shares = cnt(SignalType.SHARE)
             completions = cnt(SignalType.COMPLETION)
             watch_sec = float(sig.get(SignalType.WATCH_DURATION, {}).get("total", 0.0))
-            comments = getattr(post, "comment_count", 0)
+            comments = comment_counts.get(post.id, 0)
 
             # Fallback to denormalized post counters if no signal rows exist in period
             final_views = views if views > 0 else getattr(post, "view_count", 0)
@@ -379,14 +415,21 @@ class CreatorAnalyticsService:
         return result
 
     async def daily_trends(self, creator_id: uuid.UUID, start: datetime, end: datetime) -> list[dict]:
-        """Return one grouped row per UTC day and tracked metric using InteractionSignal."""
+        """Return one grouped row per UTC day from persisted analytics sources."""
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
         rows = await self.analytics_repo.daily_signal_totals(
             creator_id=creator_id, start=start, end=end
+        )
+        comment_rows = await CommentRepository(self.db).daily_counts_for_creator(
+            creator_id, start, end
         )
         collaborations = await CollaborationRepository(self.db).get_for_user_in_period(
             creator_id, start, end
         )
         by_date = {row["date"]: row for row in rows}
+        for row in comment_rows:
+            by_date.setdefault(row["date"], {})["comments"] = row["comments"]
         accepted_statuses = {
             CollaborationStatus.ACCEPTED,
             CollaborationStatus.IN_PROGRESS,

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException, UploadFile
+from starlette.requests import Request
 
 from app.models.user import AccountStatus, User, UserRole
 from features.media.router import delete_media, get_media_content, upload_media
@@ -30,6 +31,24 @@ def make_user(role: UserRole = UserRole.USER) -> User:
 
 def make_upload(content: bytes, name: str = "upload.bin") -> UploadFile:
     return UploadFile(filename=name, file=io.BytesIO(content))
+
+
+def make_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/media/posts/test",
+            "raw_path": b"/media/posts/test",
+            "query_string": b"",
+            "headers": [],
+            "client": ("192.0.2.1", 1234),
+            "server": ("test", 80),
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -93,7 +112,7 @@ async def test_upload_persists_media_for_owned_post(monkeypatch):
     monkeypatch.setattr("features.media.router.media_storage.upload", store_file)
     monkeypatch.setattr("repositories.content_repository.MediaRepository.create", create_media)
 
-    response = await upload_media(post.id, make_upload(b"\xff\xd8\xff"), user, db)
+    response = await upload_media(make_request(), post.id, make_upload(b"\xff\xd8\xff"), user, db)
 
     assert response["post_id"] == str(post.id)
     assert response["media_type"] == "image/jpeg"
@@ -124,7 +143,7 @@ async def test_upload_removes_stored_object_when_persistence_fails(monkeypatch):
     monkeypatch.setattr("repositories.content_repository.MediaRepository.create", create_media)
 
     with pytest.raises(HTTPException) as error:
-        await upload_media(post.id, make_upload(b"\x00"), user, db)
+        await upload_media(make_request(), post.id, make_upload(b"\x00"), user, db)
 
     assert error.value.status_code == 500
     db.rollback.assert_awaited_once()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,12 +13,20 @@ from app.models.analytics import EventType
 from app.models.base import generate_uuidv7
 from app.models.content import Media
 from app.models.user import User, UserRole
+from app.rate_limits import (
+    UPLOAD_VOLUME_ACTION,
+    UPLOAD_VOLUME_LIMITS,
+    ActionRateLimitExceeded,
+    ActionRateLimiter,
+    client_identity,
+)
 from features.auth.middleware import get_current_active_user
 from repositories.content_repository import MediaRepository, PostRepository
 from services.analytics_event_service import AnalyticsEventService
 from services.media_storage import MediaStorageError, media_storage
 
 router = APIRouter(prefix="/media", tags=["media"])
+upload_volume_limiter = ActionRateLimiter(UPLOAD_VOLUME_LIMITS)
 
 
 def _can_manage(user: User, owner_id: uuid.UUID) -> bool:
@@ -34,6 +42,7 @@ async def _get_media_or_404(db: AsyncSession, media_id: uuid.UUID) -> Media:
 
 @router.post("/posts/{post_id}", status_code=status.HTTP_201_CREATED)
 async def upload_media(
+    request: Request,
     post_id: uuid.UUID,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
@@ -44,6 +53,21 @@ async def upload_media(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
     if not _can_manage(current_user, post.user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to upload media")
+
+    try:
+        upload_volume_limiter.consume(
+            client_identity(
+                current_user.id if current_user is not None else None,
+                request.client.host if request.client else "unknown",
+            ),
+            {UPLOAD_VOLUME_ACTION: _uploaded_file_size(file)},
+        )
+    except ActionRateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
 
     media_id = generate_uuidv7()
     try:
@@ -86,6 +110,16 @@ async def upload_media(
         )
 
     return _media_payload(media)
+
+
+def _uploaded_file_size(file: UploadFile) -> int:
+    if file.size is not None:
+        return max(file.size, 1)
+    position = file.file.tell()
+    file.file.seek(0, 2)
+    size = file.file.tell()
+    file.file.seek(position)
+    return max(size, 1)
 
 
 @router.get("/posts/{post_id}")

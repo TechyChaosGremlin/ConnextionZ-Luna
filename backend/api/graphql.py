@@ -26,22 +26,33 @@ from repositories.creator_scoring import (
 
 import uuid
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from enum import Enum
 from functools import wraps
-from typing import AsyncIterator, Optional, List, Callable
+from typing import Any, AsyncIterator, Optional, List, Callable
 
 import strawberry
-from fastapi import Request, Response
+from cross_web import AsyncHTTPRequestAdapter
+from fastapi import HTTPException, Request, Response
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from strawberry.fastapi import BaseContext, GraphQLRouter
 from strawberry.extensions import SchemaExtension
 from strawberry.schema.config import StrawberryConfig
 from strawberry.types import Info as StrawberryInfo
+from strawberry.http import GraphQLRequestData
+from strawberry.types import ExecutionResult
+from strawberry.types.execution import SubscriptionExecutionResult
 
 from app.models.user import User
 from app.config import settings
+from app.rate_limits import ActionRateLimiter, ActionRateLimitExceeded, client_identity
+from api.graphql_rate_limits import (
+    MUTATION_LIMITS,
+    mutation_costs,
+    query_complexity_error,
+)
 
 # ── Custom Scalars ───────────────────────────────────────────────────────────
 
@@ -834,6 +845,12 @@ class PostAnalyticsType:
 
 
 @strawberry.type
+class StreamDestinationAnalyticsType:
+    platform: str
+    ended_sessions: int
+
+
+@strawberry.type
 class AnalyticsSummaryType:
     period_start: DateTimeScalar
     period_end: DateTimeScalar
@@ -872,6 +889,11 @@ class AnalyticsSummaryType:
     total_uploads: int = 0
     total_published_videos: int = 0
     total_watch_time: float = 0.0
+    total_broadcast_duration: float = 0.0
+    total_ended_stream_sessions: int = 0
+    stream_destination_breakdown: list[StreamDestinationAnalyticsType] = strawberry.field(
+        default_factory=list
+    )
     avg_watch_time: Optional[float] = None
     total_completions: int = 0
     completion_rate: Optional[float] = None
@@ -4230,6 +4252,15 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
         new_followers=values["new_followers"],
         lost_followers=values["lost_followers"],
         total_watch_time=values.get("total_watch_time", 0.0),
+        total_broadcast_duration=values.get("total_broadcast_duration", 0.0),
+        total_ended_stream_sessions=values.get("total_ended_stream_sessions", 0),
+        stream_destination_breakdown=[
+            StreamDestinationAnalyticsType(
+                platform=row["platform"].value,
+                ended_sessions=row["ended_sessions"],
+            )
+            for row in values.get("stream_destination_breakdown", [])
+        ],
         avg_watch_time=values["avg_watch_time"],
         total_completions=values.get("total_completions", 0),
         completion_rate=values["completion_rate"],
@@ -6237,21 +6268,22 @@ async def _unfollow(ctx, username) -> FollowResultType:
         raise ValueError("Profile not found")
 
     follow_repo = FollowRepository(ctx.db)
-    await follow_repo.unfollow(user.id, target.id)
+    removed_follow = await follow_repo.unfollow(user.id, target.id)
 
     from repositories.analytics_repository import AnalyticsRepository
     from app.models.analytics import SignalType, EventType
     from services.analytics_event_service import AnalyticsEventService
 
-    await AnalyticsRepository(ctx.db).record(
-        user_id=user.id, creator_id=target.id, signal_type=SignalType.UNFOLLOW
-    )
-    await AnalyticsEventService(ctx.db).track_event(
-        event_type=EventType.FOLLOW_REMOVED,
-        user=user,
-        target_user=target,
-        session_id=ctx.session_id,
-    )
+    if removed_follow:
+        await AnalyticsRepository(ctx.db).record(
+            user_id=user.id, creator_id=target.id, signal_type=SignalType.UNFOLLOW
+        )
+        await AnalyticsEventService(ctx.db).track_event(
+            event_type=EventType.FOLLOW_REMOVED,
+            user=user,
+            target_user=target,
+            session_id=ctx.session_id,
+        )
 
     profile_repo = ProfileRepository(ctx.db)
     target_profile = await profile_repo.get_by_user_id(target.id)
@@ -6874,9 +6906,53 @@ schema = strawberry.Schema(
 # ── Router Factory ───────────────────────────────────────────────────────────
 
 
+class RateLimitedGraphQLRouter(GraphQLRouter[AppContext]):
+    action_limiter: ActionRateLimiter
+
+    async def execute_operation(
+        self,
+        request: Request,
+        request_adapter: AsyncHTTPRequestAdapter,
+        request_data: GraphQLRequestData | list[GraphQLRequestData],
+        context: AppContext,
+        root_value: Any,
+        sub_response: Response,
+    ) -> ExecutionResult | list[ExecutionResult] | SubscriptionExecutionResult:
+        complexity_error = query_complexity_error(schema._schema, request_data)
+        if complexity_error is not None:
+            if isinstance(request_data, list):
+                return [
+                    ExecutionResult(data=None, errors=[complexity_error])
+                    for _ in request_data
+                ]
+            return ExecutionResult(data=None, errors=[complexity_error])
+
+        if request_adapter.method == "POST":
+            costs: Counter[str] = Counter()
+            operations = request_data if isinstance(request_data, list) else [request_data]
+            for operation in operations:
+                costs.update(mutation_costs(schema._schema, operation))
+            user = context.current_user
+            identity = client_identity(
+                user.id if user is not None else None,
+                request.client.host if request.client else "unknown",
+            )
+            try:
+                self.action_limiter.consume(identity, costs)
+            except ActionRateLimitExceeded as exc:
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(exc),
+                    headers={"Retry-After": str(exc.retry_after)},
+                ) from exc
+        return await super().execute_operation(
+            request, request_adapter, request_data, context, root_value, sub_response
+        )
+
+
 def create_graphql_router(
     session_factory: Callable[[], AsyncSession],
-) -> GraphQLRouter[AppContext]:
+) -> RateLimitedGraphQLRouter:
     """Create a FastAPI-compatible GraphQL router."""
 
     async def get_context(
@@ -6901,12 +6977,14 @@ def create_graphql_router(
 
         return AppContext(db=db, current_user=current_user, session_id=session_id)
 
-    return GraphQLRouter[AppContext](
+    router = RateLimitedGraphQLRouter(
         schema,
         context_getter=get_context,
         graphql_ide="graphiql",
         subscription_protocols=["graphql-ws"],
     )
+    router.action_limiter = ActionRateLimiter(MUTATION_LIMITS)
+    return router
 
 
 async def _graphql_user_from_token(db, token: str) -> tuple[User | None, str | None]:

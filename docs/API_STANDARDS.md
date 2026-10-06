@@ -210,7 +210,156 @@ X-RateLimit-Remaining: 87
 X-RateLimit-Reset: 1690000000
 ```
 
-GraphQL rate limiting counts by query complexity (cost model TBD).
+### Active protection
+
+The active middleware retains a global limit of **60 HTTP requests per IP per
+60 seconds** (configurable via `rate_limit_per_minute`). Health endpoints are exempt.
+The tier limits above are not yet implemented.
+
+REST authentication endpoints also have independent IP-based sliding-window
+buckets:
+
+| Endpoint | Limit |
+|----------|-------|
+| `POST /auth/login` | 10 attempts per 60 seconds |
+| `POST /auth/register` | 5 requests per 60 minutes |
+| `POST /auth/refresh` | 30 requests per 60 seconds |
+| `POST /auth/logout` | 30 requests per 60 seconds |
+
+Login requests are charged before authentication, so failed credential attempts
+are counted. Every auth request continues to count against the global IP limit.
+
+The active media upload endpoint (`POST /media/posts/{post_id}`) also has an
+independent limit of **10 upload requests per user (or anonymous client IP) per
+60 minutes**, plus a cumulative volume limit of **1 GiB per user/IP per 60
+minutes**. The volume budget is reserved before storage is called; rejected
+uploads do not execute the storage operation. These rate limits do not change
+the existing 8 MiB image or 512 MiB video file-size validation.
+
+GraphQL queries and mutations are rejected before resolver execution when they
+exceed either **10 selected-field levels of depth** or **1,000 selected fields**
+per request. Root fields count as depth 1. Aliases and fields expanded from
+fragments count as selected fields, and `@skip`/`@include` directives are
+evaluated using coerced variable values. When JSON batching is enabled, the field
+count is aggregated across the request's operations.
+Limit violations use the regular GraphQL `errors` response (HTTP 200) with a
+`QUERY_DEPTH_LIMIT_EXCEEDED` or `QUERY_FIELD_LIMIT_EXCEEDED` code and a
+`statusCode` of 400 in `extensions`.
+
+GraphQL HTTP mutations also have independent sliding-window action buckets:
+
+| Mutation action | Limit per 60 seconds |
+|-----------------|----------------------|
+| `register` / `login` (shared bucket) | 5 |
+| `createPost` | 5 |
+| `createComment` / `addComment` (shared bucket) | 20 |
+| `sharePost` | 10 |
+| `follow` | 20 |
+| `createCollaboration` (proposal/request creation) | 5 |
+| `sendMessage` | 30 |
+| `startLiveStream` | 2 |
+
+Action buckets use the verified authenticated user ID, or the direct client IP for
+anonymous/invalid-token requests. Changing access tokens or IPs does not reset a
+user's bucket; different users on the same IP have separate action buckets but
+still share global IP protection. Forwarded IP headers are not trusted.
+
+Only the selected operation is charged. Executable root mutation fields are
+counted separately by action, including aliases and fragments, honoring
+`@skip`/`@include` and coerced variable defaults. Repeated selections merged by
+GraphQL count once. All action costs are reserved before any resolver runs;
+an over-budget request executes no mutation fields and consumes no action quota.
+Accepted attempts consume quota even when a resolver subsequently fails.
+JSON array batching is disabled by Strawberry's default schema configuration;
+the limiter also aggregates costs if batching is enabled in the future.
+
+The authenticated streaming REST API has additional user-ID-based limits:
+
+| Endpoint / resource | Limit |
+|---------------------|-------|
+| `POST /api/streams` | 2 start attempts per 60 seconds AND 10 per 60 minutes |
+| Pending or active `StreamSession` records | 1 per user |
+| `POST /api/streams/{stream_id}/stop` | 10 owned stop requests per 60 seconds |
+| `POST /api/streams/{stream_id}/viewers/join` | 20 authenticated attempts per 60 seconds |
+| `POST /api/streams/{stream_id}/viewers/{viewer_session_id}/heartbeat` | 30 authenticated attempts per 60 seconds |
+| `POST /api/streams/{stream_id}/viewers/{viewer_session_id}/leave` | 20 authenticated attempts per 60 seconds |
+
+The minute start limit follows the existing GraphQL `startLiveStream` threshold.
+The hourly start budget, concurrent-session cap, and stop budget are conservative
+initial REST policies. Start attempts consume both budgets before session
+creation, including attempts that fail process startup or encounter an occupied
+slot. Over-budget attempts do not consume additional action quota. Stopping does
+not reset either start budget, preventing repeated stop/start churn. Owned
+idempotent stop requests count too; authentication, validation, and ownership
+failures retain their existing responses.
+
+A database partial unique index reserves the slot when the pending session is
+flushed, before FFmpeg starts. This prevents simultaneous starts across workers
+from bypassing the cap. Pending sessions count as live reservations; ended/failed
+sessions do not. Successful stop, startup failure, and persisted process exit
+release the slot through the existing status transitions. A concurrent-limit
+429 advises retrying after 60 seconds, but expiry alone does not release the
+slot: the previous session must end or fail.
+
+Deploy Alembic revision `199` before serving this policy on an existing database.
+If an owner already has multiple pending/active sessions, the index creation
+fails rather than silently stopping streams or rewriting session history.
+Resolve those sessions via the existing lifecycle before retrying the migration.
+
+Rate limit violations return HTTP 429 with the existing
+`{"error":{"code":"TOO_MANY_REQUESTS","message":"Too many requests. Please slow down and try again later."}}`
+body and an integer `Retry-After` header in seconds. Action limits are process-local,
+like the global middleware; multiple workers/replicas do not share quota. Distributed
+frequency-limit storage, WebSocket mutation limits, and other Week 5 limits remain
+follow-up work. The streaming concurrent-session cap is database-enforced and is
+shared across workers/replicas.
+
+### Authenticated viewer presence
+
+Deploy the existing Alembic revision `202` before enabling these collection
+routes. They use canonical `StreamSession` IDs, not the legacy GraphQL live-stream
+IDs. No new migration or real-time transport is required.
+
+- Join accepts only `{"client_session_id": "<UUID>"}`. Identity comes exclusively
+  from authentication. The parent must be active with a valid server start time
+  and no end time. Successful first joins and retries return HTTP 200 with the
+  same viewer-session identity for the same broadcast/user/client attempt.
+  Retries do not extend the lease, reset timestamps, or reopen closed/expired
+  intervals. A reconnect after expiry/leave needs a new client attempt UUID.
+- Heartbeat and leave address the returned `viewer_session_id`. They accept no
+  body or `{}`; extra body fields are rejected with HTTP 422. Both verify the
+  authenticated viewer and supplied stream; a missing, foreign, or mismatched
+  viewer session returns HTTP 404, including when the caller is the creator.
+- Heartbeat renews only an unclosed session whose join time has arrived and whose
+  deadline is strictly in the future, while the parent remains active. Rejected
+  renewal or inactive join returns HTTP 409. Renewal never shortens a deadline.
+- Leave preserves the first finalized end time. It can be used after expiry or
+  broadcast termination and selects the earliest of server time, lease expiry,
+  and the broadcast's end timestamp. It never reopens an interval.
+
+Responses contain `viewer_session_id`, `stream_id`, `client_session_id`,
+`joined_at`, `lease_expires_at`, `left_at`, and point-in-time `is_active`.
+Presence requires an unclosed interval, `joined_at <= server_now`, an unexpired
+lease, and an active canonical parent; an unclosed expired row is not active.
+No user identity, creator metrics, credentials, or input-source URLs are exposed.
+
+`STREAMING_VIEWER_LEASE_SECONDS` configures the server lease (default 60 seconds,
+positive integer, maximum 3600). With the default, clients should renew roughly
+every 20 seconds while playback is present, rather than for every playback tick.
+Each action has one authenticated-user bucket across all broadcasts, tabs,
+devices, tokens, and IP changes. Validated attempts, including idempotent retries,
+authorization misses, and conflicts, consume their action budget before database
+work. Invalid bodies are rejected before the action service. All requests still
+pass through the existing global per-IP middleware (default 60 requests/minute);
+combined traffic may therefore hit its limit first. IP is never viewer identity.
+
+PostgreSQL parent/viewer row locks and conditional updates serialize presence
+changes against termination and prevent renewal of closed/expired intervals.
+The stop path acquires its final parent lock only after the process-exit callback
+finishes, avoiding a callback deadlock and retaining the callback's end time.
+Persistence failures use the standard logged error response, not a successful
+presence response. Expired intervals need no background cleanup to be inactive;
+this slice does not bulk-finalize viewer rows on termination.
 
 ## 6. Timestamps
 
@@ -299,6 +448,6 @@ This avoids streaming large files through the API server.
 
 - All GraphQL inputs are validated by Strawberry type system
 - String fields have length limits enforced at the resolver level
-- File uploads have size limits (10 MB default for images, 500 MB for video)
+- File uploads have size limits (8 MiB maximum for images, 512 MiB maximum for video)
 - User-generated HTML is sanitized before storage
 - SQL injection is prevented by SQLAlchemy parameterized queries

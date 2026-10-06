@@ -110,6 +110,8 @@ async def test_overview_aggregates_events_and_handles_watch_metrics():
         SimpleNamespace(event_type=EventType.SAVE_CREATED, count=1, unique_users=1, duration_ms=0),
         SimpleNamespace(event_type=EventType.VIDEO_UPLOADED, count=3, unique_users=2, duration_ms=0),
         SimpleNamespace(event_type=EventType.VIDEO_PUBLISHED, count=2, unique_users=2, duration_ms=0),
+        SimpleNamespace(event_type=EventType.FOLLOW_CREATED, count=3, unique_users=3, duration_ms=0),
+        SimpleNamespace(event_type=EventType.FOLLOW_REMOVED, count=1, unique_users=1, duration_ms=0),
     ]
     db = AsyncMock()
     db.execute.side_effect = [
@@ -134,6 +136,9 @@ async def test_overview_aggregates_events_and_handles_watch_metrics():
     assert values["total_uploads"] == 3
     assert values["total_published_videos"] == 2
     assert values["average_watch_time"] == 3.0
+    assert values["follows_created"] == 3
+    assert values["follows_removed"] == 1
+    assert values["net_followers"] == 2
     assert values["completion_rate"] == 50.0
     assert values["engagement_rate"] == 50.0
     assert values["approved_content"] == 6

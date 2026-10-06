@@ -4,6 +4,7 @@ Luna streaming feature — database foundation.
 Covers the multi-destination live streaming MVP models:
 - ``StreamSession`` — one broadcast attempt owned by a user (input source,
   lifecycle status, failure reason).
+- ``StreamViewerSession`` — one authenticated viewing connection interval.
 - ``StreamDestination`` — one output target (Twitch/YouTube/Kick/Facebook)
   attached to a ``StreamSession``, optionally backed by a
   ``ConnectedStreamAccount``.
@@ -29,7 +30,17 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -67,6 +78,9 @@ class StreamDestinationStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+LIVE_STREAM_OWNER_INDEX = "uq_stream_sessions_live_owner"
+
+
 # ── StreamSession ────────────────────────────────────────────────
 
 
@@ -74,6 +88,15 @@ class StreamSession(Base, TimestampMixin):
     """A single broadcast attempt owned by a user."""
 
     __tablename__ = "stream_sessions"
+    __table_args__ = (
+        Index(
+            LIVE_STREAM_OWNER_INDEX,
+            "owner_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'active')"),
+            sqlite_where=text("status IN ('pending', 'active')"),
+        ),
+    )
 
     owner_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -100,9 +123,61 @@ class StreamSession(Base, TimestampMixin):
     destinations: Mapped[list["StreamDestination"]] = relationship(
         "StreamDestination", back_populates="stream_session", lazy="selectin"
     )
+    viewer_sessions: Mapped[list["StreamViewerSession"]] = relationship(
+        "StreamViewerSession",
+        back_populates="stream_session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     def __repr__(self) -> str:
         return f"<StreamSession id={self.id!r} owner_id={self.owner_id!r} status={self.status.value!r}>"
+
+
+class StreamViewerSession(Base, TimestampMixin):
+    """One lease-backed authenticated viewing connection, not one unique viewer."""
+
+    __tablename__ = "stream_viewer_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "stream_session_id", "user_id", "client_session_id",
+            name="uq_stream_viewer_sessions_client_attempt",
+        ),
+        CheckConstraint(
+            "lease_expires_at > joined_at",
+            name="ck_stream_viewer_sessions_lease_after_join",
+        ),
+        CheckConstraint(
+            "left_at IS NULL OR (left_at >= joined_at AND left_at <= lease_expires_at)",
+            name="ck_stream_viewer_sessions_leave_within_lease",
+        ),
+        Index(
+            "ix_stream_viewer_sessions_open_lease",
+            "stream_session_id", "lease_expires_at",
+            postgresql_where=text("left_at IS NULL"),
+            sqlite_where=text("left_at IS NULL"),
+        ),
+    )
+
+    stream_session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("stream_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    client_session_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    stream_session: Mapped["StreamSession"] = relationship(
+        "StreamSession", back_populates="viewer_sessions"
+    )
 
 
 # ── StreamDestination ────────────────────────────────────────────

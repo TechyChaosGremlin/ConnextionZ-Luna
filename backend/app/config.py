@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     ffmpeg_path: str = Field(default="ffmpeg")
     ffmpeg_startup_timeout_seconds: float = Field(default=1.0, gt=0)
     ffmpeg_stop_timeout_seconds: float = Field(default=10.0, gt=0)
+    streaming_viewer_lease_seconds: int = Field(default=60, gt=0, le=3600)
     streaming_twitch_destination_url: SecretStr = Field(
         default=SecretStr("rtmp://127.0.0.1:1935/live/luna-twitch-test")
     )

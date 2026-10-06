@@ -53,13 +53,15 @@ class FollowRepository(BaseRepository[Follow]):
         await self.db.flush()
         return result.first() is not None
 
-    async def unfollow(self, follower_id: uuid.UUID, following_id: uuid.UUID) -> None:
-        await self.db.execute(
-            delete(Follow).where(
-                Follow.follower_id == follower_id, Follow.following_id == following_id
-            )
+    async def unfollow(self, follower_id: uuid.UUID, following_id: uuid.UUID) -> bool:
+        """Remove a follow relationship, returning whether this call removed it."""
+        result = await self.db.execute(
+            delete(Follow)
+            .where(Follow.follower_id == follower_id, Follow.following_id == following_id)
+            .returning(Follow.id)
         )
         await self.db.flush()
+        return result.first() is not None
 
     async def get_following_ids(self, follower_id: uuid.UUID) -> list[uuid.UUID]:
         result = await self.db.execute(

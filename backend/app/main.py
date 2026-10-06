@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 import signal
+import math
 import time
 from typing import AsyncIterator
 
@@ -17,14 +18,26 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp
 
 from app.config import settings
 from app.errors import register_exception_handlers
+from app.rate_limits import (
+    AUTH_ENDPOINT_ACTIONS,
+    AUTH_ENDPOINT_LIMITS,
+    RATE_LIMIT_MESSAGE,
+    UPLOAD_REQUEST_ACTION,
+    UPLOAD_REQUEST_LIMITS,
+    ActionRateLimitExceeded,
+    ActionRateLimiter,
+    client_identity,
+)
 from app.logging_config import configure_logging, RequestIDMiddleware
 from app.db.session import async_session_factory
 from app.db.session import check_db_connection
 from api.graphql import create_graphql_router
 from features.auth.router import router as auth_router
+from features.auth.jwt import ACCESS_TOKEN_TYPE, JWTError, REFRESH_TOKEN_TYPE, decode_token
 from features.media.router import router as media_router
 from features.streaming.router import router as streaming_router
 from features.streaming.service import stream_manager
@@ -38,10 +51,12 @@ shutdown_event = None
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Simple in-memory per-IP rate limiter for production-safe API protection."""
 
-    def __init__(self, app: FastAPI, requests_per_minute: int = 60):
+    def __init__(self, app: ASGIApp, requests_per_minute: int = 60):
         super().__init__(app)
         self.requests_per_minute = max(1, requests_per_minute)
         self._history: dict[str, deque[float]] = defaultdict(deque)
+        self.auth_action_limiter = ActionRateLimiter(AUTH_ENDPOINT_LIMITS)
+        self.upload_action_limiter = ActionRateLimiter(UPLOAD_REQUEST_LIMITS)
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in {"/health", "/health/live", "/health/ready"}:
@@ -57,19 +72,74 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if len(bucket) >= self.requests_per_minute:
             return JSONResponse(
                 status_code=429,
+                headers={"Retry-After": str(max(1, math.ceil(bucket[0] + 60 - now)))},
                 content={
                     "error": {
                         "code": "TOO_MANY_REQUESTS",
-                        "message": "Too many requests. Please slow down and try again later.",
+                        "message": RATE_LIMIT_MESSAGE,
                     }
                 },
             )
 
         bucket.append(now)
+        auth_action = AUTH_ENDPOINT_ACTIONS.get(request.url.path)
+        if request.method == "POST" and auth_action is not None:
+            try:
+                self.auth_action_limiter.consume(
+                    client_identity(None, client_ip),
+                    {auth_action: 1},
+                )
+            except ActionRateLimitExceeded as exc:
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": str(exc.retry_after)},
+                    content={
+                        "error": {
+                            "code": "TOO_MANY_REQUESTS",
+                            "message": RATE_LIMIT_MESSAGE,
+                        }
+                    },
+                )
+
+        if request.method == "POST" and _is_media_post_upload(request.url.path):
+            try:
+                self.upload_action_limiter.consume(
+                    _upload_client_identity(request, client_ip),
+                    {UPLOAD_REQUEST_ACTION: 1},
+                )
+            except ActionRateLimitExceeded as exc:
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": str(exc.retry_after)},
+                    content={
+                        "error": {
+                            "code": "TOO_MANY_REQUESTS",
+                            "message": RATE_LIMIT_MESSAGE,
+                        }
+                    },
+                )
+
         response = await call_next(request)
         response.headers["X-RateLimit-Limit"] = str(self.requests_per_minute)
         response.headers["X-RateLimit-Remaining"] = str(max(0, self.requests_per_minute - len(bucket)))
         return response
+
+
+def _is_media_post_upload(path: str) -> bool:
+    parts = path.strip("/").split("/")
+    return len(parts) == 3 and parts[:2] == ["media", "posts"] and bool(parts[2])
+
+
+def _upload_client_identity(request: Request, client_ip: str) -> tuple[str, str]:
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        try:
+            payload = decode_token(authorization[len("Bearer ") :])
+        except JWTError:
+            payload = {}
+        if payload.get("type") in {ACCESS_TOKEN_TYPE, REFRESH_TOKEN_TYPE} and payload.get("sub"):
+            return client_identity(str(payload["sub"]), client_ip)
+    return client_identity(None, client_ip)
 
 
 @asynccontextmanager

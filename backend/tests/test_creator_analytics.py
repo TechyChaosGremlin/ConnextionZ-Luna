@@ -18,15 +18,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from api.graphql import AppContext, _creator_analytics, _creator_video_analytics, _post_analytics, schema
 from app.models.collaboration import CollaborationStatus
 from app.models.analytics import EventType, SignalType
+from app.models.streaming import StreamPlatform, StreamSessionStatus
 from repositories.analytics_repository import AnalyticsRepository
 from repositories.analytics_event_repository import AnalyticsEventRepository
+from repositories.stream_session_repository import StreamSessionRepository
 from services.creator_analytics_service import CreatorAnalyticsService
 
 
@@ -159,6 +161,34 @@ async def test_unique_commenters_aggregate_counts_distinct_users():
     assert "JOIN posts ON comments.post_id = posts.id" in statement
 
 
+@pytest.mark.asyncio
+async def test_stream_repository_limits_duration_input_to_ended_sessions():
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=MagicMock())
+    db.execute.return_value.scalars.return_value.all.return_value = []
+    creator_id = uuid.uuid4()
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 31, tzinfo=timezone.utc)
+
+    await StreamSessionRepository(db).get_ended_for_owner_in_period(
+        creator_id, start, end
+    )
+
+    statement = db.execute.await_args.args[0]
+    sql = str(statement)
+    params = statement.compile().params
+    assert "stream_sessions.owner_id =" in sql
+    assert "stream_sessions.status =" in sql
+    assert "stream_sessions.started_at IS NOT NULL" in sql
+    assert "stream_sessions.ended_at IS NOT NULL" in sql
+    assert "stream_sessions.ended_at >=" in sql
+    assert "stream_sessions.ended_at <=" in sql
+    assert creator_id in params.values()
+    assert StreamSessionStatus.ENDED in params.values()
+    assert start in params.values()
+    assert end in params.values()
+
+
 class TestCreatorAnalytics:
     @pytest.fixture(autouse=True)
     def stub_unique_viewer_counts(self, monkeypatch):
@@ -185,6 +215,10 @@ class TestCreatorAnalytics:
             AsyncMock(return_value=0),
         )
         monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.counts_by_post",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
             AnalyticsEventRepository,
             "profile_viewer_counts_for_creator",
             AsyncMock(return_value={"total": 0, "unique_viewers": 0}),
@@ -197,6 +231,16 @@ class TestCreatorAnalytics:
         monkeypatch.setattr(
             "repositories.social_repository.FollowRepository.count_followers",
             AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            StreamSessionRepository,
+            "get_ended_for_owner_in_period",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            StreamSessionRepository,
+            "ended_destination_counts_for_owner_in_period",
+            AsyncMock(return_value=[]),
         )
 
     @pytest.mark.asyncio
@@ -282,6 +326,7 @@ class TestCreatorAnalytics:
             "active_collaborations": 1, "completed_collaborations": 1,
             "collaboration_acceptance_rate": 50.0, "collaboration_completion_rate": 33.333,
             "average_response_hours": 2.0, "collaboration_success_rate": 33.333,
+            "total_broadcast_duration": 5400.0,
         }
 
         async def fake_overview(self, requested_creator_id, start, end):
@@ -292,7 +337,7 @@ class TestCreatorAnalytics:
         monkeypatch.setattr("services.creator_analytics_service.CreatorAnalyticsService.overview", fake_overview)
         result = await _creator_analytics(ctx, period)
 
-        assert result.total_collaboration_requests == 6
+        assert result.total_broadcast_duration == pytest.approx(5400.0)
         assert result.pending_collaborations == 1
         assert result.accepted_collaborations == 3
         assert result.active_collaborations == 1
@@ -571,10 +616,170 @@ class TestCreatorAnalytics:
         assert overview["lost_followers"] == 1
         assert overview["follower_growth"] == 4
         assert overview["total_watch_time"] == 500.0
+        assert overview["total_broadcast_duration"] == 0.0
         assert overview["total_not_interested"] == 2
         assert overview["avg_watch_time"] == pytest.approx(500.0 / 25)
         assert overview["completion_rate"] == pytest.approx(10 / 25 * 100)
         assert len(overview["top_posts"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_broadcast_duration_for_ended_stream(self, monkeypatch):
+        creator_id = uuid.uuid4()
+        started_at = datetime(2026, 1, 3, 10, tzinfo=timezone.utc)
+        ended_at = datetime(2026, 1, 3, 11, 30, tzinfo=timezone.utc)
+
+        async def ended_sessions(self, requested_creator_id, start, end):
+            assert requested_creator_id == creator_id
+            return [SimpleNamespace(started_at=started_at, ended_at=ended_at)]
+
+        monkeypatch.setattr(
+            StreamSessionRepository, "get_ended_for_owner_in_period", ended_sessions
+        )
+        duration = await CreatorAnalyticsService(AsyncMock())._total_broadcast_duration(
+            creator_id,
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 31, tzinfo=timezone.utc),
+        )
+
+        assert duration == pytest.approx(5400.0)
+
+    @pytest.mark.asyncio
+    async def test_broadcast_duration_sums_multiple_streams(self, monkeypatch):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        sessions = [
+            SimpleNamespace(
+                started_at=datetime(2026, 1, 3, 10, tzinfo=timezone.utc),
+                ended_at=datetime(2026, 1, 3, 10, 45, tzinfo=timezone.utc),
+            ),
+            SimpleNamespace(
+                started_at=datetime(2026, 1, 8, 14, tzinfo=timezone.utc),
+                ended_at=datetime(2026, 1, 8, 15, 15, tzinfo=timezone.utc),
+            ),
+        ]
+
+        async def ended_sessions(self, requested_creator_id, period_start, period_end):
+            assert requested_creator_id == creator_id
+            return sessions
+
+        monkeypatch.setattr(
+            StreamSessionRepository, "get_ended_for_owner_in_period", ended_sessions
+        )
+        duration = await CreatorAnalyticsService(AsyncMock())._total_broadcast_duration(
+            creator_id, start, datetime(2026, 1, 31, tzinfo=timezone.utc)
+        )
+
+        assert duration == pytest.approx(7200.0)
+
+    @pytest.mark.asyncio
+    async def test_broadcast_duration_ignores_stream_without_end_timestamp(self, monkeypatch):
+        creator_id = uuid.uuid4()
+
+        async def ended_sessions(self, requested_creator_id, start, end):
+            return [
+                SimpleNamespace(
+                    started_at=datetime(2026, 1, 3, 10, tzinfo=timezone.utc),
+                    ended_at=None,
+                )
+            ]
+
+        monkeypatch.setattr(
+            StreamSessionRepository, "get_ended_for_owner_in_period", ended_sessions
+        )
+        duration = await CreatorAnalyticsService(AsyncMock())._total_broadcast_duration(
+            creator_id,
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 31, tzinfo=timezone.utc),
+        )
+
+        assert duration == 0.0
+
+    @pytest.mark.asyncio
+    async def test_broadcast_duration_is_zero_when_creator_has_no_streams(self):
+        duration = await CreatorAnalyticsService(AsyncMock())._total_broadcast_duration(
+            uuid.uuid4(),
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 31, tzinfo=timezone.utc),
+        )
+
+        assert duration == 0.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_count", [0, 1, 3])
+    async def test_graphql_exposes_ended_stream_totals(self, monkeypatch, session_count):
+        creator_id = uuid.uuid4()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        sessions = [
+            SimpleNamespace(
+                started_at=start + timedelta(days=index),
+                ended_at=start + timedelta(days=index, hours=1),
+            )
+            for index in range(session_count)
+        ]
+        ended_sessions = AsyncMock(return_value=sessions)
+        breakdown = (
+            [{"platform": StreamPlatform.TWITCH, "ended_sessions": session_count}]
+            if session_count else []
+        )
+        destination_counts = AsyncMock(return_value=breakdown)
+        monkeypatch.setattr(
+            StreamSessionRepository,
+            "ended_destination_counts_for_owner_in_period",
+            destination_counts,
+        )
+        monkeypatch.setattr(
+            StreamSessionRepository, "get_ended_for_owner_in_period", ended_sessions
+        )
+        monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+        monkeypatch.setattr(AnalyticsRepository, "signal_totals", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.count_for_creator",
+            AsyncMock(return_value=0),
+        )
+        monkeypatch.setattr(
+            "repositories.collaboration_repository.CollaborationRepository.get_for_user_in_period",
+            AsyncMock(return_value=[]),
+        )
+
+        result = await schema.execute(
+            '''{ creatorAnalytics(period: {
+                start: "2026-01-01T00:00:00+00:00", end: "2026-01-08T00:00:00+00:00"
+            }) { totalEndedStreamSessions totalBroadcastDuration
+                streamDestinationBreakdown { platform endedSessions } } }''',
+            context_value=AppContext(db=object(), current_user=SimpleNamespace(id=creator_id)),
+        )
+
+        assert result.errors is None
+        assert result.data == {
+            "creatorAnalytics": {
+                "totalEndedStreamSessions": session_count,
+                "totalBroadcastDuration": session_count * 3600.0,
+                "streamDestinationBreakdown": (
+                    [{"platform": "twitch", "endedSessions": session_count}]
+                    if session_count else []
+                ),
+            }
+        }
+        ended_sessions.assert_awaited_once_with(creator_id, start, end)
+        destination_counts.assert_awaited_once_with(creator_id, start, end)
+
+    @pytest.mark.asyncio
+    async def test_stream_totals_exclude_invalid_duration_inputs(self, monkeypatch):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            StreamSessionRepository, "get_ended_for_owner_in_period",
+            AsyncMock(return_value=[
+                SimpleNamespace(started_at=start, ended_at=None),
+                SimpleNamespace(started_at=None, ended_at=start),
+                SimpleNamespace(started_at=start, ended_at=start - timedelta(seconds=1)),
+                SimpleNamespace(started_at=start, ended_at=start),
+            ]),
+        )
+
+        assert await CreatorAnalyticsService(AsyncMock())._stream_session_totals(
+            uuid.uuid4(), start, start + timedelta(days=1)
+        ) == (1, 0.0)
 
     @pytest.mark.asyncio
     async def test_creator_service_compares_against_previous_period(self, monkeypatch):
@@ -1713,6 +1918,10 @@ class TestCreatorAnalytics:
         service = CreatorAnalyticsService(AsyncMock())
         start = datetime(2026, 4, 1, tzinfo=timezone.utc)
         end = datetime(2026, 4, 3, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.daily_counts_for_creator",
+            AsyncMock(return_value=[]),
+        )
 
         async def fake_daily_signal_totals(*args, **kwargs):
             return [{"date": "2026-04-02", "views": 5, "likes": 1, "comments": 0, "shares": 0, "saves": 0, "followers_gained": 1}]
@@ -1740,6 +1949,10 @@ class TestCreatorAnalytics:
         service = CreatorAnalyticsService(AsyncMock())
         start = datetime(2026, 4, 1, tzinfo=timezone.utc)
         end = datetime(2026, 4, 3, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            "repositories.content_repository.CommentRepository.daily_counts_for_creator",
+            AsyncMock(return_value=[]),
+        )
 
         async def fake_daily_signal_totals(*args, **kwargs):
             return []

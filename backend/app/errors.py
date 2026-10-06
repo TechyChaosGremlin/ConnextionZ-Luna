@@ -73,7 +73,7 @@ class ValidationError(AppError):
             code="VALIDATION_ERROR",
             message=message,
             details=details,
-            http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            http_status=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
 
@@ -155,11 +155,14 @@ def register_exception_handlers(app: FastAPI) -> None:
             status=exc.status_code,
             path=request.url.path,
         )
-        return _build_error_response(
+        response = _build_error_response(
             code=code,
             message=str(exc.detail),
             http_status=exc.status_code,
         )
+        if exc.headers:
+            response.headers.update(exc.headers)
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -183,7 +186,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             code="VALIDATION_ERROR",
             message="Request validation failed",
             details={"fields": field_errors},
-            http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            http_status=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
     @app.exception_handler(Exception)

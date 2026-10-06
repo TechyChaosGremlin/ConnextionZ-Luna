@@ -506,6 +506,11 @@ type Report {
 
 # ---- Analytics (Feature: Analytics Dashboard) ----
 
+type StreamDestinationAnalytics {
+  platform: String!
+  endedSessions: Int!
+}
+
 type AnalyticsSummary {
   periodStart: DateTime!
   periodEnd: DateTime!
@@ -542,6 +547,10 @@ type AnalyticsSummary {
   totalUploads: Int!
   totalPublishedVideos: Int!
   totalWatchTime: Float!
+  # Sum of broadcast seconds for ended streams in this period.
+  totalBroadcastDuration: Float!
+  totalEndedStreamSessions: Int!
+  streamDestinationBreakdown: [StreamDestinationAnalytics!]!
   avgWatchTime: Float
   completionRate: Float
   uniqueCompleters: Int!
@@ -1388,4 +1397,3 @@ type Mutation {
   """
   reportContent(input: ReportContentInput!): Report!
 }
-
