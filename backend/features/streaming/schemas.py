@@ -65,3 +65,31 @@ class ViewerSessionResponse(BaseModel):
     lease_expires_at: datetime
     left_at: datetime | None
     is_active: bool
+
+
+class StreamChatMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    body: str = Field(min_length=1, max_length=2000)
+
+
+class StreamChatMessageResponse(BaseModel):
+    id: uuid.UUID
+    stream_id: uuid.UUID
+    user_id: uuid.UUID
+    body: str
+    created_at: datetime
+
+
+class StreamSubscriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    creator_id: uuid.UUID
+
+
+class StreamSubscriptionResponse(BaseModel):
+    id: uuid.UUID
+    stream_id: uuid.UUID
+    user_id: uuid.UUID
+    creator_id: uuid.UUID
+    created_at: datetime

@@ -25,6 +25,11 @@ class StreamDestinationCount(TypedDict):
     ended_sessions: int
 
 
+class StreamSessionStatusCount(TypedDict):
+    status: StreamSessionStatus
+    sessions: int
+
+
 class StreamSessionRepository(BaseRepository[StreamSession]):
     def __init__(self, db: AsyncSession) -> None:
         super().__init__(db, StreamSession)
@@ -56,9 +61,42 @@ class StreamSessionRepository(BaseRepository[StreamSession]):
         )
         return list(result.scalars().all())
 
+    async def get_active_for_owner_at(
+        self, owner_id: uuid.UUID, stream_id: uuid.UUID, at: datetime
+    ) -> StreamSession | None:
+        result = await self.db.execute(
+            select(StreamSession).where(
+                StreamSession.id == stream_id,
+                StreamSession.owner_id == owner_id,
+                StreamSession.status == StreamSessionStatus.ACTIVE,
+                StreamSession.started_at.is_not(None),
+                StreamSession.started_at <= at,
+                (StreamSession.ended_at.is_(None) | (StreamSession.ended_at > at)),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_active_for_owner_at_point(
+        self, owner_id: uuid.UUID, at: datetime
+    ) -> list[StreamSession]:
+        result = await self.db.execute(
+            select(StreamSession)
+            .where(
+                StreamSession.owner_id == owner_id,
+                StreamSession.status == StreamSessionStatus.ACTIVE,
+                StreamSession.started_at.is_not(None),
+                StreamSession.started_at <= at,
+                (StreamSession.ended_at.is_(None) | (StreamSession.ended_at > at)),
+            )
+            .order_by(StreamSession.started_at.desc())
+        )
+        return list(result.scalars().all())
+
     async def get_ended_for_owner_in_period(
         self, owner_id: uuid.UUID, start: datetime, end: datetime
     ) -> list[StreamSession]:
+        if end <= start:
+            raise ValueError("Reporting end must be after reporting start")
         result = await self.db.execute(
             select(StreamSession).where(
                 StreamSession.owner_id == owner_id,
@@ -66,10 +104,33 @@ class StreamSessionRepository(BaseRepository[StreamSession]):
                 StreamSession.started_at.is_not(None),
                 StreamSession.ended_at.is_not(None),
                 StreamSession.ended_at >= start,
-                StreamSession.ended_at <= end,
+                StreamSession.ended_at < end,
             )
         )
         return list(result.scalars().all())
+
+    async def status_counts_for_owner_created_in_period(
+        self, owner_id: uuid.UUID, start: datetime, end: datetime
+    ) -> list[StreamSessionStatusCount]:
+        """Snapshot current statuses for sessions created in [start, end)."""
+        if end <= start:
+            raise ValueError("Reporting end must be after reporting start")
+        result = await self.db.execute(
+            select(StreamSession.status, func.count(StreamSession.id).label("sessions"))
+            .where(
+                StreamSession.owner_id == owner_id,
+                StreamSession.created_at >= start,
+                StreamSession.created_at < end,
+            )
+            .group_by(StreamSession.status)
+        )
+        counts = {status: 0 for status in StreamSessionStatus}
+        for row in result.all():
+            counts[row.status] = int(row.sessions)
+        return [
+            {"status": status, "sessions": counts[status]}
+            for status in StreamSessionStatus
+        ]
 
     async def get_for_owner(self, owner_id: uuid.UUID) -> list[StreamSession]:
         result = await self.db.execute(
@@ -83,6 +144,8 @@ class StreamSessionRepository(BaseRepository[StreamSession]):
     async def ended_destination_counts_for_owner_in_period(
         self, owner_id: uuid.UUID, start: datetime, end: datetime
     ) -> list[StreamDestinationCount]:
+        if end <= start:
+            raise ValueError("Reporting end must be after reporting start")
         result = await self.db.execute(
             select(
                 StreamDestination.platform,
@@ -95,7 +158,7 @@ class StreamSessionRepository(BaseRepository[StreamSession]):
                 StreamSession.started_at.is_not(None),
                 StreamSession.ended_at.is_not(None),
                 StreamSession.ended_at >= start,
-                StreamSession.ended_at <= end,
+                StreamSession.ended_at < end,
                 StreamSession.ended_at >= StreamSession.started_at,
             )
             .group_by(StreamDestination.platform)

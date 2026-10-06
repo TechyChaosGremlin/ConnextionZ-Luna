@@ -2,6 +2,9 @@
 
 Uses ``InteractionSignal`` (via ``AnalyticsRepository``) as the source of truth
 for engagement signals, complemented by ``Post`` and ``Comment`` queries.
+Streaming audience metrics use persisted Luna viewing intervals for ended
+broadcasts, separately from post viewers/watch time. Current concurrency remains
+derived from persisted active sessions and viewer leases.
 """
 
 from __future__ import annotations
@@ -15,11 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.analytics import EventType, SignalType
 from app.models.collaboration import CollaborationStatus
 from app.models.content import ContentStatus, Post
+from app.models.streaming import StreamSession
 from repositories.analytics_repository import AnalyticsRepository
 from repositories.analytics_event_repository import AnalyticsEventRepository
 from repositories.collaboration_repository import CollaborationRepository
 from repositories.content_repository import CommentRepository
 from repositories.stream_session_repository import StreamSessionRepository
+from repositories.stream_chat_repository import StreamChatRepository
+from repositories.stream_subscription_repository import StreamSubscriptionRepository
+from repositories.stream_viewer_session_repository import StreamViewerSessionRepository
 
 
 class CreatorAnalyticsService:
@@ -160,21 +167,78 @@ class CreatorAnalyticsService:
     async def _stream_session_totals(
         self, creator_id: uuid.UUID, start: datetime, end: datetime
     ) -> tuple[int, float]:
+        sessions = await self._qualifying_stream_sessions(creator_id, start, end)
+        return len(sessions), self._broadcast_duration(sessions)
+
+    @classmethod
+    def _broadcast_duration(cls, sessions: list[StreamSession]) -> float:
+        duration_seconds = 0.0
+        for session in sessions:
+            started_at = cls._parse_timestamp(session.started_at)
+            ended_at = cls._parse_timestamp(session.ended_at)
+            if started_at is not None and ended_at is not None:
+                duration_seconds += (ended_at - started_at).total_seconds()
+        return duration_seconds
+
+    async def _qualifying_stream_sessions(
+        self, creator_id: uuid.UUID, start: datetime, end: datetime
+    ) -> list[StreamSession]:
         sessions = await StreamSessionRepository(self.db).get_ended_for_owner_in_period(
             creator_id, start, end
         )
-        ended_sessions = 0
-        duration_seconds = 0.0
+        qualifying: list[StreamSession] = []
         for session in sessions:
             started_at = self._parse_timestamp(session.started_at)
             ended_at = self._parse_timestamp(session.ended_at)
             if started_at is None or ended_at is None:
                 continue
-            duration = (ended_at - started_at).total_seconds()
-            if duration >= 0:
-                ended_sessions += 1
-                duration_seconds += duration
-        return ended_sessions, duration_seconds
+            if ended_at >= started_at:
+                qualifying.append(session)
+        return qualifying
+
+    async def _stream_audience_totals(
+        self, sessions: list[StreamSession], start: datetime, end: datetime
+    ) -> dict:
+        """Use the existing ended-broadcast scope and clip audience time to [start, end).
+
+        Per-stream counts cannot deduplicate viewers across broadcasts. Reuse the
+        repository's effective intervals for identities so lease, leave, stream,
+        and reporting boundaries stay identical to its aggregation methods.
+        Watch time is audience-seconds, unioning tabs/devices within each broadcast
+        before summing broadcasts. Peak concurrency is the maximum broadcast peak,
+        not their sum. Empty audiences return zero counts and 0.0 seconds.
+        """
+        repository = StreamViewerSessionRepository(self.db)
+        viewers: set[uuid.UUID] = set()
+        watch_seconds = 0.0
+        peak_viewers = 0
+        for session in sessions:
+            intervals = await repository._effective_intervals(session.id, start, end)
+            viewers.update(user_id for user_id, _, _ in intervals)
+            watch_seconds += await repository.total_watch_duration(session.id, start, end)
+            peak_viewers = max(
+                peak_viewers,
+                await repository.peak_concurrent_viewers(session.id, start, end),
+            )
+        return {
+            "unique_stream_viewers": len(viewers),
+            "total_stream_watch_time": watch_seconds,
+            "peak_concurrent_stream_viewers": peak_viewers,
+        }
+
+    async def _current_stream_totals(self, creator_id: uuid.UUID) -> dict[str, int]:
+        now = datetime.now(timezone.utc)
+        sessions = await StreamSessionRepository(self.db).get_active_for_owner_at_point(
+            creator_id, now
+        )
+        viewer_repository = StreamViewerSessionRepository(self.db)
+        current_viewers = 0
+        for session in sessions:
+            current_viewers += await viewer_repository.count_current_viewers(session.id, now)
+        return {
+            "current_active_stream_sessions": len(sessions),
+            "current_concurrent_stream_viewers": current_viewers,
+        }
 
     async def _collaboration_totals(
         self, creator_id: uuid.UUID, start: datetime, end: datetime
@@ -227,12 +291,26 @@ class CreatorAnalyticsService:
     async def overview(self, creator_id: uuid.UUID, start: datetime, end: datetime) -> dict:
         posts = await self._posts(creator_id)
         current = await self._period_totals(creator_id, start, end)
-        total_ended_stream_sessions, total_broadcast_duration = await self._stream_session_totals(
+        stream_sessions = await self._qualifying_stream_sessions(creator_id, start, end)
+        total_ended_stream_sessions = len(stream_sessions)
+        total_broadcast_duration = self._broadcast_duration(stream_sessions)
+        stream_audience = await self._stream_audience_totals(stream_sessions, start, end)
+        stream_repository = StreamSessionRepository(self.db)
+        stream_destination_breakdown = await stream_repository.ended_destination_counts_for_owner_in_period(
             creator_id, start, end
         )
-        stream_destination_breakdown = await StreamSessionRepository(
+        stream_session_status_breakdown = (
+            await stream_repository.status_counts_for_owner_created_in_period(
+                creator_id, start, end
+            )
+        )
+        current_stream_totals = await self._current_stream_totals(creator_id)
+        stream_chat_totals = await StreamChatRepository(self.db).creator_chat_totals(
+            creator_id=creator_id, start=start, end=end
+        )
+        stream_subscription_totals = await StreamSubscriptionRepository(
             self.db
-        ).ended_destination_counts_for_owner_in_period(creator_id, start, end)
+        ).creator_subscription_totals(creator_id=creator_id, start=start, end=end)
         period_length = end - start
         previous = await self._period_totals(creator_id, start - period_length, start)
         try:
@@ -277,6 +355,9 @@ class CreatorAnalyticsService:
         from repositories.social_repository import FollowRepository
 
         current_followers = await FollowRepository(self.db).count_followers(creator_id)
+        stream_follow_totals = await self.analytics_repo.creator_stream_follow_totals(
+            creator_id=creator_id, start=start, end=end
+        )
 
         top_video_perf = await self.video_performance(creator_id, start, end)
         top_video_perf.sort(key=lambda item: item["engagement_rate"], reverse=True)
@@ -328,6 +409,12 @@ class CreatorAnalyticsService:
             "total_broadcast_duration": total_broadcast_duration,
             "total_ended_stream_sessions": total_ended_stream_sessions,
             "stream_destination_breakdown": stream_destination_breakdown,
+            "stream_session_status_breakdown": stream_session_status_breakdown,
+            **stream_follow_totals,
+            **stream_chat_totals,
+            **stream_subscription_totals,
+            **current_stream_totals,
+            **stream_audience,
             "avg_watch_time": current["avg_watch_time"],
             "total_completions": current["completions"],
             "completion_rate": current["completion_rate"],
@@ -344,15 +431,15 @@ class CreatorAnalyticsService:
                 else None
             ),
             "unique_new_followers": unique_actor_counts.get(SignalType.FOLLOW, 0),
-            "unique_not_interested_users": unique_actor_counts.get(
-                SignalType.NOT_INTERESTED, 0
-            ),
+            "unique_not_interested_users": unique_actor_counts.get(SignalType.NOT_INTERESTED, 0),
             "engagement_rate": current["engagement_rate"],
             "views_growth_pct": self._growth_pct(current["views"], previous["views"]),
             "likes_growth_pct": self._growth_pct(current["likes"], previous["likes"]),
             "comments_growth_pct": self._growth_pct(current["comments"], previous["comments"]),
             "shares_growth_pct": self._growth_pct(current["shares"], previous["shares"]),
-            "followers_growth_pct": self._growth_pct(current["new_followers"], previous["new_followers"]),
+            "followers_growth_pct": self._growth_pct(
+                current["new_followers"], previous["new_followers"]
+            ),
             **collaborations,
             "top_posts": top_video_perf[:5],
         }

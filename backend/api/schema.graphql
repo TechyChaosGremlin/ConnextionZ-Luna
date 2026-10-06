@@ -511,6 +511,11 @@ type StreamDestinationAnalytics {
   endedSessions: Int!
 }
 
+type StreamSessionStatusAnalytics {
+  status: String!
+  sessions: Int!
+}
+
 type AnalyticsSummary {
   periodStart: DateTime!
   periodEnd: DateTime!
@@ -550,6 +555,21 @@ type AnalyticsSummary {
   # Sum of broadcast seconds for ended streams in this period.
   totalBroadcastDuration: Float!
   totalEndedStreamSessions: Int!
+  # Current status snapshot of sessions created during the reporting period.
+  streamSessionStatusBreakdown: [StreamSessionStatusAnalytics!]!
+  uniqueStreamViewers: Int!
+  totalStreamWatchTime: Float!
+  peakConcurrentStreamViewers: Int!
+  # Point-in-time values from persisted active sessions and viewer leases.
+  currentActiveStreamSessions: Int!
+  currentConcurrentStreamViewers: Int!
+  # FOLLOW signals explicitly attributed to a stream owned by this creator.
+  streamAttributedFollows: Int!
+  uniqueStreamFollowers: Int!
+  streamChatMessages: Int!
+  uniqueStreamChatters: Int!
+  streamSubscriptions: Int!
+  uniqueStreamSubscribers: Int!
   streamDestinationBreakdown: [StreamDestinationAnalytics!]!
   avgWatchTime: Float
   completionRate: Float

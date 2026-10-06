@@ -851,6 +851,12 @@ class StreamDestinationAnalyticsType:
 
 
 @strawberry.type
+class StreamSessionStatusAnalyticsType:
+    status: str
+    sessions: int
+
+
+@strawberry.type
 class AnalyticsSummaryType:
     period_start: DateTimeScalar
     period_end: DateTimeScalar
@@ -891,6 +897,20 @@ class AnalyticsSummaryType:
     total_watch_time: float = 0.0
     total_broadcast_duration: float = 0.0
     total_ended_stream_sessions: int = 0
+    stream_session_status_breakdown: list[StreamSessionStatusAnalyticsType] = strawberry.field(
+        default_factory=list
+    )
+    unique_stream_viewers: int = 0
+    total_stream_watch_time: float = 0.0
+    peak_concurrent_stream_viewers: int = 0
+    current_active_stream_sessions: int = 0
+    current_concurrent_stream_viewers: int = 0
+    stream_attributed_follows: int = 0
+    unique_stream_followers: int = 0
+    stream_chat_messages: int = 0
+    unique_stream_chatters: int = 0
+    stream_subscriptions: int = 0
+    unique_stream_subscribers: int = 0
     stream_destination_breakdown: list[StreamDestinationAnalyticsType] = strawberry.field(
         default_factory=list
     )
@@ -1853,9 +1873,14 @@ class Mutation:
         return await _delete_account(info.context)
 
     @strawberry.mutation
-    async def follow(self, info: StrawberryInfo[AppContext, None], username: str) -> FollowResultType:
+    async def follow(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        username: str,
+        stream_session_id: UUIDScalar | None = None,
+    ) -> FollowResultType:
         """Follow a creator by username."""
-        return await _follow(info.context, username)
+        return await _follow(info.context, username, stream_session_id)
 
     @strawberry.mutation
     async def unfollow(self, info: StrawberryInfo[AppContext, None], username: str) -> FollowResultType:
@@ -2102,8 +2127,6 @@ class Mutation:
     ) -> ReportType:
         """Report content or a user."""
         return await _report_content(info.context, input)
-
-
 
 
 # ── Auth Resolvers ───────────────────────────────────────────────────────────
@@ -4254,6 +4277,26 @@ async def _creator_analytics(ctx, period) -> AnalyticsSummaryType:
         total_watch_time=values.get("total_watch_time", 0.0),
         total_broadcast_duration=values.get("total_broadcast_duration", 0.0),
         total_ended_stream_sessions=values.get("total_ended_stream_sessions", 0),
+        stream_session_status_breakdown=[
+            StreamSessionStatusAnalyticsType(
+                status=row["status"].value,
+                sessions=row["sessions"],
+            )
+            for row in values.get("stream_session_status_breakdown", [])
+        ],
+        unique_stream_viewers=values.get("unique_stream_viewers", 0),
+        total_stream_watch_time=values.get("total_stream_watch_time", 0.0),
+        peak_concurrent_stream_viewers=values.get("peak_concurrent_stream_viewers", 0),
+        current_active_stream_sessions=values.get("current_active_stream_sessions", 0),
+        current_concurrent_stream_viewers=values.get(
+            "current_concurrent_stream_viewers", 0
+        ),
+        stream_attributed_follows=values.get("stream_attributed_follows", 0),
+        unique_stream_followers=values.get("unique_stream_followers", 0),
+        stream_chat_messages=values.get("stream_chat_messages", 0),
+        unique_stream_chatters=values.get("unique_stream_chatters", 0),
+        stream_subscriptions=values.get("stream_subscriptions", 0),
+        unique_stream_subscribers=values.get("unique_stream_subscribers", 0),
         stream_destination_breakdown=[
             StreamDestinationAnalyticsType(
                 platform=row["platform"].value,
@@ -6198,7 +6241,20 @@ async def _delete_account(ctx) -> bool:
     return True
 
 
-async def _follow(ctx, username) -> FollowResultType:
+async def _follow(ctx, username, stream_session_id: uuid.UUID | None = None) -> FollowResultType:
+    if stream_session_id is None:
+        return await _follow_creator(ctx, username)
+    try:
+        return await _follow_creator(ctx, username, stream_session_id)
+    finally:
+        # Release the parent lock even if authorization or the transaction fails.
+        # After a successful commit this is a no-op.
+        await ctx.db.rollback()
+
+
+async def _follow_creator(
+    ctx, username, stream_session_id: uuid.UUID | None = None
+) -> FollowResultType:
     from repositories.user_repository import UserRepository
     from repositories.social_repository import FollowRepository
     from repositories.profile_repository import ProfileRepository
@@ -6210,6 +6266,17 @@ async def _follow(ctx, username) -> FollowResultType:
     if target.id == user.id:
         raise ValueError("You cannot follow yourself")
 
+    creator_id = target.id
+    if stream_session_id is not None:
+        from repositories.stream_engagement_repository import StreamEngagementRepository
+
+        stream = await StreamEngagementRepository(ctx.db).authorize_follow(
+            stream_id=stream_session_id,
+            creator_id=target.id,
+            user_id=user.id,
+        )
+        creator_id = stream.owner_id
+
     follow_repo = FollowRepository(ctx.db)
     is_new_follow = await follow_repo.follow(user.id, target.id)
 
@@ -6219,13 +6286,17 @@ async def _follow(ctx, username) -> FollowResultType:
 
     if is_new_follow:
         await AnalyticsRepository(ctx.db).record(
-            user_id=user.id, creator_id=target.id, signal_type=SignalType.FOLLOW
+            user_id=user.id,
+            creator_id=creator_id,
+            signal_type=SignalType.FOLLOW,
+            stream_session_id=stream_session_id,
         )
         await AnalyticsEventService(ctx.db).track_event(
             event_type=EventType.FOLLOW_CREATED,
             user=user,
             target_user=target,
             session_id=ctx.session_id,
+            isolate_failure=stream_session_id is not None,
         )
 
     profile_repo = ProfileRepository(ctx.db)
@@ -6852,6 +6923,7 @@ class ConnextionZErrorExtension(SchemaExtension):
     them to structured GraphQL errors with proper extensions.
 
     Catches:
+    - AppError → application error code and status
     - PermissionError → UNAUTHENTICATED (401)
     - ValueError → VALIDATION_ERROR (400)
     - NotImplementedError → NOT_IMPLEMENTED (501)
@@ -6859,6 +6931,8 @@ class ConnextionZErrorExtension(SchemaExtension):
     """
 
     def on_execute(self):
+        from app.errors import AppError
+
         yield
         # After execution, check for errors and enrich them
         result = self.execution_context.result
@@ -6873,7 +6947,11 @@ class ConnextionZErrorExtension(SchemaExtension):
 
                 # Map Python exceptions to GraphQL error codes
                 original = error.original_error
-                if isinstance(original, PermissionError):
+                if isinstance(original, AppError):
+                    error.extensions = error.extensions or {}
+                    error.extensions["code"] = original.code
+                    error.extensions["statusCode"] = original.http_status
+                elif isinstance(original, PermissionError):
                     error.extensions = error.extensions or {}
                     error.extensions["code"] = "UNAUTHENTICATED"
                     error.extensions["statusCode"] = 401

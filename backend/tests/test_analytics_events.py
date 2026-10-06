@@ -43,6 +43,8 @@ from app.models.analytics import AnalyticsEvent, EventType, SignalType
 from app.models.social import Follow
 from app.models.user import AccountStatus, User, UserRole
 from repositories.analytics_repository import AnalyticsRepository
+from repositories.stream_engagement_repository import StreamEngagementRepository
+from app.errors import ForbiddenError
 from services.analytics_event_service import AnalyticsEventService
 
 
@@ -346,6 +348,78 @@ async def test_follow_created_event(spy_track_event, monkeypatch, created):
     )
     if created:
         assert spy_track_event[0]["target_user"] is target
+
+
+@pytest.mark.asyncio
+async def test_follow_from_active_creator_stream_records_stream_attribution(
+    spy_track_event, monkeypatch
+):
+    user = make_user("alice")
+    target = make_user("bob")
+    stream_id = uuid.uuid4()
+    ctx = make_ctx(user)
+    record = AsyncMock()
+
+    monkeypatch.setattr(
+        "repositories.user_repository.UserRepository.get_by_username",
+        AsyncMock(return_value=target),
+    )
+    monkeypatch.setattr(
+        StreamEngagementRepository,
+        "authorize_follow",
+        AsyncMock(return_value=SimpleNamespace(id=stream_id, owner_id=target.id)),
+    )
+    monkeypatch.setattr(
+        "repositories.social_repository.FollowRepository.follow",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(AnalyticsRepository, "record", record)
+    monkeypatch.setattr(
+        "repositories.social_repository.FollowRepository.count_followers",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        "repositories.social_repository.FollowRepository.count_following",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        "repositories.profile_repository.ProfileRepository.get_by_user_id",
+        AsyncMock(return_value=SimpleNamespace(follower_count=0, following_count=0)),
+    )
+    monkeypatch.setattr("api.graphql._notify", AsyncMock())
+
+    await _follow(ctx, target.username, stream_id)
+
+    record.assert_awaited_once_with(
+        user_id=user.id,
+        creator_id=target.id,
+        signal_type=SignalType.FOLLOW,
+        stream_session_id=stream_id,
+    )
+    assert [event["event_type"] for event in spy_track_event] == [EventType.FOLLOW_CREATED]
+
+
+@pytest.mark.asyncio
+async def test_follow_rejects_inactive_or_unowned_stream_attribution(monkeypatch):
+    user = make_user("alice")
+    target = make_user("bob")
+    stream_id = uuid.uuid4()
+    ctx = make_ctx(user)
+    follow = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "repositories.user_repository.UserRepository.get_by_username",
+        AsyncMock(return_value=target),
+    )
+    monkeypatch.setattr(
+        StreamEngagementRepository,
+        "authorize_follow",
+        AsyncMock(side_effect=ForbiddenError("Stream is not owned by the followed creator")),
+    )
+    monkeypatch.setattr("repositories.social_repository.FollowRepository.follow", follow)
+
+    with pytest.raises(ForbiddenError, match="not owned by the followed creator"):
+        await _follow(ctx, target.username, stream_id)
+    follow.assert_not_awaited()
 
 
 @pytest.mark.asyncio

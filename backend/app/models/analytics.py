@@ -16,7 +16,7 @@ from __future__ import annotations
 import enum
 import uuid
 
-from sqlalchemy import Enum, Float, ForeignKey, Index, Integer, String
+from sqlalchemy import CheckConstraint, Enum, Float, ForeignKey, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -51,6 +51,8 @@ class InteractionSignal(Base, TimestampMixin):
     can be computed without joining back to ``posts``.
     ``value`` carries the signal's magnitude where relevant (e.g. watched
     seconds for ``WATCH_DURATION``, 1.0 otherwise).
+    ``stream_session_id`` explicitly identifies the originating Luna broadcast
+    for creator-level FOLLOW transitions only; it is never inferred for posts.
     """
 
     __tablename__ = "interaction_signals"
@@ -58,16 +60,35 @@ class InteractionSignal(Base, TimestampMixin):
         Index("ix_interaction_signals_user_type", "user_id", "signal_type"),
         Index("ix_interaction_signals_post_type", "post_id", "signal_type"),
         Index("ix_interaction_signals_creator_type", "creator_id", "signal_type"),
+        Index("ix_interaction_signals_stream_type", "stream_session_id", "signal_type"),
+        Index(
+            "ix_interaction_signals_creator_stream_period",
+            "creator_id",
+            "created_at",
+            postgresql_where=text("stream_session_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "stream_session_id IS NULL OR (signal_type = 'follow' AND post_id IS NULL)",
+            name="ck_interaction_signals_stream_follow",
+        ),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     post_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=True, index=True
     )
     creator_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stream_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("stream_sessions.id", ondelete="SET NULL"),
+        nullable=True,
     )
     signal_type: Mapped[SignalType] = mapped_column(
         # values_callable persists the enum values ("view", ...) rather than

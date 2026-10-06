@@ -283,6 +283,7 @@ The authenticated streaming REST API has additional user-ID-based limits:
 | `POST /api/streams/{stream_id}/viewers/join` | 20 authenticated attempts per 60 seconds |
 | `POST /api/streams/{stream_id}/viewers/{viewer_session_id}/heartbeat` | 30 authenticated attempts per 60 seconds |
 | `POST /api/streams/{stream_id}/viewers/{viewer_session_id}/leave` | 20 authenticated attempts per 60 seconds |
+| `POST /api/streams/{stream_id}/subscriptions` | 20 authenticated attempts per 60 seconds |
 
 The minute start limit follows the existing GraphQL `startLiveStream` threshold.
 The hourly start budget, concurrent-session cap, and stop budget are conservative
@@ -313,6 +314,43 @@ like the global middleware; multiple workers/replicas do not share quota. Distri
 frequency-limit storage, WebSocket mutation limits, and other Week 5 limits remain
 follow-up work. The streaming concurrent-session cap is database-enforced and is
 shared across workers/replicas.
+
+### Stream-attributed follow action
+
+The existing GraphQL `follow(username, streamSessionId)` mutation uses the
+existing `follow` quota (20/user/60 seconds), including no-op retries and aliases.
+Rate-limit rejection is HTTP 429 with the standard body and `Retry-After`, before
+any mutation executes. No streaming REST engagement endpoint is added.
+
+Attribution requires an active, started, unfinalized `StreamSession` owned by the
+named creator and an authenticated caller with an unclosed, unexpired viewer
+lease on that exact stream. Missing streams, wrong owners, inactive lifecycle,
+and missing participation use the existing GraphQL error envelope with
+`NOT_FOUND` (404), `FORBIDDEN` (403), `CONFLICT` (409), and `FORBIDDEN` (403),
+respectively. Authentication and self-follow restrictions are unchanged.
+Only newly inserted canonical follow relationships emit attributed signals;
+retries cannot move an existing follow to another stream. No attribution is
+inferred from time, posts, or external-platform actions.
+
+Deploy pending migrations through `206` before enabling this reporting.
+See [creator analytics](./CREATOR_ANALYTICS.md#native-stream-follows).
+
+### Native stream subscription action
+
+After deploying revision `205`, `POST /api/streams/{stream_id}/subscriptions`
+accepts `{ "creator_id": "<UUID>" }`. It requires the existing active-user
+authentication dependency. The subscriber is always the authenticated user;
+extra fields such as `user_id`, client timestamps, and platform identifiers
+are rejected. The supplied recipient must own the persisted stream (403 on
+mismatch); missing streams return 404 and self-subscriptions return 403.
+
+Success returns HTTP 200 with `{ id, stream_id, user_id, creator_id, created_at }`.
+A repeated action by the same user on the same stream returns the original
+record. Database uniqueness and conflict-safe insertion enforce idempotency
+across workers. Retry attempts consume the existing streaming action quota.
+Archived streams are eligible; viewer presence and external destination accounts
+are not required. This endpoint records a native action, not a paid entitlement.
+See [creator analytics](./CREATOR_ANALYTICS.md#native-stream-subscriptions).
 
 ### Authenticated viewer presence
 

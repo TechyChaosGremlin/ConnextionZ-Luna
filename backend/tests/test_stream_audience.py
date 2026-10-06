@@ -1,4 +1,4 @@
-"""Authenticated viewer collection against isolated persisted streaming rows."""
+"""Authenticated viewer lifecycle and aggregation against persisted streaming rows."""
 
 from __future__ import annotations
 
@@ -729,3 +729,281 @@ def test_openapi_exposes_only_presence_contracts(harness):
     update_schema = schema["components"]["schemas"]["ViewerSessionUpdateRequest"]
     assert update_schema["properties"] == {}
     assert update_schema["additionalProperties"] is False
+
+
+async def persist_intervals(harness, intervals, *, stream_id=STREAM_ID, left_at=None):
+    """Persist (user, join seconds, lease seconds) relative to NOW."""
+    async with harness.sessions() as db:
+        repository = StreamViewerSessionRepository(db)
+        for user_id, joined, lease in intervals:
+            viewer = await repository.create_attempt(
+                stream_id=stream_id,
+                user_id=user_id,
+                client_session_id=uuid.uuid4(),
+                joined_at=NOW + timedelta(seconds=joined),
+                lease_expires_at=NOW + timedelta(seconds=lease),
+            )
+            if left_at is not None:
+                await repository.finalize(viewer, NOW + timedelta(seconds=left_at))
+        await db.commit()
+
+
+async def audience_totals(harness, start=NOW, end=NOW + timedelta(seconds=60)):
+    async with harness.sessions() as db:
+        repository = StreamViewerSessionRepository(db)
+        return (
+            await repository.count_unique_viewers(STREAM_ID, start, end),
+            await repository.total_watch_duration(STREAM_ID, start, end),
+            await repository.peak_concurrent_viewers(STREAM_ID, start, end),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "intervals, expected",
+    [
+        ([], (0, 0.0, 0)),
+        ([(VIEWER_A, 0, 10)], (1, 10.0, 1)),
+        ([(VIEWER_A, 0, 10), (VIEWER_B, 0, 10)], (2, 20.0, 2)),
+        ([(VIEWER_A, 0, 10), (VIEWER_A, 0, 10)], (1, 10.0, 1)),
+        ([(VIEWER_A, 0, 10), (VIEWER_A, 5, 15)], (1, 15.0, 1)),
+        ([(VIEWER_A, 0, 20), (VIEWER_A, 5, 10)], (1, 20.0, 1)),
+        ([(VIEWER_A, 0, 5), (VIEWER_A, 10, 15)], (1, 10.0, 1)),
+        (
+            [(VIEWER_A, 0, 5), (VIEWER_A, 10, 15), (VIEWER_B, 5, 10)],
+            (2, 15.0, 1),
+        ),
+        ([(VIEWER_A, 0, 5), (VIEWER_A, 5, 10)], (1, 10.0, 1)),
+        ([(VIEWER_A, 0, 5), (VIEWER_B, 5, 10)], (2, 10.0, 1)),
+        (
+            [(VIEWER_A, 0, 10), (VIEWER_A, 5, 15), (VIEWER_B, 7, 12),
+             (CREATOR, 10, 20)],
+            (3, 30.0, 3),
+        ),
+        # Reversed insertion order must not change merging or the sweep.
+        (
+            [(VIEWER_A, 10, 20), (VIEWER_A, 5, 15), (VIEWER_A, 0, 10),
+             (VIEWER_B, 3, 7), (VIEWER_B, 12, 17)],
+            (2, 29.0, 2),
+        ),
+        ([(VIEWER_A, 0.25, 1.75)], (1, 1.5, 1)),
+    ],
+    ids=[
+        "zero", "one", "unique-users", "identical-tabs", "overlap", "nested-tabs",
+        "gaps", "gap-does-not-inflate-peak", "adjacent-same-user",
+        "simultaneous-leave-join", "three-users-overlap",
+        "unsorted-overlap-and-gaps", "fractional-seconds",
+    ],
+)
+async def test_repository_audience_interval_union(harness, intervals, expected):
+    await persist_intervals(harness, intervals)
+    assert await audience_totals(harness) == expected
+
+
+@pytest.mark.asyncio
+async def test_repository_reporting_clips_before_union_and_excludes_boundary_touches(harness):
+    await persist_intervals(
+        harness,
+        [(VIEWER_A, -20, 15), (VIEWER_A, 10, 40), (VIEWER_B, 5, 25),
+         (CREATOR, 0, 10), (CREATOR, 20, 30)],
+    )
+    # The creator only touches the period; A's two tabs union to the full period.
+    assert await audience_totals(
+        harness, NOW + timedelta(seconds=10), NOW + timedelta(seconds=20)
+    ) == (2, 20.0, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [StreamSessionStatus.ACTIVE, StreamSessionStatus.ENDED])
+async def test_repository_stream_start_end_clipping(harness, status):
+    await persist_intervals(
+        harness,
+        [(VIEWER_A, -20, 40), (VIEWER_B, 10, 30), (CREATOR, -10, 5),
+         (CREATOR, 20, 30)],
+    )
+    await change_stream(
+        harness, status=status,
+        started_at=NOW + timedelta(seconds=5), ended_at=NOW + timedelta(seconds=20),
+    )
+    assert await audience_totals(harness) == (2, 25.0, 2)
+    async with harness.sessions() as db:
+        repository = StreamViewerSessionRepository(db)
+        assert await repository.count_current_viewers(
+            STREAM_ID, NOW + timedelta(seconds=10)
+        ) == (2 if status == StreamSessionStatus.ACTIVE else 0)
+        for second in (0, 20, 30):
+            assert await repository.count_current_viewers(
+                STREAM_ID, NOW + timedelta(seconds=second)
+            ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_at, expected", [(None, 10.0), (4, 4.0), (0, 0.0), (10, 10.0)])
+async def test_repository_expired_lease_and_explicit_leave(harness, left_at, expected):
+    await persist_intervals(harness, [(VIEWER_A, 0, 10)], left_at=left_at)
+    assert await audience_totals(harness) == (
+        int(expected > 0), expected, int(expected > 0)
+    )
+    async with harness.sessions() as db:
+        repository = StreamViewerSessionRepository(db)
+        boundary = left_at if left_at is not None else 10
+        assert await repository.count_current_viewers(
+            STREAM_ID, NOW + timedelta(seconds=boundary)
+        ) == 0
+        if boundary > 0:
+            assert await repository.count_current_viewers(
+                STREAM_ID, NOW + timedelta(seconds=boundary, microseconds=-1)
+            ) == 1
+        assert await repository.count_unique_viewers(
+            STREAM_ID, NOW + timedelta(seconds=10), NOW + timedelta(seconds=60)
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_repository_current_concurrency_distinct_users_and_half_open_boundaries(harness):
+    await persist_intervals(
+        harness, [(VIEWER_A, 0, 10), (VIEWER_A, 2, 12), (VIEWER_B, 5, 15)]
+    )
+    async with harness.sessions() as db:
+        repository = StreamViewerSessionRepository(db)
+        for second, expected in [(-1, 0), (0, 1), (2, 1), (5, 2), (10, 2), (12, 1), (15, 0)]:
+            assert await repository.count_current_viewers(
+                STREAM_ID, NOW + timedelta(seconds=second)
+            ) == expected
+    assert await audience_totals(harness) == (2, 22.0, 2)
+
+
+@pytest.mark.asyncio
+async def test_repository_current_simultaneous_leaves_and_joins(harness):
+    await persist_intervals(
+        harness,
+        [(VIEWER_A, 0, 5), (VIEWER_A, 5, 10), (VIEWER_B, 0, 5), (CREATOR, 5, 10)],
+    )
+    async with harness.sessions() as db:
+        assert await StreamViewerSessionRepository(db).count_current_viewers(
+            STREAM_ID, NOW + timedelta(seconds=5)
+        ) == 2
+    assert await audience_totals(harness) == (3, 20.0, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"status": StreamSessionStatus.PENDING},
+        {"status": StreamSessionStatus.FAILED},
+        {"started_at": None},
+        {"started_at": NOW + timedelta(seconds=20), "ended_at": NOW + timedelta(seconds=10)},
+        {"ended_at": NOW},
+        {"started_at": NOW + timedelta(seconds=60)},
+    ],
+    ids=["pending", "failed", "no-start", "inverted-stream", "ended-before-period", "future-start"],
+)
+async def test_repository_excludes_nonqualifying_parent_streams(harness, values):
+    await persist_intervals(harness, [(VIEWER_A, 0, 30)])
+    await change_stream(harness, **values)
+    assert await audience_totals(harness) == (0, 0.0, 0)
+    async with harness.sessions() as db:
+        assert await StreamViewerSessionRepository(db).count_current_viewers(
+            STREAM_ID, NOW + timedelta(seconds=5)
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_repository_scopes_all_metrics_to_parent_stream(harness):
+    await persist_intervals(harness, [(VIEWER_A, 0, 10)])
+    await persist_intervals(
+        harness, [(VIEWER_B, 0, 60), (CREATOR, 0, 60)], stream_id=OTHER_STREAM_ID
+    )
+    assert await audience_totals(harness) == (1, 10.0, 1)
+    async with harness.sessions() as db:
+        repository = StreamViewerSessionRepository(db)
+        assert await repository.count_current_viewers(STREAM_ID, NOW) == 1
+        missing_id = uuid.uuid4()
+        end = NOW + timedelta(seconds=60)
+        assert await repository.count_unique_viewers(missing_id, NOW, end) == 0
+        assert await repository.total_watch_duration(missing_id, NOW, end) == 0.0
+        assert await repository.peak_concurrent_viewers(missing_id, NOW, end) == 0
+        assert await repository.count_current_viewers(missing_id, NOW) == 0
+
+
+@pytest.mark.asyncio
+async def test_repository_zero_current_viewers(harness):
+    async with harness.sessions() as db:
+        assert await StreamViewerSessionRepository(db).count_current_viewers(STREAM_ID, NOW) == 0
+
+
+@pytest.mark.asyncio
+async def test_repository_normalizes_reporting_and_point_timezones(harness):
+    await persist_intervals(harness, [(VIEWER_A, 0, 10)])
+    offset = timezone(timedelta(hours=2))
+    for start in (NOW.replace(tzinfo=None), NOW.astimezone(offset)):
+        end = start + timedelta(seconds=10)
+        assert await audience_totals(harness, start, end) == (1, 10.0, 1)
+        async with harness.sessions() as db:
+            assert await StreamViewerSessionRepository(db).count_current_viewers(
+                STREAM_ID, start
+            ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["count_unique_viewers", "total_watch_duration", "peak_concurrent_viewers"]
+)
+@pytest.mark.parametrize("seconds", [0, -1])
+async def test_repository_rejects_invalid_reporting_period(method, seconds):
+    db = MagicMock()
+    db.execute = AsyncMock()
+    repository = StreamViewerSessionRepository(db)
+    with pytest.raises(ValueError, match="Reporting end must be after reporting start"):
+        await getattr(repository, method)(STREAM_ID, NOW, NOW + timedelta(seconds=seconds))
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["count_unique_viewers", "total_watch_duration",
+               "count_current_viewers", "peak_concurrent_viewers"]
+)
+async def test_repository_aggregation_does_not_hide_database_errors(method):
+    db = MagicMock()
+    db.execute = AsyncMock(side_effect=RuntimeError("Audience query failed"))
+    args = (STREAM_ID, NOW) if method == "count_current_viewers" else (
+        STREAM_ID, NOW, NOW + timedelta(seconds=60)
+    )
+    with pytest.raises(RuntimeError, match="Audience query failed"):
+        await getattr(StreamViewerSessionRepository(db), method)(*args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method", ["count_unique_viewers", "total_watch_duration",
+               "count_current_viewers", "peak_concurrent_viewers"]
+)
+async def test_repository_aggregation_queries_compile_for_postgres(method):
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=MagicMock())
+    db.execute.return_value.all.return_value = []
+    db.execute.return_value.scalar_one.return_value = 0
+    args = (STREAM_ID, NOW) if method == "count_current_viewers" else (
+        STREAM_ID, NOW, NOW + timedelta(seconds=60)
+    )
+    await getattr(StreamViewerSessionRepository(db), method)(*args)
+    statement = db.execute.call_args.args[0]
+    sql = str(statement.compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+    ))
+    assert str(STREAM_ID) in sql
+    assert "JOIN stream_sessions ON stream_sessions.id = stream_viewer_sessions.stream_session_id" in sql
+    assert "stream_viewer_sessions.lease_expires_at >" in sql
+    assert "stream_viewer_sessions.left_at IS NULL" in sql
+    assert "stream_sessions.started_at" in sql
+    assert "stream_sessions.ended_at IS NULL" in sql
+    assert "FOR UPDATE" not in sql
+    if method == "count_current_viewers":
+        assert "count(distinct(stream_viewer_sessions.user_id))" in sql
+        assert "stream_sessions.status = 'active'" in sql
+        assert "stream_viewer_sessions.joined_at <=" in sql
+    else:
+        assert "stream_sessions.status IN ('active', 'ended')" in sql
+        assert "stream_viewer_sessions.joined_at <" in sql

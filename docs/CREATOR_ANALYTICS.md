@@ -85,6 +85,82 @@ live audience metrics separate from video metrics, and preserve the existing
 ended-session period semantics. Unique users must be deduplicated across
 selected broadcasts; session peaks must not be summed.
 
+### Native stream follows
+
+`follow(username, streamSessionId)` is the existing creator-follow mutation,
+not a second stream event API. Attribution requires an authenticated user with
+an unclosed, unexpired viewer lease on that exact **active** Luna stream.
+The supplied username must identify `StreamSession.owner_id`; the server derives
+the signal's creator from that owner. Pending, ended, failed, future-started,
+and already-finalized streams are rejected. Self-follows remain prohibited.
+Ordinary follows without `streamSessionId` keep their existing behavior.
+
+`streamAttributedFollows` counts newly created canonical follow transitions
+explicitly linked to the creator's streams in **[start, end)**.
+`uniqueStreamFollowers` counts distinct actors across those same transitions,
+deduplicated across broadcasts and follow/unfollow/re-follow cycles.
+Both return zero with no activity. These are acquisition/activity counts, not
+current followers or stream subscriptions. The generic follower metrics retain
+their existing semantics; stream follows are a subset, never added twice.
+
+The canonical `uq_follow_pair` constraint and `INSERT ... ON CONFLICT DO NOTHING
+RETURNING` determine whether to emit a signal. Retrying a follow, or following
+while already following from another broadcast, emits no new signal and cannot
+reattribute an existing relationship. A genuine follow after an unfollow is a
+new transition. There is no timestamp-based inference or historical backfill.
+The existing GraphQL action limiter charges every executable `follow`, including
+aliases and no-op retries, at 20/user/minute; overflow uses HTTP 429 and
+`Retry-After`. No separate limiter is introduced.
+
+Migration `206` (parent `205`) restricts attributed signals to creator-level
+follows with no post association, and adds a partial creator/time index.
+Upgrade fails if existing rows violate that guard; it does not silently
+rewrite or delete historical events.
+Migration `203` already provides the StreamSession foreign key; stream deletion
+sets attribution to null and removes it from stream reporting. User deletion
+cascades signals. Reporting joins through stream ownership, bounds event time,
+and excludes ordinary follows and all post or external-platform engagement.
+Likes/unlikes, shares, and saves/unsaves remain **unsupported for streams**:
+their Luna write paths target posts, not broadcasts. Unfollow is creator-level
+and has no originating stream parameter, so it is not inferred as stream activity.
+
+Follow state and its canonical signal remain transactional, matching the
+existing architecture: a signal-write failure fails the follow transaction
+rather than acknowledging an untracked action. No stream manager, FFmpeg, stop,
+or lifecycle operation is called by attribution or reporting. The ancillary
+product `FOLLOW_CREATED` event uses a SAVEPOINT for attributed follows: its
+failure is logged without rolling back the canonical follow or stream signal.
+It is not a second stream-reporting source. Apply pending
+migrations before enabling these APIs; offline SQL validation is not deployment.
+
+### Native stream subscriptions
+
+Migration `205` (parent `204`) adds `stream_subscriptions`. Each row identifies
+a persisted Luna `StreamSession`, an authenticated subscriber (`user_id`), and
+the server-generated creation time. The receiving creator is derived through
+`StreamSession.owner_id`, not stored as an independent attribution.
+
+`streamSubscriptions` counts these rows created in **[start, end)**.
+`uniqueStreamSubscribers` counts distinct subscribers across all of the
+authenticated creator's streams in that same window. Both return zero for no
+activity, and neither includes follows, generic creator subscriptions, direct
+messages, GraphQL transport subscriptions, or external-platform subscriptions.
+These queries are independent of the ended-session broadcast reporting window.
+
+The native subscription action is unique per subscriber and broadcast; retries
+return the original row without changing its timestamp. The same subscriber
+may subscribe on multiple broadcasts, contributing multiple actions but only
+one unique subscriber per creator reporting window. Persisted broadcasts,
+including archived broadcasts, are eligible; the action does not require an
+active viewer lease. Self-subscription is rejected.
+
+This is a native stream-associated subscription action, **not** a payment,
+renewal, recurring billing entitlement, or subscriber balance. There is no
+billing/subscription lifecycle model in Luna to link yet. There is no historical
+backfill or inferred stream attribution. Hard deletion of the stream or user
+cascades to the records and removes their historical contribution. Apply
+migration `205` before serving the new write path or analytics queries.
+
 ## Collaboration metrics
 
 Collaboration metrics are calculated from non-deleted collaborations involving the authenticated creator and created within the requested period. The response includes total requests, proposed/pending, accepted or progressed (`accepted`, `in_progress`, or `completed`), declined, cancelled, active, and completed counts. Acceptance rate is accepted-or-progressed requests divided by total requests; completion rate is completed requests divided by accepted-or-progressed requests. Both rates are null when their denominator is zero.

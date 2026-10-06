@@ -4,6 +4,10 @@
 
 This guide explains how to install dependencies for the ConnextionZ platform using the improved setup scripts.
 
+The JWT backend uses Passlib 1.7.4 with `bcrypt>=4.1.0,<5`. Keep this constraint
+in both backend requirements files: bcrypt 5 rejects Passlib's backend compatibility
+probe, preventing even short valid passwords from being hashed.
+
 ## Quick Start
 
 ### Windows Users

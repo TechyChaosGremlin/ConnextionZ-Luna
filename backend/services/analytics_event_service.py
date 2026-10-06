@@ -7,8 +7,8 @@ instead of constructing ``AnalyticsEvent`` rows directly, so that:
 - event types are validated against the canonical ``EventType`` enum
 - nullable associations (user/post/target_user/session) are handled safely
 - a failure recording analytics NEVER breaks the primary user action
-- writes are isolated in their own transaction (SAVEPOINT) so a bad event
-  can't poison the caller's in-flight transaction
+- callers can opt into a SAVEPOINT so a bad event cannot poison the
+  caller's in-flight transaction (enabled for stream-attributed follows)
 
 Usage (mirrors the existing ``AnalyticsRepository(ctx.db).record(...)``
 call convention already used for recommendation signals)::
@@ -83,6 +83,7 @@ class AnalyticsEventService:
         session_id: str | None = None,
         duration_ms: int | None = None,
         metadata: dict | None = None,
+        isolate_failure: bool = False,
     ) -> AnalyticsEvent | None:
         """Record one analytics event. Returns the created row, or ``None``
         if the event was rejected as malformed or recording failed.
@@ -116,16 +117,15 @@ class AnalyticsEventService:
         )
 
         try:
-            # Recording failures are logged and swallowed here so a bad
-            # event never breaks the caller's primary action. This does not
-            # use a SAVEPOINT: the existing resolver test suite exercises
-            # ``ctx.db`` as a bare ``AsyncMock`` (no real transaction), and
-            # analytics writes participate in the same session/transaction
-            # as the primary action (committed together, same as the
-            # existing ``AnalyticsRepository.record`` signal writes).
-            await self._repo.create_event(event)
+            if isolate_failure:
+                async with self.db.begin_nested():
+                    await self._repo.create_event(event)
+            else:
+                await self._repo.create_event(event)
         except Exception:
-            logger.warning("analytics_event.record_failed", event_type=event_type.value, exc_info=True)
+            logger.warning(
+                "analytics_event.record_failed", event_type=event_type.value, exc_info=True
+            )
             return None
 
         return event

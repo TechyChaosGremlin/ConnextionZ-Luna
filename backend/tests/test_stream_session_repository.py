@@ -71,8 +71,8 @@ async def test_ended_stream_scope_and_duration_against_persisted_rows() -> None:
 
             db = SimpleNamespace(execute=AsyncMock(side_effect=execute))
             service = CreatorAnalyticsService(db)
-            assert await service._stream_session_totals(owner_id, start, end) == (2, 10800.0)
-            assert await service._total_broadcast_duration(owner_id, start, end) == 10800.0
+            assert await service._stream_session_totals(owner_id, start, end) == (1, 3600.0)
+            assert await service._total_broadcast_duration(owner_id, start, end) == 3600.0
             assert await service._stream_session_totals(uuid.uuid4(), start, end) == (0, 0.0)
     finally:
         engine.dispose()
@@ -132,7 +132,7 @@ async def test_ended_destination_breakdown_from_persisted_rows(
             })
 
     for index, platforms in enumerate(platforms_by_session):
-        ended_at = start if index == 0 else end
+        ended_at = start if index == 0 else end - timedelta(microseconds=1)
         add_session(owner_id, "ended", ended_at - timedelta(hours=1), ended_at, platforms)
     for status in ("pending", "active", "failed"):
         add_session(owner_id, status, start, end, ["youtube"])

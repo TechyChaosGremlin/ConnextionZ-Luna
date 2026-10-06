@@ -11,6 +11,7 @@ def test_streaming_openapi_exposes_required_operations() -> None:
     assert "get" in paths["/api/streams"]
     assert "get" in paths["/api/streams/{stream_id}"]
     assert "post" in paths["/api/streams/{stream_id}/stop"]
+    assert "post" in paths["/api/streams/{stream_id}/chat"]
 
 
 def test_start_contract_uses_input_source_and_platforms() -> None:

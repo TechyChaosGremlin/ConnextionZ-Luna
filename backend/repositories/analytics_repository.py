@@ -17,6 +17,7 @@ from sqlalchemy import func, literal, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.analytics import InteractionSignal, SignalType
+from app.models.streaming import StreamSession
 from repositories.base import BaseRepository
 from repositories.feed_ranking import ViewerPostSignals
 
@@ -37,12 +38,18 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
         creator_id: uuid.UUID,
         signal_type: SignalType,
         post_id: uuid.UUID | None = None,
+        stream_session_id: uuid.UUID | None = None,
         value: float = 1.0,
     ) -> InteractionSignal:
+        if stream_session_id is not None and (
+            signal_type != SignalType.FOLLOW or post_id is not None
+        ):
+            raise ValueError("Only creator follow signals can be attributed to a stream session")
         signal = InteractionSignal(
             user_id=user_id,
             post_id=post_id,
             creator_id=creator_id,
+            stream_session_id=stream_session_id,
             signal_type=signal_type,
             value=value,
         )
@@ -203,6 +210,45 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
         )
         result = await self.db.execute(stmt)
         return int(result.scalar_one() or 0)
+
+    async def stream_attributed_follow_count(
+        self, *, creator_id: uuid.UUID, start: datetime, end: datetime
+    ) -> int:
+        """Count follow events attributed to this creator's own streams in [start, end)."""
+        totals = await self.creator_stream_follow_totals(
+            creator_id=creator_id, start=start, end=end
+        )
+        return totals["stream_attributed_follows"]
+
+    async def creator_stream_follow_totals(
+        self, *, creator_id: uuid.UUID, start: datetime, end: datetime
+    ) -> dict[str, int]:
+        """Count persisted transitions and distinct actors across a creator's streams."""
+        if end <= start:
+            raise ValueError("Reporting end must be after reporting start")
+        stmt = (
+            select(
+                func.count().label("follows"),
+                func.count(func.distinct(InteractionSignal.user_id)).label("followers"),
+            )
+            .select_from(InteractionSignal)
+            .join(StreamSession, StreamSession.id == InteractionSignal.stream_session_id)
+            .where(
+                InteractionSignal.creator_id == creator_id,
+                InteractionSignal.signal_type == SignalType.FOLLOW,
+                InteractionSignal.post_id.is_(None),
+                InteractionSignal.stream_session_id.is_not(None),
+                StreamSession.owner_id == creator_id,
+                InteractionSignal.created_at >= start,
+                InteractionSignal.created_at < end,
+            )
+        )
+        result = await self.db.execute(stmt)
+        row = result.one()
+        return {
+            "stream_attributed_follows": int(row.follows or 0),
+            "unique_stream_followers": int(row.followers or 0),
+        }
 
     async def unique_signal_actor_counts(
         self,

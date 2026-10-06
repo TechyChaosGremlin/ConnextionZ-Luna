@@ -57,6 +57,8 @@ STREAM_STOP_ACTION = "stream_stop"
 STREAM_VIEWER_JOIN_ACTION = "stream_viewer_join"
 STREAM_VIEWER_HEARTBEAT_ACTION = "stream_viewer_heartbeat"
 STREAM_VIEWER_LEAVE_ACTION = "stream_viewer_leave"
+STREAM_CHAT_SEND_ACTION = "stream_chat_send"
+STREAM_SUBSCRIBE_ACTION = "stream_subscribe"
 STREAM_CONCURRENT_RETRY_SECONDS = 60
 STREAM_ACTION_LIMITS = MappingProxyType(
     {
@@ -71,6 +73,8 @@ STREAM_VIEWER_ACTION_LIMITS = MappingProxyType(
         STREAM_VIEWER_JOIN_ACTION: ActionLimit(20),
         STREAM_VIEWER_HEARTBEAT_ACTION: ActionLimit(30),
         STREAM_VIEWER_LEAVE_ACTION: ActionLimit(20),
+        STREAM_CHAT_SEND_ACTION: ActionLimit(20),
+        STREAM_SUBSCRIBE_ACTION: ActionLimit(20),
     }
 )
 

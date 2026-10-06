@@ -7,10 +7,12 @@ Covers:
 - Follower growth, likes/shares (signal-based) and comments (join-based) totals
 - Engagement rate calculation and top-post ranking
 - Per-post analytics (avg watch time, completion rate)
+- Creator streaming audience metrics from persisted SQLite viewing intervals
 
 Follows the pattern established in test_social_interactions.py: resolvers are
 called directly with a lightweight AppContext, and repository methods are
-monkeypatched so no real (Postgres-only) database is required.
+monkeypatched so no real (Postgres-only) database is required. Streaming service
+tests use the real streaming repositories against isolated SQLite tables.
 """
 
 from __future__ import annotations
@@ -21,14 +23,28 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from sqlalchemy import Column, MetaData, Table, Uuid, event, select
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.graphql import AppContext, _creator_analytics, _creator_video_analytics, _post_analytics, schema
 from app.models.collaboration import CollaborationStatus
-from app.models.analytics import EventType, SignalType
-from app.models.streaming import StreamPlatform, StreamSessionStatus
+from app.models.analytics import EventType, InteractionSignal, SignalType
+from app.models.streaming import (
+    StreamChatMessage,
+    StreamDestination,
+    StreamDestinationStatus,
+    StreamPlatform,
+    StreamSession,
+    StreamSessionStatus,
+    StreamSubscription,
+    StreamViewerSession,
+)
 from repositories.analytics_repository import AnalyticsRepository
 from repositories.analytics_event_repository import AnalyticsEventRepository
 from repositories.stream_session_repository import StreamSessionRepository
+from repositories.stream_viewer_session_repository import StreamViewerSessionRepository
 from services.creator_analytics_service import CreatorAnalyticsService
 
 
@@ -182,11 +198,70 @@ async def test_stream_repository_limits_duration_input_to_ended_sessions():
     assert "stream_sessions.started_at IS NOT NULL" in sql
     assert "stream_sessions.ended_at IS NOT NULL" in sql
     assert "stream_sessions.ended_at >=" in sql
-    assert "stream_sessions.ended_at <=" in sql
+    assert "stream_sessions.ended_at <" in sql
     assert creator_id in params.values()
     assert StreamSessionStatus.ENDED in params.values()
     assert start in params.values()
     assert end in params.values()
+
+
+@pytest.mark.asyncio
+async def test_stream_status_counts_use_created_at_half_open_period():
+    db = MagicMock()
+    db.execute = AsyncMock(
+        return_value=SimpleNamespace(
+            all=lambda: [
+                SimpleNamespace(status=StreamSessionStatus.ENDED, sessions=2),
+                SimpleNamespace(status=StreamSessionStatus.FAILED, sessions=1),
+            ]
+        )
+    )
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+    creator_id = uuid.uuid4()
+
+    result = await StreamSessionRepository(db).status_counts_for_owner_created_in_period(
+        creator_id, start, end
+    )
+
+    assert result == [
+        {"status": StreamSessionStatus.PENDING, "sessions": 0},
+        {"status": StreamSessionStatus.ACTIVE, "sessions": 0},
+        {"status": StreamSessionStatus.ENDED, "sessions": 2},
+        {"status": StreamSessionStatus.FAILED, "sessions": 1},
+    ]
+    statement = db.execute.await_args.args[0]
+    assert "stream_sessions.created_at >=" in str(statement)
+    assert "stream_sessions.created_at <" in str(statement)
+    assert "stream_sessions.owner_id =" in str(statement)
+
+
+@pytest.mark.asyncio
+async def test_stream_attributed_follow_count_is_creator_and_period_scoped():
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(one=lambda: SimpleNamespace(follows=3, followers=2))
+        )
+    )
+    repository = AnalyticsRepository(db)
+    creator_id = uuid.uuid4()
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+
+    assert (
+        await repository.stream_attributed_follow_count(creator_id=creator_id, start=start, end=end)
+        == 3
+    )
+
+    statement = str(db.execute.await_args.args[0])
+    assert (
+        "JOIN stream_sessions ON stream_sessions.id = interaction_signals.stream_session_id"
+        in statement
+    )
+    assert "interaction_signals.creator_id =" in statement
+    assert "stream_sessions.owner_id =" in statement
+    assert "interaction_signals.created_at >=" in statement
+    assert "interaction_signals.created_at <" in statement
 
 
 class TestCreatorAnalytics:
@@ -202,13 +277,45 @@ class TestCreatorAnalytics:
             AsyncMock(return_value=0),
         )
 
-        async def empty_actor_counts(
-            self, *, creator_id, signal_types, start, end
-        ):
+        async def empty_actor_counts(self, *, creator_id, signal_types, start, end):
             return {}
 
+        monkeypatch.setattr(AnalyticsRepository, "unique_signal_actor_counts", empty_actor_counts)
         monkeypatch.setattr(
-            AnalyticsRepository, "unique_signal_actor_counts", empty_actor_counts
+            AnalyticsRepository,
+            "creator_stream_follow_totals",
+            AsyncMock(
+                return_value={
+                    "stream_attributed_follows": 0,
+                    "unique_stream_followers": 0,
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            StreamSessionRepository,
+            "status_counts_for_owner_created_in_period",
+            AsyncMock(
+                return_value=[{"status": status, "sessions": 0} for status in StreamSessionStatus]
+            ),
+        )
+        monkeypatch.setattr(
+            StreamSessionRepository,
+            "get_active_for_owner_at_point",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            "repositories.stream_chat_repository.StreamChatRepository.creator_chat_totals",
+            AsyncMock(return_value={
+                "stream_chat_messages": 0,
+                "unique_stream_chatters": 0,
+            }),
+        )
+        monkeypatch.setattr(
+            "repositories.stream_subscription_repository.StreamSubscriptionRepository.creator_subscription_totals",
+            AsyncMock(return_value={
+                "stream_subscriptions": 0,
+                "unique_stream_subscribers": 0,
+            }),
         )
         monkeypatch.setattr(
             "repositories.content_repository.CommentRepository.count_unique_commenters_for_creator",
@@ -241,6 +348,15 @@ class TestCreatorAnalytics:
             StreamSessionRepository,
             "ended_destination_counts_for_owner_in_period",
             AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            StreamViewerSessionRepository, "_effective_intervals", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            StreamViewerSessionRepository, "total_watch_duration", AsyncMock(return_value=0.0)
+        )
+        monkeypatch.setattr(
+            StreamViewerSessionRepository, "peak_concurrent_viewers", AsyncMock(return_value=0)
         )
 
     @pytest.mark.asyncio
@@ -712,6 +828,7 @@ class TestCreatorAnalytics:
         end = start + timedelta(days=7)
         sessions = [
             SimpleNamespace(
+                id=uuid.uuid4(),
                 started_at=start + timedelta(days=index),
                 ended_at=start + timedelta(days=index, hours=1),
             )
@@ -2103,3 +2220,636 @@ class TestAnalyticsRepository:
         statement = str(db.execute.await_args.args[0])
         assert "count(distinct(interaction_signals.user_id))" in statement
         assert result == {"total": 3, "by_post": {post_id: 2}}
+
+
+@pytest_asyncio.fixture
+async def streaming_analytics(monkeypatch):
+    """Real persisted streaming rows; unrelated analytics sources remain isolated."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    metadata = MetaData()
+    Table("users", metadata, Column("id", Uuid(native_uuid=False), primary_key=True))
+    Table(
+        "connected_stream_accounts", metadata,
+        Column("id", Uuid(native_uuid=False), primary_key=True),
+    )
+    Table("posts", metadata, Column("id", Uuid(native_uuid=False), primary_key=True))
+    for model in (
+        StreamSession,
+        StreamDestination,
+        StreamViewerSession,
+        StreamChatMessage,
+    ):
+        model.__table__.to_metadata(metadata)
+    StreamSubscription.__table__.to_metadata(metadata)
+    InteractionSignal.__table__.to_metadata(metadata)
+    for table in metadata.tables.values():
+        for column in table.columns:
+            if isinstance(column.type, PG_UUID):
+                column.type = Uuid(native_uuid=False)
+    creator_id, other_creator_id, *viewer_ids = [uuid.uuid4() for _ in range(5)]
+    async with engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
+        await connection.execute(
+            metadata.tables["users"].insert(),
+            [{"id": identity} for identity in (creator_id, other_creator_id, *viewer_ids)],
+        )
+
+    monkeypatch.setattr(CreatorAnalyticsService, "_posts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        CreatorAnalyticsService, "_collaboration_totals", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        AnalyticsRepository, "signal_totals",
+        AsyncMock(return_value={
+            SignalType.VIEW: {"count": 4, "total": 4.0},
+            SignalType.WATCH_DURATION: {"count": 4, "total": 123.0},
+            SignalType.LIKE: {"count": 2, "total": 2.0},
+            SignalType.SAVE: {"count": 1, "total": 1.0},
+            SignalType.FOLLOW: {"count": 3, "total": 3.0},
+            SignalType.COMPLETION: {"count": 2, "total": 2.0},
+        }),
+    )
+    monkeypatch.setattr(
+        AnalyticsRepository, "unique_viewer_counts",
+        AsyncMock(return_value={"total": 9, "by_post": {}}),
+    )
+    monkeypatch.setattr(
+        AnalyticsRepository, "unique_signal_actor_count", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        AnalyticsRepository, "unique_signal_actor_counts", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        AnalyticsEventRepository, "profile_viewer_counts_for_creator",
+        AsyncMock(return_value={"total": 0, "unique_viewers": 0}),
+    )
+    monkeypatch.setattr(
+        AnalyticsEventRepository, "post_event_totals_for_creator", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        "repositories.content_repository.CommentRepository.count_for_creator",
+        AsyncMock(return_value=7),
+    )
+    monkeypatch.setattr(
+        "repositories.content_repository.CommentRepository.count_unique_commenters_for_creator",
+        AsyncMock(return_value=2),
+    )
+    monkeypatch.setattr(
+        "repositories.social_repository.FollowRepository.count_followers",
+        AsyncMock(return_value=10),
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    start = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+    try:
+        async with sessions() as db:
+            yield SimpleNamespace(
+                db=db, service=CreatorAnalyticsService(db),
+                creator_id=creator_id, other_creator_id=other_creator_id,
+                viewer_ids=viewer_ids, start=start, end=start + timedelta(seconds=60),
+            )
+    finally:
+        await engine.dispose()
+
+
+async def persist_analytics_broadcast(
+    harness, intervals=(), *, owner_id=None, status=StreamSessionStatus.ENDED,
+    started=0, ended=30,
+):
+    """Persist viewer index/join/lease/leave offsets in seconds from reporting start."""
+    stream = StreamSession(
+        id=uuid.uuid4(), owner_id=owner_id or harness.creator_id,
+        input_source="input.mp4", status=status,
+        created_at=harness.start + timedelta(seconds=started or 0),
+        started_at=harness.start + timedelta(seconds=started) if started is not None else None,
+        ended_at=harness.start + timedelta(seconds=ended) if ended is not None else None,
+    )
+    harness.db.add(stream)
+    await harness.db.flush()
+    for viewer_index, joined, lease, left in intervals:
+        harness.db.add(StreamViewerSession(
+            id=uuid.uuid4(), stream_session_id=stream.id,
+            user_id=harness.viewer_ids[viewer_index], client_session_id=uuid.uuid4(),
+            joined_at=harness.start + timedelta(seconds=joined),
+            lease_expires_at=harness.start + timedelta(seconds=lease),
+            left_at=harness.start + timedelta(seconds=left) if left is not None else None,
+        ))
+    await harness.db.commit()
+    return stream
+
+
+async def streaming_overview(harness, *, start=None, end=None):
+    result = await harness.service.overview(
+        harness.creator_id,
+        harness.start if start is None else start,
+        harness.end if end is None else end,
+    )
+    # Audience telemetry must not replace post, comment, or social signal sources.
+    assert result["unique_viewers"] == 9
+    assert result["total_watch_time"] == 123.0
+    assert result["total_views"] == 4
+    assert result["total_comments"] == 7
+    assert result["unique_commenters"] == 2
+    assert result["total_likes"] == 2
+    assert result["total_saves"] == 1
+    assert result["new_followers"] == 3
+    assert result["total_completions"] == 2
+    assert result["completion_rate"] == 50.0
+    return result
+
+
+def assert_stream_audience(result, unique, watch_seconds, peak):
+    assert result["unique_stream_viewers"] == unique
+    assert result["total_stream_watch_time"] == pytest.approx(watch_seconds)
+    assert result["peak_concurrent_stream_viewers"] == peak
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "intervals, expected",
+    [
+        ([], (0, 0.0, 0)),
+        ([(0, 0, 10, None)], (1, 10.0, 1)),
+        ([(0, 0, 10, None), (1, 0, 10, None), (2, 0, 10, None)], (3, 30.0, 3)),
+        ([(0, 0, 10, None), (0, 5, 15, None)], (1, 15.0, 1)),
+        ([(0, 0, 20, None), (0, 5, 10, None)], (1, 20.0, 1)),
+        ([(0, 0, 20, 4), (0, 2, 12, 8), (1, 5, 15, 10)], (2, 13.0, 2)),
+        ([(0, 0, 5, None), (1, 5, 10, None)], (2, 10.0, 1)),
+        ([(0, 0, 10, 0)], (0, 0.0, 0)),
+        ([(0, 0.25, 1.75, None)], (1, 1.5, 1)),
+    ],
+    ids=[
+        "no-viewers", "one-viewer", "multiple-viewers", "overlapping-devices",
+        "nested-tabs", "leave-before-lease", "half-open-concurrency",
+        "zero-duration-viewer", "fractional-seconds",
+    ],
+)
+async def test_creator_stream_audience_persisted_intervals(streaming_analytics, intervals, expected):
+    await persist_analytics_broadcast(streaming_analytics, intervals)
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, *expected)
+    assert result["total_ended_stream_sessions"] == 1
+    assert result["total_broadcast_duration"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_audience_no_broadcasts(streaming_analytics):
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, 0, 0.0, 0)
+    assert result["total_ended_stream_sessions"] == 0
+    assert result["total_broadcast_duration"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_session_status_counts_are_period_and_owner_scoped(
+    streaming_analytics,
+):
+    await persist_analytics_broadcast(streaming_analytics, status=StreamSessionStatus.ENDED)
+    await persist_analytics_broadcast(
+        streaming_analytics,
+        status=StreamSessionStatus.FAILED,
+    )
+    await persist_analytics_broadcast(
+        streaming_analytics,
+        owner_id=streaming_analytics.other_creator_id,
+        status=StreamSessionStatus.ACTIVE,
+    )
+
+    result = await streaming_overview(streaming_analytics)
+
+    assert result["stream_session_status_breakdown"] == [
+        {"status": StreamSessionStatus.PENDING, "sessions": 0},
+        {"status": StreamSessionStatus.ACTIVE, "sessions": 0},
+        {"status": StreamSessionStatus.ENDED, "sessions": 1},
+        {"status": StreamSessionStatus.FAILED, "sessions": 1},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_attributed_follow_aggregation_excludes_global_and_cross_creator_signals(
+    streaming_analytics,
+):
+    harness = streaming_analytics
+    own_stream = await persist_analytics_broadcast(harness)
+    other_stream = await persist_analytics_broadcast(
+        harness, owner_id=harness.other_creator_id
+    )
+    for index, (creator_id, stream_id) in enumerate(
+        [
+            (harness.creator_id, own_stream.id),
+            (harness.creator_id, other_stream.id),
+            (harness.other_creator_id, other_stream.id),
+            (harness.creator_id, None),
+        ]
+    ):
+        harness.db.add(
+            InteractionSignal(
+                id=uuid.uuid4(),
+                user_id=harness.viewer_ids[index % len(harness.viewer_ids)],
+                creator_id=creator_id,
+                stream_session_id=stream_id,
+                signal_type=SignalType.FOLLOW,
+                value=1.0,
+                created_at=harness.start + timedelta(seconds=index),
+            )
+        )
+    await harness.db.commit()
+
+    persisted_signals = (
+        await harness.db.execute(select(InteractionSignal))
+    ).scalars().all()
+    assert len(persisted_signals) == 4
+
+    assert await harness.service.analytics_repo.stream_attributed_follow_count(
+        creator_id=harness.creator_id,
+        start=harness.start,
+        end=harness.end,
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_creator_current_stream_metrics_use_persisted_active_viewer_leases(
+    streaming_analytics,
+):
+    harness = streaming_analytics
+    now = datetime.now(timezone.utc)
+    stream = StreamSession(
+        id=uuid.uuid4(),
+        owner_id=harness.creator_id,
+        input_source="input.mp4",
+        status=StreamSessionStatus.ACTIVE,
+        created_at=now - timedelta(seconds=30),
+        started_at=now - timedelta(seconds=20),
+        ended_at=None,
+    )
+    harness.db.add(stream)
+    harness.db.add(
+        StreamViewerSession(
+            id=uuid.uuid4(),
+            stream_session_id=stream.id,
+            user_id=harness.viewer_ids[0],
+            client_session_id=uuid.uuid4(),
+            joined_at=now - timedelta(seconds=10),
+            lease_expires_at=now + timedelta(seconds=60),
+            left_at=None,
+        )
+    )
+    await harness.db.commit()
+
+    result = await streaming_overview(harness)
+
+    assert result["current_active_stream_sessions"] == 1
+    assert result["current_concurrent_stream_viewers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_audience_deduplicates_across_broadcasts_and_sums_watch_time(
+    streaming_analytics,
+):
+    await persist_analytics_broadcast(
+        streaming_analytics, [(0, 0, 10, None), (0, 5, 15, None)], ended=20
+    )
+    await persist_analytics_broadcast(
+        streaming_analytics, [(0, 20, 30, None), (1, 25, 35, None)], started=20, ended=40
+    )
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, 2, 35.0, 2)
+    assert result["total_ended_stream_sessions"] == 2
+    assert result["total_broadcast_duration"] == 40.0
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_audience_peak_is_maximum_not_sum(streaming_analytics):
+    await persist_analytics_broadcast(
+        streaming_analytics, [(0, 0, 10, None), (1, 0, 10, None), (2, 0, 10, None)],
+        ended=20,
+    )
+    await persist_analytics_broadcast(
+        streaming_analytics, [(0, 20, 30, None), (1, 20, 30, None)], started=20, ended=40
+    )
+    assert_stream_audience(await streaming_overview(streaming_analytics), 3, 50.0, 3)
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_audience_clips_reporting_and_stream_boundaries(streaming_analytics):
+    harness = streaming_analytics
+    await persist_analytics_broadcast(
+        harness,
+        [(0, -30, 100, None), (0, 20, 50, None), (1, -20, 10, None),
+         (2, 60, 70, None)],
+        started=-20, ended=59.5,
+    )
+    result = await streaming_overview(harness, start=harness.start + timedelta(seconds=10))
+    assert_stream_audience(result, 1, 49.5, 1)
+    # Existing broadcast duration is not period-clipped; audience watch time is.
+    assert result["total_broadcast_duration"] == 79.5
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_audience_excludes_unrelated_creator(streaming_analytics):
+    await persist_analytics_broadcast(streaming_analytics, [(0, 0, 10, None)])
+    await persist_analytics_broadcast(
+        streaming_analytics, [(1, 0, 30, None), (2, 0, 30, None)],
+        owner_id=streaming_analytics.other_creator_id,
+    )
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, 1, 10.0, 1)
+    assert result["total_ended_stream_sessions"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_viewer", [False, True])
+async def test_creator_stream_audience_not_inferred_or_multiplied_by_destinations(
+    streaming_analytics, has_viewer,
+):
+    intervals = [(0, 0, 10, None)] if has_viewer else []
+    stream = await persist_analytics_broadcast(streaming_analytics, intervals)
+    for platform in (StreamPlatform.TWITCH, StreamPlatform.YOUTUBE):
+        streaming_analytics.db.add(StreamDestination(
+            id=uuid.uuid4(), stream_session_id=stream.id,
+            platform=platform, status=StreamDestinationStatus.ENDED,
+        ))
+    await streaming_analytics.db.commit()
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, int(has_viewer), 10.0 if has_viewer else 0.0, int(has_viewer))
+    assert result["stream_destination_breakdown"] == [
+        {"platform": platform, "ended_sessions": 1}
+        for platform in (StreamPlatform.TWITCH, StreamPlatform.YOUTUBE)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_graphql_creator_analytics_exposes_stream_audience_metrics(
+    streaming_analytics, monkeypatch,
+):
+    harness = streaming_analytics
+    monkeypatch.setattr(
+        CreatorAnalyticsService,
+        "_collaboration_totals",
+        AsyncMock(return_value={
+            "total_collaboration_requests": 0,
+            "pending_collaborations": 0,
+            "accepted_collaborations": 0,
+            "declined_collaborations": 0,
+            "cancelled_collaborations": 0,
+            "collaboration_acceptance_rate": None,
+            "collaboration_completion_rate": None,
+            "average_response_hours": None,
+            "active_collaborations": 0,
+            "completed_collaborations": 0,
+            "collaboration_success_rate": None,
+        }),
+    )
+    await persist_analytics_broadcast(
+        harness, [(0, 0, 10, None), (0, 5, 15, None)], ended=20
+    )
+    await persist_analytics_broadcast(
+        harness, [(0, 20, 30, None), (1, 25, 35, None)], started=20, ended=40
+    )
+    streams = (await harness.db.scalars(select(StreamSession))).all()
+    harness.db.add_all(
+        [
+            StreamChatMessage(
+                id=uuid.uuid4(),
+                stream_session_id=streams[0].id,
+                user_id=harness.viewer_ids[0],
+                body="one",
+                created_at=harness.start + timedelta(seconds=1),
+            ),
+            StreamChatMessage(
+                id=uuid.uuid4(),
+                stream_session_id=streams[0].id,
+                user_id=harness.viewer_ids[0],
+                body="two",
+                created_at=harness.start + timedelta(seconds=2),
+            ),
+            StreamChatMessage(
+                id=uuid.uuid4(),
+                stream_session_id=streams[1].id,
+                user_id=harness.viewer_ids[1],
+                body="three",
+                created_at=harness.start + timedelta(seconds=25),
+            ),
+        ]
+    )
+    await harness.db.commit()
+
+    harness.db.add_all(
+        [
+            StreamSubscription(
+                stream_session_id=streams[0].id,
+                user_id=harness.viewer_ids[0],
+                created_at=harness.start,
+            ),
+            StreamSubscription(
+                stream_session_id=streams[1].id,
+                user_id=harness.viewer_ids[0],
+                created_at=harness.start + timedelta(seconds=25),
+            ),
+            StreamSubscription(
+                stream_session_id=streams[1].id,
+                user_id=harness.viewer_ids[1],
+                created_at=harness.start + timedelta(seconds=26),
+            ),
+        ]
+    )
+    await harness.db.commit()
+
+    result = await schema.execute(
+        f'''{{
+            creatorAnalytics(period: {{
+                start: "{harness.start.isoformat()}", end: "{harness.end.isoformat()}"
+            }}) {{
+                uniqueStreamViewers
+                totalStreamWatchTime
+                peakConcurrentStreamViewers
+                totalViews
+                totalWatchTime
+                totalEndedStreamSessions
+                totalBroadcastDuration
+                streamSessionStatusBreakdown {{ status sessions }}
+                currentActiveStreamSessions
+                currentConcurrentStreamViewers
+                streamAttributedFollows
+                streamChatMessages
+                uniqueStreamChatters
+                streamSubscriptions
+                uniqueStreamSubscribers
+            }}
+        }}''',
+        context_value=AppContext(
+            db=harness.db, current_user=SimpleNamespace(id=harness.creator_id)
+        ),
+    )
+
+    assert result.errors is None
+    assert result.data == {
+        "creatorAnalytics": {
+            "uniqueStreamViewers": 2,
+            "totalStreamWatchTime": 35.0,
+            "peakConcurrentStreamViewers": 2,
+            "totalViews": 4,
+            "totalWatchTime": 123.0,
+            "totalEndedStreamSessions": 2,
+            "totalBroadcastDuration": 40.0,
+            "streamSessionStatusBreakdown": [
+                {"status": "pending", "sessions": 0},
+                {"status": "active", "sessions": 0},
+                {"status": "ended", "sessions": 2},
+                {"status": "failed", "sessions": 0},
+            ],
+            "currentActiveStreamSessions": 0,
+            "currentConcurrentStreamViewers": 0,
+            "streamAttributedFollows": 0,
+            "streamChatMessages": 3,
+            "uniqueStreamChatters": 2,
+            "streamSubscriptions": 3,
+            "uniqueStreamSubscribers": 2,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_graphql_creator_analytics_returns_zero_stream_audience_metrics(
+    streaming_analytics, monkeypatch,
+):
+    harness = streaming_analytics
+    monkeypatch.setattr(
+        CreatorAnalyticsService,
+        "_collaboration_totals",
+        AsyncMock(return_value={
+            "total_collaboration_requests": 0,
+            "pending_collaborations": 0,
+            "accepted_collaborations": 0,
+            "declined_collaborations": 0,
+            "cancelled_collaborations": 0,
+            "collaboration_acceptance_rate": None,
+            "collaboration_completion_rate": None,
+            "average_response_hours": None,
+            "active_collaborations": 0,
+            "completed_collaborations": 0,
+            "collaboration_success_rate": None,
+        }),
+    )
+    result = await schema.execute(
+        f'''{{
+            creatorAnalytics(period: {{
+                start: "{harness.start.isoformat()}", end: "{harness.end.isoformat()}"
+            }}) {{
+                uniqueStreamViewers
+                totalStreamWatchTime
+                peakConcurrentStreamViewers
+                streamChatMessages
+                uniqueStreamChatters
+                streamSubscriptions
+                uniqueStreamSubscribers
+                streamSessionStatusBreakdown {{ status sessions }}
+                currentActiveStreamSessions
+                currentConcurrentStreamViewers
+                streamAttributedFollows
+            }}
+        }}''',
+        context_value=AppContext(
+            db=harness.db, current_user=SimpleNamespace(id=harness.creator_id)
+        ),
+    )
+
+    assert result.errors is None
+    assert result.data == {
+        "creatorAnalytics": {
+            "uniqueStreamViewers": 0,
+            "totalStreamWatchTime": 0.0,
+            "peakConcurrentStreamViewers": 0,
+            "streamChatMessages": 0,
+            "uniqueStreamChatters": 0,
+            "streamSubscriptions": 0,
+            "uniqueStreamSubscribers": 0,
+            "streamSessionStatusBreakdown": [
+                {"status": "pending", "sessions": 0},
+                {"status": "active", "sessions": 0},
+                {"status": "ended", "sessions": 0},
+                {"status": "failed", "sessions": 0},
+            ],
+            "currentActiveStreamSessions": 0,
+            "currentConcurrentStreamViewers": 0,
+            "streamAttributedFollows": 0,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_graphql_creator_analytics_requires_authentication(streaming_analytics):
+    harness = streaming_analytics
+    result = await schema.execute(
+        f'''{{
+            creatorAnalytics(period: {{
+                start: "{harness.start.isoformat()}", end: "{harness.end.isoformat()}"
+            }}) {{
+                uniqueStreamViewers
+                streamSubscriptions
+                uniqueStreamSubscribers
+            }}
+        }}''',
+        context_value=AppContext(db=harness.db, current_user=None),
+    )
+
+    assert result.data is None
+    assert result.errors
+    assert "Authentication required" in str(result.errors[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"status": StreamSessionStatus.ACTIVE, "ended": None},
+        {"status": StreamSessionStatus.PENDING},
+        {"status": StreamSessionStatus.FAILED},
+        {"started": None},
+        {"ended": None},
+        {"started": 20, "ended": 10},
+        {"started": -20, "ended": -1},
+        {"ended": 61},
+    ],
+    ids=[
+        "active", "pending", "failed", "missing-start", "missing-end",
+        "inverted-duration", "ended-before-period", "ends-after-period",
+    ],
+)
+async def test_creator_stream_audience_only_qualifying_ended_broadcasts(
+    streaming_analytics, values,
+):
+    await persist_analytics_broadcast(streaming_analytics, [(0, -30, 90, None)], **values)
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, 0, 0.0, 0)
+    assert result["total_ended_stream_sessions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_creator_stream_audience_ended_at_period_start_has_no_viewing_time(streaming_analytics):
+    await persist_analytics_broadcast(
+        streaming_analytics, [(0, -10, 10, None)], started=-10, ended=0
+    )
+    result = await streaming_overview(streaming_analytics)
+    assert_stream_audience(result, 0, 0.0, 0)
+    assert result["total_ended_stream_sessions"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["_effective_intervals", "total_watch_duration", "peak_concurrent_viewers"])
+async def test_creator_stream_audience_propagates_repository_errors(
+    streaming_analytics, monkeypatch, method,
+):
+    await persist_analytics_broadcast(streaming_analytics, [(0, 0, 10, None)])
+    monkeypatch.setattr(
+        StreamViewerSessionRepository, method,
+        AsyncMock(side_effect=RuntimeError("Audience aggregation failed")),
+    )
+    with pytest.raises(RuntimeError, match="Audience aggregation failed"):
+        await streaming_overview(streaming_analytics)

@@ -5,6 +5,7 @@ Covers the multi-destination live streaming MVP models:
 - ``StreamSession`` — one broadcast attempt owned by a user (input source,
   lifecycle status, failure reason).
 - ``StreamViewerSession`` — one authenticated viewing connection interval.
+- ``StreamSubscription`` — one native subscription action per user and broadcast.
 - ``StreamDestination`` — one output target (Twitch/YouTube/Kick/Facebook)
   attached to a ``StreamSession``, optionally backed by a
   ``ConnectedStreamAccount``.
@@ -129,6 +130,18 @@ class StreamSession(Base, TimestampMixin):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    chat_messages: Mapped[list["StreamChatMessage"]] = relationship(
+        "StreamChatMessage",
+        back_populates="stream_session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    subscriptions: Mapped[list["StreamSubscription"]] = relationship(
+        "StreamSubscription",
+        back_populates="stream_session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     def __repr__(self) -> str:
         return f"<StreamSession id={self.id!r} owner_id={self.owner_id!r} status={self.status.value!r}>"
@@ -177,6 +190,60 @@ class StreamViewerSession(Base, TimestampMixin):
 
     stream_session: Mapped["StreamSession"] = relationship(
         "StreamSession", back_populates="viewer_sessions"
+    )
+
+
+class StreamChatMessage(Base, TimestampMixin):
+    """A persisted message posted directly in a Luna stream's chat."""
+
+    __tablename__ = "stream_chat_messages"
+    __table_args__ = (
+        Index("ix_stream_chat_messages_stream_created", "stream_session_id", "created_at"),
+        Index("ix_stream_chat_messages_sender_stream", "user_id", "stream_session_id"),
+    )
+
+    stream_session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("stream_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+
+    stream_session: Mapped["StreamSession"] = relationship(
+        "StreamSession", back_populates="chat_messages"
+    )
+
+
+class StreamSubscription(Base, TimestampMixin):
+    """One native subscription action per authenticated user and Luna broadcast."""
+
+    __tablename__ = "stream_subscriptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "stream_session_id", "user_id", name="uq_stream_subscriptions_stream_user"
+        ),
+        Index("ix_stream_subscriptions_stream_created", "stream_session_id", "created_at"),
+        Index("ix_stream_subscriptions_user", "user_id"),
+    )
+
+    stream_session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("stream_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    stream_session: Mapped["StreamSession"] = relationship(
+        "StreamSession", back_populates="subscriptions"
     )
 
 
