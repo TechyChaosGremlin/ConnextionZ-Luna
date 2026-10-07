@@ -21,6 +21,87 @@ notifications, collaborations). Several resolvers now record **both** — e.g.
 liking a post still writes an `InteractionSignal` (for recommendation
 scoring) *and* an `AnalyticsEvent` (for general analytics).
 
+## Paid attribution boundary
+
+The [Paid Algorithm Specification](./ARCHITECTURE.md#paid-algorithm-specification)
+defines Paid as a separate discovery area, not placements in normal feeds.
+Engagement provenance is resolved server-side from the exact impressed
+`paid_deliveries` row referenced by the Paid feed item, scoped to authenticated
+viewer and post. Paid-specific mutations also require a separate random,
+five-minute interaction context issued for that selection. Only its hash is
+stored, and it is consumed under a row lock on the first valid interaction.
+The delivery ID alone is only a lookup reference: the server rejects unknown,
+pending, wrong-viewer, or wrong-post identities, and the context cannot be
+forged or reused. Client metadata such as `source`, `algorithm`, `isSponsored`,
+or campaign IDs cannot establish Paid attribution. Events without both the
+validated delivery reference and interaction context stay unattributed/non-Paid,
+even if the same viewer previously received that post as Paid. `AnalyticsEvent`,
+`InteractionSignal`, and active post-interaction rows retain the resolved
+delivery and campaign IDs; Paid event metadata is populated only after that
+lookup succeeds. Invalid explicit references fail safely rather than being
+guessed or replaced with the latest Paid receipt.
+
+Only Paid-specific interaction mutations accept a delivery ID and interaction
+context. Normal like/save/share/watch/feedback mutations do not accept either,
+so a valid Paid delivery ID replayed through a non-Paid interaction route cannot
+assign Paid provenance. Paid-specific mutations validate the context and the
+delivery ID against the authenticated viewer, post, and impressed ledger row.
+
+Recommendation aggregates for creator affinity, viewer history, For You
+engagement rates, Viral momentum, and interest tags exclude rows with
+`paid_delivery_id`. For You's counter inputs and view-count diversity tie-break
+also use active interaction rows whose Paid attribution is null. Paid events
+remain in the analytics/event stores and in analytics totals; they are not
+discarded. Historical rows retain null provenance and continue to be treated
+as non-Paid, consistent with the public Paid gate having remained disabled.
+Campaign budget/cap accounting does not depend on this best-effort event logger.
+
+The Paid resolver has a receipt-backed delivery integration, but the hard-coded
+public delivery gate remains disabled; requests still return the explicit
+not-implemented error and do not publicly deliver posts. Attribution migration
+209 adds nullable provenance columns with no historical backfill. No Paid
+impression or spend accounting is copied into analytics; the delivery ledger
+remains authoritative.
+
+### Authoritative Paid impressions and frequency history
+
+[PaidFrequencyService](../backend/services/paid_frequency.py) now has a read-only
+boundary for per-viewer/per-campaign frequency eligibility. It counts only
+distinct, server-validated Paid deliveries in
+`[now - frequency_window_seconds, now]` (inclusive bounds), never general watch/engagement activity.
+The default [history repository](../backend/repositories/paid_impression_history_repository.py)
+reads only `paid_deliveries` rows with `impressed_at` set. Pending server
+selections, ordinary `VIDEO_IMPRESSION` events, and campaign/source claims in
+free-form metadata are not impressions. The primary key is a server-generated
+selection identity, so one ID counts once and a later genuine delivery needs
+a new ID. Attribution is derived from that persisted viewer/campaign/post
+relationship, not a client-supplied source flag.
+
+[PaidDeliveryService](../backend/services/paid_delivery_service.py) remains the
+authoritative accounting boundary: campaign row locking, revalidation,
+database-side impression/reach increments, and ledger recording happen
+transactionally. The gated GraphQL delivery integration commits accounting
+before returning receipt-backed sponsored items and rolls back on failure.
+Spend is unchanged; the record establishes serving semantics, not billing or
+client-visible/watch verification. No public Paid delivery is enabled.
+
+The history read checks lifetime ledger count/distinct viewers against the
+campaign's impression/reach counters. Complete zero history is a valid zero;
+missing schema or mismatched/legacy counters remain
+`PaidImpressionHistoryUnavailable`, yielding `ATTRIBUTION_UNAVAILABLE` with a
+warning/reason for capped frequency. Missing-table queries use a savepoint so
+the transaction remains usable; unexpected failures propagate. Uncapped
+frequency does not query history, but internal recording always checks lifetime
+completeness. Viewer deletion retains the campaign-local UUID/count history.
+No backfill from unverifiable old events is performed.
+
+Paid views, watch behavior, likes, saves, shares, and not-interested signals
+can carry Paid attribution when their mutation includes the Paid item delivery
+ID and one-use interaction context, and the server verifies the exact ledger
+receipt. Comments, follows, and purchases do not carry this delivery context
+in the current mutation contract.
+Existing events and non-Paid behavior remain unchanged.
+
 ## Event types
 
 Defined in `backend/app/models/analytics.py::EventType`:

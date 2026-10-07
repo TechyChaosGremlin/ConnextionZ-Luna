@@ -31,6 +31,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.analytics import AnalyticsEvent, EventType
+from app.models.paid_delivery import PaidDelivery
 from repositories.analytics_event_repository import AnalyticsEventRepository
 
 logger = structlog.get_logger()
@@ -39,16 +40,25 @@ logger = structlog.get_logger()
 # should never pass these, but strip them if they somehow do).
 _FORBIDDEN_METADATA_KEYS = {
     "password",
-    "hashed_password",
+    "hashedpassword",
     "token",
-    "access_token",
-    "refresh_token",
+    "accesstoken",
+    "refreshtoken",
     "authorization",
     "jwt",
-    "credit_card",
-    "card_number",
+    "creditcard",
+    "cardnumber",
     "cvv",
     "ssn",
+    "paidcampaignid",
+    "paidcampaign",
+    "campaignid",
+    "campaign",
+    "paiddeliveryid",
+    "deliveryid",
+    "selectionid",
+    "impressionid",
+    "sponsoredlabel",
 }
 
 
@@ -63,7 +73,19 @@ def _has_id(entity: Any) -> uuid.UUID | None:
 def _sanitize_metadata(metadata: dict | None) -> dict | None:
     if not metadata:
         return None
-    return {k: v for k, v in metadata.items() if k.lower() not in _FORBIDDEN_METADATA_KEYS}
+    sanitized = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            continue
+        normalized = key.replace("_", "").lower()
+        if normalized in _FORBIDDEN_METADATA_KEYS or normalized.startswith("paid"):
+            continue
+        if normalized in {"source", "algorithm"} and "paid" in str(value).lower():
+            continue
+        if normalized in {"issponsored", "sponsored"}:
+            continue
+        sanitized[key] = value
+    return sanitized or None
 
 
 class AnalyticsEventService:
@@ -72,6 +94,16 @@ class AnalyticsEventService:
     def __init__(self, db: AsyncSession):
         self.db = db
         self._repo = AnalyticsEventRepository(db)
+
+    async def _paid_delivery_for(
+        self, delivery_id: uuid.UUID, user_id: uuid.UUID, post_id: uuid.UUID
+    ) -> PaidDelivery:
+        from repositories.paid_delivery_repository import PaidDeliveryRepository
+
+        async with self.db.begin_nested():
+            return await PaidDeliveryRepository(self.db).impressed_for_engagement(
+                delivery_id, user_id, post_id
+            )
 
     async def track_event(
         self,
@@ -84,6 +116,7 @@ class AnalyticsEventService:
         duration_ms: int | None = None,
         metadata: dict | None = None,
         isolate_failure: bool = False,
+        paid_delivery_id: uuid.UUID | None = None,
     ) -> AnalyticsEvent | None:
         """Record one analytics event. Returns the created row, or ``None``
         if the event was rejected as malformed or recording failed.
@@ -106,6 +139,34 @@ class AnalyticsEventService:
         if session_id is not None and not isinstance(session_id, str):
             session_id = str(session_id)
 
+        clean_metadata = _sanitize_metadata(metadata) or {}
+        validated_paid_delivery_id = None
+        paid_campaign_id = None
+        if paid_delivery_id is not None:
+            if user_id is None or post_id is None:
+                logger.warning("analytics_event.invalid_paid_attribution_context")
+                return None
+            try:
+                delivery = await self._paid_delivery_for(paid_delivery_id, user_id, post_id)
+            except Exception:
+                logger.exception(
+                    "analytics_event.paid_attribution_unavailable",
+                    user_id=str(user_id),
+                    post_id=str(post_id),
+                )
+                clean_metadata["attribution_status"] = "unavailable"
+                return None
+            else:
+                validated_paid_delivery_id = delivery.id
+                paid_campaign_id = delivery.campaign_id
+                clean_metadata.update(
+                    {
+                        "source": "paid",
+                        "paid_campaign_id": str(delivery.campaign_id),
+                        "paid_delivery_id": str(delivery.id),
+                    }
+                )
+
         event = AnalyticsEvent(
             user_id=user_id,
             event_type=event_type,
@@ -113,7 +174,9 @@ class AnalyticsEventService:
             target_user_id=target_user_id,
             session_id=session_id,
             duration_ms=duration_ms,
-            event_metadata=_sanitize_metadata(metadata),
+            paid_delivery_id=validated_paid_delivery_id,
+            paid_campaign_id=paid_campaign_id,
+            event_metadata=clean_metadata or None,
         )
 
         try:

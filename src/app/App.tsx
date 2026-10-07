@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { TrendingSounds } from "./TrendingSounds";
+import { PaidDiscoveryScreen } from "./PaidDiscovery";
 import { AuthFlow } from "./Auth";
 import { SettingsScreen, DeleteProfileModal } from "./Settings";
 import { UploadScreen } from "./Upload";
@@ -828,7 +829,7 @@ export default function App() {
   // The signed-in account, restored from the persisted session on load.
   const [account, setAccount] = useState<Account | null>(() => getSession());
   const [isDark, setIsDark] = useState(true);
-  const [screen, setScreen] = useState<"feed" | "discover" | "profile" | "inbox">("feed");
+  const [screen, setScreen] = useState<"feed" | "discover" | "paid" | "profile" | "inbox">("feed");
   const [feedTab, setFeedTab] = useState<"forYou" | "following">("forYou");
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [liveMode, setLiveMode] = useState<"off" | "setup" | "creator" | "viewer" | "upload">("off");
@@ -1079,7 +1080,10 @@ export default function App() {
 
           {/* ── Trending Sounds ── */}
           <AnimatePresence>
-            {screen === "discover" && <TrendingSounds key="sounds" onBack={() => setScreen("feed")} />}
+            {screen === "discover" && <TrendingSounds key="sounds" onBack={() => setScreen("feed")}
+              onOpenPaid={() => setScreen("paid")} />}
+            {screen === "paid" && <PaidDiscoveryScreen key={account.email} viewerKey={account.email}
+              onBack={() => setScreen("discover")} />}
           </AnimatePresence>
 
           {/* ── Inbox ── */}

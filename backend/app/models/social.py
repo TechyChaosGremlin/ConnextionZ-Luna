@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -73,7 +73,14 @@ class UserMute(Base, TimestampMixin):
 
 class PostLike(Base, TimestampMixin):
     __tablename__ = "post_likes"
-    __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_post_like"),)
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_post_like"),
+        Index("ix_post_likes_paid_post", "paid_delivery_id", "post_id"),
+        CheckConstraint(
+            "(paid_delivery_id IS NULL) = (paid_campaign_id IS NULL)",
+            name="ck_post_likes_paid_attribution",
+        ),
+    )
 
     post_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, index=True
@@ -81,11 +88,20 @@ class PostLike(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    paid_delivery_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    paid_campaign_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
 
 class PostSave(Base, TimestampMixin):
     __tablename__ = "post_saves"
-    __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_post_save"),)
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_post_save"),
+        Index("ix_post_saves_paid_post", "paid_delivery_id", "post_id"),
+        CheckConstraint(
+            "(paid_delivery_id IS NULL) = (paid_campaign_id IS NULL)",
+            name="ck_post_saves_paid_attribution",
+        ),
+    )
 
     post_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, index=True
@@ -93,11 +109,20 @@ class PostSave(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    paid_delivery_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    paid_campaign_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
 
 class PostShare(Base, TimestampMixin):
     __tablename__ = "post_shares"
-    __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_post_share"),)
+    __table_args__ = (
+        UniqueConstraint("post_id", "user_id", name="uq_post_share"),
+        Index("ix_post_shares_paid_post", "paid_delivery_id", "post_id"),
+        CheckConstraint(
+            "(paid_delivery_id IS NULL) = (paid_campaign_id IS NULL)",
+            name="ck_post_shares_paid_attribution",
+        ),
+    )
 
     post_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, index=True
@@ -105,12 +130,21 @@ class PostShare(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    paid_delivery_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    paid_campaign_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
 
 class PostWatch(Base, TimestampMixin):
     """One watch event per call — rewatch flag distinguishes repeats, rows are never merged."""
 
     __tablename__ = "post_watches"
+    __table_args__ = (
+        Index("ix_post_watches_paid_post", "paid_delivery_id", "post_id"),
+        CheckConstraint(
+            "(paid_delivery_id IS NULL) = (paid_campaign_id IS NULL)",
+            name="ck_post_watches_paid_attribution",
+        ),
+    )
 
     post_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("posts.id", ondelete="CASCADE"), nullable=False, index=True
@@ -121,6 +155,8 @@ class PostWatch(Base, TimestampMixin):
     watched_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     rewatched: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    paid_delivery_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    paid_campaign_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
 
 class CommentLike(Base, TimestampMixin):

@@ -46,6 +46,17 @@ class AnalyticsEventRepository(BaseRepository[AnalyticsEvent]):
         )
         return list(result.scalars().all())
 
+    async def get_for_paid_campaign(
+        self, campaign_id: uuid.UUID, limit: int = 500
+    ) -> list[AnalyticsEvent]:
+        result = await self.db.execute(
+            select(AnalyticsEvent)
+            .where(AnalyticsEvent.paid_campaign_id == campaign_id)
+            .order_by(AnalyticsEvent.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
     async def get_by_type(self, event_type: EventType, limit: int = 500) -> list[AnalyticsEvent]:
         result = await self.db.execute(
             select(AnalyticsEvent)

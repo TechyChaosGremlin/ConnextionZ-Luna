@@ -40,16 +40,31 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
         post_id: uuid.UUID | None = None,
         stream_session_id: uuid.UUID | None = None,
         value: float = 1.0,
+        paid_delivery_id: uuid.UUID | None = None,
     ) -> InteractionSignal:
         if stream_session_id is not None and (
             signal_type != SignalType.FOLLOW or post_id is not None
         ):
             raise ValueError("Only creator follow signals can be attributed to a stream session")
+        validated_paid_delivery_id = None
+        paid_campaign_id = None
+        if paid_delivery_id is not None:
+            if post_id is None:
+                raise ValueError("Paid engagement requires a post")
+            from repositories.paid_delivery_repository import PaidDeliveryRepository
+
+            delivery = await PaidDeliveryRepository(self.db).impressed_for_engagement(
+                paid_delivery_id, user_id, post_id
+            )
+            validated_paid_delivery_id = delivery.id
+            paid_campaign_id = delivery.campaign_id
         signal = InteractionSignal(
             user_id=user_id,
             post_id=post_id,
             creator_id=creator_id,
             stream_session_id=stream_session_id,
+            paid_delivery_id=validated_paid_delivery_id,
+            paid_campaign_id=paid_campaign_id,
             signal_type=signal_type,
             value=value,
         )
@@ -80,6 +95,7 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
         *,
         creator_id: uuid.UUID | None = None,
         post_id: uuid.UUID | None = None,
+        paid_campaign_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> dict[SignalType, dict[str, float]]:
@@ -94,6 +110,8 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
             stmt = stmt.where(InteractionSignal.creator_id == creator_id)
         if post_id is not None:
             stmt = stmt.where(InteractionSignal.post_id == post_id)
+        if paid_campaign_id is not None:
+            stmt = stmt.where(InteractionSignal.paid_campaign_id == paid_campaign_id)
         if start is not None:
             stmt = stmt.where(InteractionSignal.created_at >= start)
         if end is not None:
@@ -109,6 +127,7 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
         *,
         creator_id: uuid.UUID | None = None,
         post_ids: list[uuid.UUID] | None = None,
+        paid_campaign_id: uuid.UUID | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> dict[uuid.UUID, dict[SignalType, dict[str, float]]]:
@@ -127,6 +146,8 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
             stmt = stmt.where(InteractionSignal.creator_id == creator_id)
         if post_ids:
             stmt = stmt.where(InteractionSignal.post_id.in_(post_ids))
+        if paid_campaign_id is not None:
+            stmt = stmt.where(InteractionSignal.paid_campaign_id == paid_campaign_id)
         if start is not None:
             stmt = stmt.where(InteractionSignal.created_at >= start)
         if end is not None:
@@ -350,7 +371,10 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                 InteractionSignal.signal_type,
                 func.sum(InteractionSignal.value).label("total"),
             )
-            .where(InteractionSignal.user_id == user_id)
+            .where(
+                InteractionSignal.user_id == user_id,
+                InteractionSignal.paid_delivery_id.is_(None),
+            )
             .group_by(InteractionSignal.creator_id, InteractionSignal.signal_type)
         )
         scores: dict[uuid.UUID, float] = {}
@@ -387,8 +411,11 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                 func.count().label("cnt"),
                 func.max(InteractionSignal.value).label("max_value"),
             )
-            .where(InteractionSignal.user_id == user_id)
-            .where(InteractionSignal.post_id.in_(post_ids))
+            .where(
+                InteractionSignal.user_id == user_id,
+                InteractionSignal.post_id.in_(post_ids),
+                InteractionSignal.paid_delivery_id.is_(None),
+            )
             .group_by(InteractionSignal.post_id, InteractionSignal.signal_type)
         )
         result = await self.db.execute(stmt)
@@ -455,7 +482,10 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                 func.count().label("cnt"),
                 func.sum(InteractionSignal.value).label("total"),
             )
-            .where(InteractionSignal.post_id.in_(post_ids))
+            .where(
+                InteractionSignal.post_id.in_(post_ids),
+                InteractionSignal.paid_delivery_id.is_(None),
+            )
             .group_by(InteractionSignal.post_id, InteractionSignal.signal_type)
         )
         result = await self.db.execute(stmt)
@@ -491,6 +521,7 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
             .where(
                 InteractionSignal.post_id.in_(post_ids),
                 InteractionSignal.created_at >= since,
+                InteractionSignal.paid_delivery_id.is_(None),
             )
             .group_by(InteractionSignal.post_id, InteractionSignal.signal_type)
         )
@@ -539,6 +570,7 @@ class AnalyticsRepository(BaseRepository[InteractionSignal]):
                 InteractionSignal.user_id == user_id,
                 InteractionSignal.post_id.is_not(None),
                 InteractionSignal.signal_type.in_(active),
+                InteractionSignal.paid_delivery_id.is_(None),
                 Post.tags.is_not(None),
             )
             .limit(200)

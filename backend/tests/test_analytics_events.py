@@ -102,12 +102,16 @@ class TestAnalyticsEventModel:
         column_names = set(table.columns.keys())
         assert column_names == {
             "id", "user_id", "event_type", "post_id", "target_user_id",
-            "session_id", "duration_ms", "metadata", "created_at", "updated_at",
+            "session_id", "duration_ms", "metadata", "paid_delivery_id",
+            "paid_campaign_id", "created_at", "updated_at",
         }
 
     def test_nullable_associations(self):
         table = AnalyticsEvent.__table__
-        for col in ("user_id", "post_id", "target_user_id", "session_id", "duration_ms", "metadata"):
+        for col in (
+            "user_id", "post_id", "target_user_id", "session_id", "duration_ms",
+            "metadata", "paid_delivery_id", "paid_campaign_id",
+        ):
             assert table.columns[col].nullable is True
         assert table.columns["event_type"].nullable is False
         assert table.columns["created_at"].nullable is False

@@ -150,6 +150,16 @@ class FakeFollowGraph:
 @pytest.fixture
 def follow_graph(monkeypatch):
     graph = FakeFollowGraph()
+    async def empty_recommendation_counts(self, post_ids):
+        return {
+            post_id: {"views": 0, "likes": 0, "saves": 0, "shares": 0}
+            for post_id in post_ids
+        }
+
+    monkeypatch.setattr(
+        "repositories.social_repository.PostInteractionRepository.recommendation_engagement_counts",
+        empty_recommendation_counts,
+    )
     monkeypatch.setattr(
         "repositories.social_repository.FollowRepository.follow",
         lambda self, follower_id, following_id: graph.follow(follower_id, following_id),
@@ -396,6 +406,25 @@ def stub_post_engagement_rates(monkeypatch, rates: dict):
     monkeypatch.setattr(
         "repositories.analytics_repository.AnalyticsRepository.post_engagement_rates",
         fake_post_engagement_rates,
+    )
+
+
+def stub_recommendation_engagement_counts(monkeypatch, counts: dict):
+    async def fake_counts(self, post_ids):
+        return {
+            post_id: {
+                "views": counts[post_id].get("views", 0),
+                "likes": counts[post_id].get("likes", 0),
+                "saves": counts[post_id].get("saves", 0),
+                "shares": counts[post_id].get("shares", 0),
+            }
+            for post_id in post_ids
+            if post_id in counts
+        }
+
+    monkeypatch.setattr(
+        "repositories.social_repository.PostInteractionRepository.recommendation_engagement_counts",
+        fake_counts,
     )
 
 
@@ -681,6 +710,16 @@ async def test_for_you_scoring_ranks_higher_engagement_above_stale_low_engagemen
     stub_feed_posts(monkeypatch, [])
     stub_discovery_pool(monkeypatch, [quiet_post, popular_post])
     stub_hidden_creators(monkeypatch)
+    async def active_counts(self, post_ids):
+        return {
+            popular_id: {"views": 1000, "likes": 500, "saves": 50, "shares": 50},
+            quiet_id: {"views": 10, "likes": 0, "saves": 0, "shares": 0},
+        }
+
+    monkeypatch.setattr(
+        "repositories.social_repository.PostInteractionRepository.recommendation_engagement_counts",
+        active_counts,
+    )
 
     page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
 
@@ -899,6 +938,13 @@ async def test_for_you_pagination_is_stable_across_pages(monkeypatch, follow_gra
     stub_feed_posts(monkeypatch, [])
     stub_discovery_pool(monkeypatch, posts)
     stub_hidden_creators(monkeypatch)
+    stub_recommendation_engagement_counts(
+        monkeypatch,
+        {
+            post.id: {"views": post.view_count}
+            for post in posts
+        },
+    )
 
     first_page = await _feed(make_ctx(viewer), cursor=None, limit=2, following=False)
     assert len(first_page.items) == 2
@@ -942,6 +988,22 @@ async def test_for_you_pagination_snapshot_cursor_survives_mid_pagination_drift(
         stub_discovery_pool(monkeypatch, list(posts_by_id.values()))
 
     restub_pool(live_posts)
+    async def live_recommendation_counts(self, post_ids):
+        return {
+            post_id: {
+                "views": live_posts[post_id].view_count,
+                "likes": 0,
+                "saves": 0,
+                "shares": 0,
+            }
+            for post_id in post_ids
+            if post_id in live_posts
+        }
+
+    monkeypatch.setattr(
+        "repositories.social_repository.PostInteractionRepository.recommendation_engagement_counts",
+        live_recommendation_counts,
+    )
 
     first_page = await _feed(make_ctx(viewer), cursor=None, limit=2, following=False)
     first_ids = [item.id for item in first_page.items]
@@ -986,6 +1048,13 @@ async def test_for_you_pagination_accepts_legacy_plain_post_id_cursor(
     stub_feed_posts(monkeypatch, [])
     stub_discovery_pool(monkeypatch, posts)
     stub_hidden_creators(monkeypatch)
+    stub_recommendation_engagement_counts(
+        monkeypatch,
+        {
+            post.id: {"views": post.view_count}
+            for post in posts
+        },
+    )
 
     page = await _feed(
         make_ctx(viewer), cursor=str(post_ids[0]), limit=2, following=False
@@ -1481,6 +1550,10 @@ async def test_organic_delegates_unchanged_to_for_you(monkeypatch, follow_graph)
 async def test_paid_is_explicitly_unimplemented_without_fallback(monkeypatch, follow_graph):
     from api.graphql import schema
 
+    monkeypatch.setattr(
+        "services.paid_campaign_service.PaidCampaignService.get_candidate_page",
+        AsyncMock(return_value=[]),
+    )
     handlers = [AsyncMock() for _ in range(4)]
     for name, handler in zip(("_for_you_feed", "_organic_feed", "_viral_feed", "_community_feed"), handlers):
         monkeypatch.setattr(f"api.graphql.{name}", handler)
@@ -1489,7 +1562,8 @@ async def test_paid_is_explicitly_unimplemented_without_fallback(monkeypatch, fo
         context_value=make_ctx(make_user("viewer")),
     )
     assert result.errors
-    assert result.errors[0].message == "Paid feed ranking is not implemented"
+    assert result.errors[0].message == "Paid feed delivery is disabled"
+    assert result.errors[0].extensions is not None
     assert result.errors[0].extensions["code"] == "NOT_IMPLEMENTED"
     assert result.errors[0].extensions["statusCode"] == 501
     for handler in handlers:

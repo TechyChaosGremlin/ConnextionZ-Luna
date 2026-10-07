@@ -53,6 +53,15 @@ from api.graphql_rate_limits import (
     mutation_costs,
     query_complexity_error,
 )
+from api.paid_campaigns import (
+    CreatePaidCampaignInput,
+    PaidCampaignType,
+    UpdatePaidCampaignInput,
+    create_paid_campaign,
+    paid_campaign,
+    update_paid_campaign,
+)
+from services.paid_campaign_service import PaidCandidatePage
 
 # ── Custom Scalars ───────────────────────────────────────────────────────────
 
@@ -413,6 +422,11 @@ class LegacyPostType:
 @strawberry.type
 class FeedItemType(LegacyPostType):
     creator: ProfileSummaryType = None  # type: ignore[assignment]
+    is_sponsored: bool = False
+    sponsored_label: Optional[str] = None
+    paid_campaign_id: Optional[UUIDScalar] = None
+    paid_delivery_id: Optional[UUIDScalar] = None
+    paid_interaction_context: Optional[str] = None
 
 
 @strawberry.type
@@ -482,6 +496,9 @@ class SoundResultGQLType:
 class FeedPageType:
     items: List[FeedItemType]
     next_cursor: Optional[str] = None
+
+
+PAID_PUBLIC_DELIVERY_ENABLED = False
 
 
 @strawberry.type
@@ -1448,6 +1465,12 @@ class ReportConnection:
 
 @strawberry.type
 class Query:
+    @strawberry.field
+    async def paid_campaign(
+        self, info: StrawberryInfo[AppContext, None], id: UUIDScalar
+    ) -> PaidCampaignType:
+        return await paid_campaign(info.context, id)
+
     # -- Health --
     @strawberry.field
     def health(self) -> str:
@@ -1832,6 +1855,18 @@ class Query:
 
 @strawberry.type
 class Mutation:
+    @strawberry.mutation
+    async def create_paid_campaign(
+        self, info: StrawberryInfo[AppContext, None], input: CreatePaidCampaignInput
+    ) -> PaidCampaignType:
+        return await create_paid_campaign(info.context, input)
+
+    @strawberry.mutation
+    async def update_paid_campaign(
+        self, info: StrawberryInfo[AppContext, None], id: UUIDScalar, input: UpdatePaidCampaignInput
+    ) -> PaidCampaignType:
+        return await update_paid_campaign(info.context, id, input)
+
     # -- Auth --
     @strawberry.mutation
     async def register(
@@ -1901,22 +1936,38 @@ class Mutation:
         return await _delete_post(info.context, id)
 
     @strawberry.mutation
-    async def like_post(self, info: StrawberryInfo[AppContext, None], id: UUIDScalar) -> LikeResultType:
+    async def like_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+    ) -> LikeResultType:
         """Like a post. Returns the new liked state and like count."""
         return await _like_post_legacy(info.context, id, like=True)
 
     @strawberry.mutation
-    async def unlike_post(self, info: StrawberryInfo[AppContext, None], id: UUIDScalar) -> LikeResultType:
+    async def unlike_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+    ) -> LikeResultType:
         """Unlike a post. Returns the new liked state and like count."""
         return await _like_post_legacy(info.context, id, like=False)
 
     @strawberry.mutation
-    async def save_post(self, info: StrawberryInfo[AppContext, None], id: UUIDScalar) -> SaveResultType:
+    async def save_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+    ) -> SaveResultType:
         """Save a post to the authenticated user's collection."""
         return await _save_post_legacy(info.context, id, save=True)
 
     @strawberry.mutation
-    async def unsave_post(self, info: StrawberryInfo[AppContext, None], id: UUIDScalar) -> SaveResultType:
+    async def unsave_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+    ) -> SaveResultType:
         """Remove a post from the authenticated user's saved collection."""
         return await _save_post_legacy(info.context, id, save=False)
 
@@ -1929,7 +1980,9 @@ class Mutation:
 
     @strawberry.mutation
     async def share_post(
-        self, info: StrawberryInfo[AppContext, None], id: UUIDScalar
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
     ) -> ShareResultType:
         """Share a post to the current user's feed."""
         return await _share_post_legacy(info.context, id)
@@ -1947,12 +2000,128 @@ class Mutation:
 
     @strawberry.mutation
     async def not_interested(
-        self, info: StrawberryInfo[AppContext, None], post_id: UUIDScalar
+        self,
+        info: StrawberryInfo[AppContext, None],
+        post_id: UUIDScalar,
     ) -> NotInterestedResultType:
         """Explicit negative feedback: demote this post (and, via the shared
         interest-signal log, reduce similar content) in the viewer's For You
         feed. Idempotent per post/user."""
         return await _not_interested(info.context, post_id)
+
+    @strawberry.mutation
+    async def paid_like_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> LikeResultType:
+        """Like a post using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, id, paid_delivery_id, paid_interaction_context
+        )
+        return await _like_post_legacy(
+            info.context, id, like=True, paid_delivery_id=paid_delivery_id
+        )
+
+    @strawberry.mutation
+    async def paid_unlike_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> LikeResultType:
+        """Remove a like using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, id, paid_delivery_id, paid_interaction_context
+        )
+        return await _like_post_legacy(
+            info.context, id, like=False, paid_delivery_id=paid_delivery_id
+        )
+
+    @strawberry.mutation
+    async def paid_save_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> SaveResultType:
+        """Save a post using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, id, paid_delivery_id, paid_interaction_context
+        )
+        return await _save_post_legacy(
+            info.context, id, save=True, paid_delivery_id=paid_delivery_id
+        )
+
+    @strawberry.mutation
+    async def paid_unsave_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> SaveResultType:
+        """Remove a save using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, id, paid_delivery_id, paid_interaction_context
+        )
+        return await _save_post_legacy(
+            info.context, id, save=False, paid_delivery_id=paid_delivery_id
+        )
+
+    @strawberry.mutation
+    async def paid_share_post(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        id: UUIDScalar,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> ShareResultType:
+        """Share a post using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, id, paid_delivery_id, paid_interaction_context
+        )
+        return await _share_post_legacy(info.context, id, paid_delivery_id=paid_delivery_id)
+
+    @strawberry.mutation
+    async def paid_track_post_watch(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        post_id: UUIDScalar,
+        watched_seconds: float,
+        completed: bool,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> WatchResultType:
+        """Record a watch using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, post_id, paid_delivery_id, paid_interaction_context
+        )
+        return await _track_post_watch(
+            info.context,
+            post_id,
+            watched_seconds,
+            completed,
+            paid_delivery_id=paid_delivery_id,
+        )
+
+    @strawberry.mutation
+    async def paid_not_interested(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        post_id: UUIDScalar,
+        paid_delivery_id: UUIDScalar,
+        paid_interaction_context: str,
+    ) -> NotInterestedResultType:
+        """Record feedback using a one-use Paid Discovery interaction context."""
+        await _consume_paid_interaction_context(
+            info.context, post_id, paid_delivery_id, paid_interaction_context
+        )
+        return await _not_interested(info.context, post_id, paid_delivery_id=paid_delivery_id)
 
     @strawberry.mutation
     async def create_comment(
@@ -2657,7 +2826,6 @@ async def _feed(
     from repositories.content_repository import PostRepository
     from repositories.profile_repository import ProfileRepository
     from repositories.social_repository import FeedSafetyRepository, FollowRepository
-    
 
     user = ctx.require_auth()
     if limit <= 0:
@@ -2668,7 +2836,7 @@ async def _feed(
     follow_repo = FollowRepository(ctx.db)
 
     before_id: Optional[uuid.UUID] = None
-    if cursor:
+    if cursor and algorithm != FeedAlgorithm.PAID:
         # Snapshot cursors (For You) are opaque strings, not bare UUIDs — skip
         # UUID parsing for them and let the For You path decode the snapshot.
         if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
@@ -2834,7 +3002,48 @@ async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
 
 
 async def _paid_feed(ctx, user, followed_ids, before_id, limit, cursor):
-    raise NotImplementedError("Paid feed ranking is not implemented")
+    from services.paid_campaign_service import PaidCampaignService
+
+    page = await PaidCampaignService(ctx.db).get_candidate_page(
+        user, cursor=cursor, limit=min(limit, 100)
+    )
+    if not PAID_PUBLIC_DELIVERY_ENABLED:
+        raise NotImplementedError("Paid feed delivery is disabled")
+    return await _deliver_paid_feed_page(ctx, user, page)
+
+
+async def _deliver_paid_feed_page(
+    ctx: AppContext, user: User, page: PaidCandidatePage
+) -> FeedPageType:
+    from repositories.content_repository import PostRepository
+    from services.paid_delivery_service import PaidDeliveryService
+
+    delivery = PaidDeliveryService(ctx.db)
+    items: list[FeedItemType] = []
+    try:
+        for candidate in page.items:
+            delivery_id = await delivery.select_candidate(user, candidate)
+            from services.paid_interaction_context_service import PaidInteractionContextService
+
+            interaction_context = await PaidInteractionContextService(ctx.db).issue(
+                user.id, delivery_id
+            )
+            post = await PostRepository(ctx.db).get_by_id(candidate.post_id)
+            if post is None:
+                raise ValueError("Paid post is no longer available for delivery")
+            item = await _post_to_feed_item(ctx, post)
+            item.is_sponsored = candidate.is_sponsored
+            item.sponsored_label = candidate.sponsored_label
+            item.paid_campaign_id = candidate.paid_campaign_id
+            item.paid_delivery_id = delivery_id
+            item.paid_interaction_context = interaction_context
+            items.append(item)
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
+
+    return FeedPageType(items=items, next_cursor=page.next_cursor)
 
 
 async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
@@ -2988,7 +3197,7 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
     from datetime import timedelta, timezone
     from repositories.content_repository import PostRepository
     from repositories.profile_repository import ProfileRepository
-    from repositories.social_repository import FeedSafetyRepository
+    from repositories.social_repository import FeedSafetyRepository, PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
     import importlib
 
@@ -3074,6 +3283,26 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
     visible_ids = [post.id for post in visible]
     viewer_history = await analytics_repo.viewer_post_history(user.id, visible_ids)
     engagement_rates = await analytics_repo.post_engagement_rates(visible_ids)
+    active_engagement = await PostInteractionRepository(
+        ctx.db
+    ).recommendation_engagement_counts(visible_ids)
+    non_paid_views = {
+        post_id: counts["views"] for post_id, counts in active_engagement.items()
+    }
+
+    def post_engagement(post):
+        raw = dict(engagement_rates.get(post.id, {}))
+        counts = active_engagement.get(post.id, {})
+        raw.update(
+            {
+                "views_total": counts.get("views", 0),
+                "likes": counts.get("likes", 0),
+                "saves": counts.get("saves", 0),
+                "shares": counts.get("shares", 0),
+            }
+        )
+        return feed_ranking.build_engagement(raw, post)
+
     scored = [
         (
             post,
@@ -3083,14 +3312,12 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
                 is_followed=post.user_id in followed_creator_ids,
                 creator_affinity=affinity.get(post.user_id, 0.0),
                 viewer_history=viewer_history.get(post.id),
-                engagement=feed_ranking.build_engagement(
-                    engagement_rates.get(post.id, {}), post
-                ),
+                engagement=post_engagement(post),
             ),
         )
         for post in visible
     ]
-    ranked = feed_ranking.diversify_by_creator(scored)
+    ranked = feed_ranking.diversify_by_creator(scored, view_counts=non_paid_views)
 
     # ── Snapshot cursor pagination ────────────────────────────────────────────
     # The cursor encodes the full ranked post-id order + the position of the
@@ -6462,7 +6689,9 @@ async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
     return await _post_to_legacy_post(ctx, post)
 
 
-async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
+async def _like_post_legacy(
+    ctx, id, like: bool, paid_delivery_id: Optional[uuid.UUID] = None
+) -> LikeResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
@@ -6479,16 +6708,24 @@ async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
 
     is_liked = await interactions.has_liked(id, user.id)
     if like and not is_liked:
-        created_like = await interactions.toggle_like(id, user.id)
+        if paid_delivery_id is None:
+            created_like = await interactions.toggle_like(id, user.id)
+        else:
+            created_like = await interactions.toggle_like(id, user.id, paid_delivery_id)
         if created_like:
             await AnalyticsRepository(ctx.db).record(
-                user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.LIKE
+                user_id=user.id,
+                creator_id=post.user_id,
+                post_id=id,
+                signal_type=SignalType.LIKE,
+                paid_delivery_id=paid_delivery_id,
             )
             await AnalyticsEventService(ctx.db).track_event(
                 event_type=EventType.LIKE_CREATED,
                 user=user,
                 post=post,
                 session_id=ctx.session_id,
+                paid_delivery_id=paid_delivery_id,
             )
         if created_like and post.user_id != user.id:
             from repositories.notification_repository import NotificationRepository
@@ -6505,13 +6742,18 @@ async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
     elif not like and is_liked:
         await interactions.toggle_like(id, user.id)
         await AnalyticsRepository(ctx.db).record(
-            user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.UNLIKE
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=id,
+            signal_type=SignalType.UNLIKE,
+            paid_delivery_id=paid_delivery_id,
         )
         await AnalyticsEventService(ctx.db).track_event(
             event_type=EventType.LIKE_REMOVED,
             user=user,
             post=post,
             session_id=ctx.session_id,
+            paid_delivery_id=paid_delivery_id,
         )
 
     post.like_count = await interactions.count_likes(id)
@@ -6519,7 +6761,21 @@ async def _like_post_legacy(ctx, id, like: bool) -> LikeResultType:
     return LikeResultType(liked=like, likes=post.like_count)
 
 
-async def _save_post_legacy(ctx, id, save: bool) -> SaveResultType:
+async def _consume_paid_interaction_context(ctx, post_id, delivery_id, token: str) -> None:
+    from services.paid_interaction_context_service import PaidInteractionContextService
+
+    user = ctx.require_auth()
+    await PaidInteractionContextService(ctx.db).consume(
+        token,
+        viewer_id=user.id,
+        post_id=post_id,
+        delivery_id=delivery_id,
+    )
+
+
+async def _save_post_legacy(
+    ctx, id, save: bool, paid_delivery_id: Optional[uuid.UUID] = None
+) -> SaveResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
@@ -6536,20 +6792,32 @@ async def _save_post_legacy(ctx, id, save: bool) -> SaveResultType:
 
     is_saved = await interactions.has_saved(id, user.id)
     if save and not is_saved:
-        await interactions.toggle_save(id, user.id)
+        if paid_delivery_id is None:
+            await interactions.toggle_save(id, user.id)
+        else:
+            await interactions.toggle_save(id, user.id, paid_delivery_id)
         await AnalyticsRepository(ctx.db).record(
-            user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.SAVE
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=id,
+            signal_type=SignalType.SAVE,
+            paid_delivery_id=paid_delivery_id,
         )
         await AnalyticsEventService(ctx.db).track_event(
             event_type=EventType.SAVE_CREATED,
             user=user,
             post=post,
             session_id=ctx.session_id,
+            paid_delivery_id=paid_delivery_id,
         )
     elif not save and is_saved:
         await interactions.toggle_save(id, user.id)
         await AnalyticsRepository(ctx.db).record(
-            user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.UNSAVE
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=id,
+            signal_type=SignalType.UNSAVE,
+            paid_delivery_id=paid_delivery_id,
         )
 
     post.save_count = await interactions.count_saves(id)
@@ -6557,7 +6825,9 @@ async def _save_post_legacy(ctx, id, save: bool) -> SaveResultType:
     return SaveResultType(saved=save, saves=post.save_count)
 
 
-async def _share_post_legacy(ctx, id) -> ShareResultType:
+async def _share_post_legacy(
+    ctx, id, paid_delivery_id: Optional[uuid.UUID] = None
+) -> ShareResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
@@ -6572,23 +6842,37 @@ async def _share_post_legacy(ctx, id) -> ShareResultType:
     if not post:
         raise ValueError("Post not found")
 
-    created_share = await interactions.add_share(id, user.id)
+    if paid_delivery_id is None:
+        created_share = await interactions.add_share(id, user.id)
+    else:
+        created_share = await interactions.add_share(id, user.id, paid_delivery_id)
     if created_share:
         await AnalyticsRepository(ctx.db).record(
-            user_id=user.id, creator_id=post.user_id, post_id=id, signal_type=SignalType.SHARE
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=id,
+            signal_type=SignalType.SHARE,
+            paid_delivery_id=paid_delivery_id,
         )
         await AnalyticsEventService(ctx.db).track_event(
             event_type=EventType.SHARE_CREATED,
             user=user,
             post=post,
             session_id=ctx.session_id,
+            paid_delivery_id=paid_delivery_id,
         )
     post.share_count = await interactions.count_shares(id)
     await ctx.db.commit()
     return ShareResultType(shares=post.share_count, shared=True)
 
 
-async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchResultType:
+async def _track_post_watch(
+    ctx,
+    post_id,
+    watched_seconds,
+    completed,
+    paid_delivery_id: Optional[uuid.UUID] = None,
+) -> WatchResultType:
     from repositories.content_repository import PostRepository
     from repositories.social_repository import PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
@@ -6606,7 +6890,13 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
     clamped_seconds = max(0.0, min(watched_seconds, post.duration_sec)) if post.duration_sec else watched_seconds
     verified_completed = completed and post.duration_sec > 0 and clamped_seconds >= 0.9 * post.duration_sec
 
-    watch = await interactions.track_watch(post_id, user.id, clamped_seconds, verified_completed)
+    watch = await interactions.track_watch(
+        post_id,
+        user.id,
+        clamped_seconds,
+        verified_completed,
+        paid_delivery_id=paid_delivery_id,
+    )
     post.view_count = await interactions.count_views(post_id)
 
     analytics = AnalyticsRepository(ctx.db)
@@ -6614,11 +6904,19 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
     duration_ms = int(watch.watched_seconds * 1000)
     if watch.rewatched:
         await analytics.record(
-            user_id=user.id, creator_id=post.user_id, post_id=post_id, signal_type=SignalType.REWATCH
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=post_id,
+            signal_type=SignalType.REWATCH,
+            paid_delivery_id=paid_delivery_id,
         )
     else:
         await analytics.record(
-            user_id=user.id, creator_id=post.user_id, post_id=post_id, signal_type=SignalType.VIEW
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=post_id,
+            signal_type=SignalType.VIEW,
+            paid_delivery_id=paid_delivery_id,
         )
     await analytics.record(
         user_id=user.id,
@@ -6626,10 +6924,15 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
         post_id=post_id,
         signal_type=SignalType.WATCH_DURATION,
         value=watch.watched_seconds,
+        paid_delivery_id=paid_delivery_id,
     )
 
     await events.track_event(
-        event_type=EventType.VIDEO_VIEWED, user=user, post=post, session_id=ctx.session_id,
+        event_type=EventType.VIDEO_VIEWED,
+        user=user,
+        post=post,
+        session_id=ctx.session_id,
+        paid_delivery_id=paid_delivery_id,
     )
     await events.track_event(
         event_type=EventType.VIDEO_WATCHED,
@@ -6637,11 +6940,16 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
         post=post,
         session_id=ctx.session_id,
         duration_ms=duration_ms,
+        paid_delivery_id=paid_delivery_id,
     )
 
     if watch.completed:
         await analytics.record(
-            user_id=user.id, creator_id=post.user_id, post_id=post_id, signal_type=SignalType.COMPLETION
+            user_id=user.id,
+            creator_id=post.user_id,
+            post_id=post_id,
+            signal_type=SignalType.COMPLETION,
+            paid_delivery_id=paid_delivery_id,
         )
         await events.track_event(
             event_type=EventType.VIDEO_COMPLETED,
@@ -6649,6 +6957,7 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
             post=post,
             session_id=ctx.session_id,
             duration_ms=duration_ms,
+            paid_delivery_id=paid_delivery_id,
         )
     elif post.duration_sec and watch.watched_seconds < 0.25 * post.duration_sec:
         # Left well before the end without completing — treat as a skip.
@@ -6657,6 +6966,7 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
             user=user,
             post=post,
             session_id=ctx.session_id,
+            paid_delivery_id=paid_delivery_id,
             duration_ms=duration_ms,
         )
 
@@ -6670,7 +6980,9 @@ async def _track_post_watch(ctx, post_id, watched_seconds, completed) -> WatchRe
     )
 
 
-async def _not_interested(ctx, post_id) -> NotInterestedResultType:
+async def _not_interested(
+    ctx, post_id, paid_delivery_id: Optional[uuid.UUID] = None
+) -> NotInterestedResultType:
     """Explicit "Not Interested" feedback on a post.
 
     Records a real production signal (SignalType.NOT_INTERESTED) into the
@@ -6701,12 +7013,14 @@ async def _not_interested(ctx, post_id) -> NotInterestedResultType:
             creator_id=post.user_id,
             post_id=post_id,
             signal_type=SignalType.NOT_INTERESTED,
+            paid_delivery_id=paid_delivery_id,
         )
         await AnalyticsEventService(ctx.db).track_event(
             event_type=EventType.NOT_INTERESTED,
             user=user,
             post=post,
             session_id=ctx.session_id,
+            paid_delivery_id=paid_delivery_id,
         )
         await ctx.db.commit()
 

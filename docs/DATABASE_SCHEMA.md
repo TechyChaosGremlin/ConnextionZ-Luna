@@ -39,6 +39,7 @@
 11. [Indexing Strategy](#indexing-strategy)
 12. [Migration Guide](#migration-guide)
 13. [Streaming Viewer Sessions](#streaming-viewer-sessions)
+14. [Paid Campaigns](#paid-campaigns)
 
 ---
 
@@ -772,6 +773,83 @@ CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --
 
 ---
 
+## Paid Campaigns
+
+The separate Paid discovery algorithm uses `paid_campaigns`, defined in
+[PaidCampaign](../backend/app/models/paid_campaign.py) and backend migration
+[207](../backend/alembic/versions/207_paid_campaign_foundation.py) (after 206).
+This foundation does not enable delivery, billing, or non-Paid feed placement.
+
+| Column | Type | Contract |
+|--------|------|----------|
+| `id` | UUIDv7 | Primary key |
+| `owner_id` | UUID | Advertiser user FK to `users.id`, cascade on user deletion |
+| `post_id` | UUID | Promoted content FK to `posts.id`, cascade on post deletion |
+| `status` | `paid_campaign_status` enum | `draft`, `scheduled`, `active`, `paused`, `exhausted`, `completed`, `cancelled`; default `draft` |
+| `start_at`, `end_at` | timezone-aware timestamp | Required, end strictly after start |
+| `currency` | varchar(3) | Explicit uppercase currency code; no conversion/payment handling |
+| `budget_minor_units` | integer | Positive minor-unit budget |
+| `spent_minor_units` | integer | Initially zero; nonnegative and no greater than budget |
+| `impressions_delivered`, `reach_delivered` | integer | Initially zero; nonnegative, reach no greater than impressions |
+| `max_impressions`, `max_reach` | nullable integer | Positive optional ceilings, no lower than delivered counters |
+| `frequency_cap`, `frequency_window_seconds` | nullable integer | Both absent or both positive; rolling eligibility fails closed until reliable Paid impression history exists |
+| `targeting` | nullable JSONB | `null`/`{}` or `{"tags": [...]}`; strict approved onboarding-topic validation, sorted lowercase values |
+| `created_at`, `updated_at` | timezone-aware timestamp | Existing timestamp mixin |
+
+Indexes: `(owner_id, created_at)`, `(post_id)`, and `(status, start_at, end_at)`.
+Campaign deletion does not cascade to its post. Terminal campaign status or
+expiry changes neither post status nor visibility. Counter updates are not
+exposed through owner-management inputs; the internal atomic ledger is described
+below. See the [Paid specification](./ARCHITECTURE.md#paid-algorithm-specification)
+for authorization, lifecycle, candidate gates, and attribution prerequisites.
+
+The targeting/frequency slice reuses this schema without a migration. Targeting
+supports only the nine existing onboarding topics matched to `Profile.tags`;
+there is no new category/interest table or demographic profiling. The validated
+array contains 1-9 unique topics (case/whitespace normalized); explicit empty
+arrays and unknown/unsupported values/fields are rejected. Null/empty-object
+targeting is broad. Frequency uses a per-viewer/per-campaign UTC rolling window,
+not campaign-wide `impressions_delivered`. Existing product event metadata is
+not reliable Paid history; frequency now queries only the authoritative ledger.
+The reads create no impression records and update no delivery counters.
+
+### Paid delivery ledger
+
+[PaidDelivery](../backend/app/models/paid_delivery.py) is created by backend
+migration [208](../backend/alembic/versions/208_paid_delivery_accounting.py),
+after 207.
+
+| Column | Type | Contract |
+|--------|------|----------|
+| `id` | UUIDv7 | Server-generated selection/deduplication primary key |
+| `campaign_id` | UUID | FK to `paid_campaigns.id`, cascade on campaign deletion |
+| `viewer_id` | UUID | Stable campaign-local viewer identity; no FK cascade that could erase history on user deletion |
+| `post_id` | UUID | FK to `posts.id`, cascade on post deletion; service verifies campaign/post relationship |
+| `selected_at` | timezone-aware timestamp | Server selection instant; no impression/capacity consumption yet |
+| `impressed_at` | nullable timezone-aware timestamp | Set only by internal atomic accounting, no earlier than `selected_at` |
+| `created_at`, `updated_at` | timezone-aware timestamp | Existing timestamp mixin |
+
+Indexes: `(campaign_id, viewer_id, impressed_at)`, `(post_id)`, and `(viewer_id)`.
+There is intentionally no uniqueness constraint on `(campaign_id, viewer_id)`:
+repeat impressions are legitimate, while reach is distinct viewer IDs.
+Pending records count as neither impressions nor reach/frequency. A recorded
+ID counts once; retries return the prior receipt. PostgreSQL parent campaign
+row locking protects SQL counter increments and concurrent first-viewer reach.
+Ledger and counter writes share a savepoint/outer transaction; caller commits.
+No monetary spend is incremented because no pricing policy exists.
+
+The history provider compares lifetime recorded counts/distinct viewer reach
+with campaign counters and fails closed on missing/inconsistent history.
+Migration 208 does not fabricate or backfill legacy Paid impressions.
+Deletion/retention must preserve ledger/counter consistency; campaign expiry
+does not delete the post. Public Paid delivery remains disabled.
+
+Use [backend/alembic.ini](../backend/alembic.ini) for this PostgreSQL chain.
+The root Alembic configuration points to a different legacy migration tree;
+it does not discover revisions 207/208. Inspect backend heads from the repository
+root with `python -m alembic -c backend/alembic.ini heads`, using the chosen
+environment's Python executable. No shared database is migrated by the tests.
+
 ## Table Summary
 
 | # | Table | Rows (est.) | Primary Key | Soft Delete | Key Feature |
@@ -795,6 +873,8 @@ CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --
 | 17 | `conversation_participants` | 20K–20M | UUIDv7 | — | Many-to-many |
 | 18 | `messages` | 100K–1B | UUIDv7 | ✅ | Chat history |
 | 19 | `notifications` | 1M–1B | UUIDv7 | — | User alerts |
+| 20 | `paid_campaigns` | Not estimated | UUIDv7 | — | Owner-managed separate Paid campaigns |
+| 21 | `paid_deliveries` | Not estimated | UUIDv7 | — | Server selections and authoritative impression/reach history |
 
 ---
 

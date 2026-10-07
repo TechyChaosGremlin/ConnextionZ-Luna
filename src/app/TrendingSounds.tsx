@@ -7,6 +7,7 @@ import {
   X, Heart, Navigation, Check, Send
 } from "lucide-react";
 import { fetchTrendingSounds } from "./profile-graphql";
+import { PaidDiscoveryLink } from "./PaidDiscovery";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 
@@ -655,11 +656,12 @@ function SoundDetail({ sound, onBack }: { sound: Sound; onBack: () => void }) {
 // ─── TRENDING SOUNDS PAGE ─────────────────────────────────────────────────────
 
 export function TrendingSounds({
-  onBack, initialSoundId = null,
+  onBack, initialSoundId = null, onOpenPaid,
 }: {
   onBack: () => void;
   /** Opens straight onto a sound's detail — how a search result lands here. */
   initialSoundId?: string | null;
+  onOpenPaid?: () => void;
 }) {
   const isDark = useTheme();
   const [activeGenre, setActiveGenre] = useState("All");
@@ -718,6 +720,7 @@ export function TrendingSounds({
           <h1 className="font-bold text-xl" style={{ color: headingColor }}>Trending Sounds</h1>
           <p className="text-[12px]" style={{ color: subheadColor }}>Updated hourly</p>
         </div>
+        {onOpenPaid && <PaidDiscoveryLink onOpen={onOpenPaid} />}
         <div className="px-3 py-1.5 rounded-full text-[11px] font-bold" style={{ background: "rgba(0,174,239,0.15)", color: "#00AEEF", border: "1px solid rgba(0,174,239,0.3)" }}>
           🔴 LIVE
         </div>

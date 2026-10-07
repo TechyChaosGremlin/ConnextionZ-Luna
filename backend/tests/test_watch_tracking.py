@@ -32,13 +32,18 @@ def watch_store(monkeypatch):
     async def fake_get_by_id(self, post_id):
         return SimpleNamespace(id=post_id, user_id=uuid.uuid4(), duration_sec=100.0, view_count=0)
 
-    async def fake_track_watch(self, post_id, user_id, watched_seconds, completed):
+    async def fake_track_watch(
+        self, post_id, user_id, watched_seconds, completed, paid_delivery_id=None
+    ):
+        assert paid_delivery_id is None
         event = SimpleNamespace(
             post_id=post_id,
             user_id=user_id,
             watched_seconds=watched_seconds,
             completed=completed,
-            rewatched=any(event.post_id == post_id and event.user_id == user_id for event in events),
+            rewatched=any(
+                event.post_id == post_id and event.user_id == user_id for event in events
+            ),
         )
         events.append(event)
         return event

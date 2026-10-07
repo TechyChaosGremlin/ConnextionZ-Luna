@@ -11,8 +11,8 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import delete, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.social import (
     CommentLike,
@@ -176,6 +176,24 @@ class PostInteractionRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def _paid_attribution(
+        self,
+        post_id: uuid.UUID,
+        user_id: uuid.UUID,
+        paid_delivery_id: uuid.UUID | None,
+    ) -> dict:
+        if paid_delivery_id is None:
+            return {}
+        from repositories.paid_delivery_repository import PaidDeliveryRepository
+
+        delivery = await PaidDeliveryRepository(self.db).impressed_for_engagement(
+            paid_delivery_id, user_id, post_id
+        )
+        return {
+            "paid_delivery_id": delivery.id,
+            "paid_campaign_id": delivery.campaign_id,
+        }
+
     async def has_liked(self, post_id: uuid.UUID, user_id: uuid.UUID) -> bool:
         result = await self.db.execute(
             select(PostLike.id).where(PostLike.post_id == post_id, PostLike.user_id == user_id)
@@ -224,7 +242,12 @@ class PostInteractionRepository:
         )
         return set(result.scalars().all())
 
-    async def toggle_like(self, post_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    async def toggle_like(
+        self,
+        post_id: uuid.UUID,
+        user_id: uuid.UUID,
+        paid_delivery_id: uuid.UUID | None = None,
+    ) -> bool:
         """Toggle like, return the new liked state."""
         if await self.has_liked(post_id, user_id):
             await self.db.execute(
@@ -234,14 +257,23 @@ class PostInteractionRepository:
             return False
         result = await self.db.execute(
             insert(PostLike)
-            .values(post_id=post_id, user_id=user_id)
+            .values(
+                post_id=post_id,
+                user_id=user_id,
+                **(await self._paid_attribution(post_id, user_id, paid_delivery_id)),
+            )
             .on_conflict_do_nothing(constraint="uq_post_like")
         )
         await self.db.flush()
         rowcount = getattr(result, "rowcount", 0)
         return bool(rowcount and rowcount > 0)
 
-    async def toggle_save(self, post_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    async def toggle_save(
+        self,
+        post_id: uuid.UUID,
+        user_id: uuid.UUID,
+        paid_delivery_id: uuid.UUID | None = None,
+    ) -> bool:
         if await self.has_saved(post_id, user_id):
             await self.db.execute(
                 delete(PostSave).where(PostSave.post_id == post_id, PostSave.user_id == user_id)
@@ -250,18 +282,33 @@ class PostInteractionRepository:
             return False
         result = await self.db.execute(
             insert(PostSave)
-            .values(post_id=post_id, user_id=user_id)
+            .values(
+                post_id=post_id,
+                user_id=user_id,
+                **(await self._paid_attribution(post_id, user_id, paid_delivery_id)),
+            )
             .on_conflict_do_nothing(constraint="uq_post_save")
         )
         await self.db.flush()
         rowcount = getattr(result, "rowcount", 0)
         return bool(rowcount and rowcount > 0)
 
-    async def add_share(self, post_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    async def add_share(
+        self,
+        post_id: uuid.UUID,
+        user_id: uuid.UUID,
+        paid_delivery_id: uuid.UUID | None = None,
+    ) -> bool:
         """Idempotent — repeated shares by the same user don't duplicate rows."""
         if await self.has_shared(post_id, user_id):
             return False
-        self.db.add(PostShare(post_id=post_id, user_id=user_id))
+        self.db.add(
+            PostShare(
+                post_id=post_id,
+                user_id=user_id,
+                **(await self._paid_attribution(post_id, user_id, paid_delivery_id)),
+            )
+        )
         await self.db.flush()
         return True
 
@@ -290,8 +337,60 @@ class PostInteractionRepository:
         )
         return result.scalar_one()
 
+    async def recommendation_engagement_counts(
+        self, post_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, int]]:
+        """Count only non-Paid interactions for Organic/For You scoring."""
+        if not post_ids:
+            return {}
+        from sqlalchemy import literal, union_all
+
+        statements = (
+            select(
+                PostWatch.post_id,
+                literal("views_total").label("metric"),
+                func.count(func.distinct(PostWatch.user_id)).label("count"),
+            )
+            .where(PostWatch.post_id.in_(post_ids), PostWatch.paid_delivery_id.is_(None))
+            .group_by(PostWatch.post_id),
+            select(
+                PostLike.post_id,
+                literal("likes").label("metric"),
+                func.count(PostLike.id).label("count"),
+            )
+            .where(PostLike.post_id.in_(post_ids), PostLike.paid_delivery_id.is_(None))
+            .group_by(PostLike.post_id),
+            select(
+                PostSave.post_id,
+                literal("saves").label("metric"),
+                func.count(PostSave.id).label("count"),
+            )
+            .where(PostSave.post_id.in_(post_ids), PostSave.paid_delivery_id.is_(None))
+            .group_by(PostSave.post_id),
+            select(
+                PostShare.post_id,
+                literal("shares").label("metric"),
+                func.count(PostShare.id).label("count"),
+            )
+            .where(PostShare.post_id.in_(post_ids), PostShare.paid_delivery_id.is_(None))
+            .group_by(PostShare.post_id),
+        )
+        result = await self.db.execute(union_all(*statements))
+        counts = {
+            post_id: {"views": 0, "likes": 0, "saves": 0, "shares": 0}
+            for post_id in post_ids
+        }
+        for post_id, metric, count in result.all():
+            counts[post_id][metric] = int(count or 0)
+        return counts
+
     async def track_watch(
-        self, post_id: uuid.UUID, user_id: uuid.UUID, watched_seconds: float, completed: bool
+        self,
+        post_id: uuid.UUID,
+        user_id: uuid.UUID,
+        watched_seconds: float,
+        completed: bool,
+        paid_delivery_id: uuid.UUID | None = None,
     ) -> PostWatch:
         """Always inserts a new row — one event per call, never merged/deduped."""
         existing = await self.db.execute(
@@ -306,6 +405,7 @@ class PostInteractionRepository:
             watched_seconds=watched_seconds,
             completed=completed,
             rewatched=rewatched,
+            **(await self._paid_attribution(post_id, user_id, paid_delivery_id)),
         )
         self.db.add(watch)
         await self.db.flush()

@@ -128,6 +128,10 @@ class PostEngagementSignals:
     watch_quality: float = 0.0
     completion_rate: float = 0.0
     rewatch_rate: float = 0.0
+    views: int | None = None
+    likes: int | None = None
+    shares: int | None = None
+    saves: int | None = None
 
 
 def _normalized_rate(count: float, denominator: float) -> float:
@@ -160,6 +164,14 @@ def build_engagement(raw: dict, post: Any) -> PostEngagementSignals:
         watch_quality=watch_quality,
         completion_rate=_normalized_rate(completions, views),
         rewatch_rate=_normalized_rate(rewatches, views),
+        views=(
+            max(int(raw["views_total"] or 0), 0)
+            if "views_total" in raw
+            else None
+        ),
+        likes=max(int(raw["likes"] or 0), 0) if "likes" in raw else None,
+        shares=max(int(raw["shares"] or 0), 0) if "shares" in raw else None,
+        saves=max(int(raw["saves"] or 0), 0) if "saves" in raw else None,
     )
 
 
@@ -221,10 +233,30 @@ def score_post(
     default_engagement = PostEngagementSignals()
     engagement = engagement or default_engagement
 
-    views = max(getattr(post, "view_count", 0) or 0, 0)
-    likes = max(getattr(post, "like_count", 0) or 0, 0)
-    shares = max(getattr(post, "share_count", 0) or 0, 0)
-    saves = max(getattr(post, "save_count", 0) or 0, 0)
+    views = max(
+        engagement.views
+        if engagement.views is not None
+        else (getattr(post, "view_count", 0) or 0),
+        0,
+    )
+    likes = max(
+        engagement.likes
+        if engagement.likes is not None
+        else (getattr(post, "like_count", 0) or 0),
+        0,
+    )
+    shares = max(
+        engagement.shares
+        if engagement.shares is not None
+        else (getattr(post, "share_count", 0) or 0),
+        0,
+    )
+    saves = max(
+        engagement.saves
+        if engagement.saves is not None
+        else (getattr(post, "save_count", 0) or 0),
+        0,
+    )
 
     # Normalized [0, 1] components (bounded; missing values => 0).
     watch_quality = max(0.0, min(1.0, engagement.watch_quality))
@@ -273,6 +305,7 @@ def score_post(
 def diversify_by_creator(
     scored: list[tuple[Any, float]],
     max_consecutive: int = MAX_CONSECUTIVE_PER_CREATOR,
+    view_counts: dict[uuid.UUID, int] | None = None,
 ) -> list[Any]:
     """Reorder score-sorted candidates so no creator dominates a run.
 
@@ -290,7 +323,12 @@ def diversify_by_creator(
         # popularity can never dominate — it only stabilizes exact ties.
         key=lambda item: (
             item[1],
-            max(getattr(item[0], "view_count", 0) or 0, 0),
+            max(
+                (view_counts or {}).get(
+                    item[0].id, getattr(item[0], "view_count", 0) or 0
+                ),
+                0,
+            ),
             str(item[0].id),
         ),
         reverse=True,

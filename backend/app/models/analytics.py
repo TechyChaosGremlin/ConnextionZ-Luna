@@ -67,9 +67,18 @@ class InteractionSignal(Base, TimestampMixin):
             "created_at",
             postgresql_where=text("stream_session_id IS NOT NULL"),
         ),
+        Index(
+            "ix_interaction_signals_paid_campaign_created",
+            "paid_campaign_id",
+            "created_at",
+        ),
         CheckConstraint(
             "stream_session_id IS NULL OR (signal_type = 'follow' AND post_id IS NULL)",
             name="ck_interaction_signals_stream_follow",
+        ),
+        CheckConstraint(
+            "(paid_delivery_id IS NULL) = (paid_campaign_id IS NULL)",
+            name="ck_interaction_signals_paid_attribution",
         ),
     )
 
@@ -90,6 +99,8 @@ class InteractionSignal(Base, TimestampMixin):
         ForeignKey("stream_sessions.id", ondelete="SET NULL"),
         nullable=True,
     )
+    paid_delivery_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    paid_campaign_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     signal_type: Mapped[SignalType] = mapped_column(
         # values_callable persists the enum values ("view", ...) rather than
         # member names ("VIEW", ...), matching migration 004's DB enum labels.
@@ -157,6 +168,11 @@ class AnalyticsEvent(Base, TimestampMixin):
     __tablename__ = "analytics_events"
     __table_args__ = (
         Index("ix_analytics_events_created_at", "created_at"),
+        Index("ix_analytics_events_paid_campaign_created", "paid_campaign_id", "created_at"),
+        CheckConstraint(
+            "(paid_delivery_id IS NULL) = (paid_campaign_id IS NULL)",
+            name="ck_analytics_events_paid_attribution",
+        ),
     )
 
     user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -176,6 +192,8 @@ class AnalyticsEvent(Base, TimestampMixin):
     )
     session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    paid_delivery_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    paid_campaign_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     # Column name stays "metadata" in the DB; the Python attribute is renamed
     # to avoid clashing with SQLAlchemy's reserved ``Base.metadata`` class attr.
     event_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
