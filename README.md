@@ -71,6 +71,17 @@
   - Production `DATABASE_URL`, `REDIS_URL`, and `RABBITMQ_URL` values. The app
     requires reachable Redis and RabbitMQ services during startup.
 
+  To copy accounts from the local PostgreSQL database into a new, empty Neon
+  database, run `.\scripts\migrate-local-db-to-neon.ps1` in PowerShell from the
+  repository root. The script reads the local source URL from `backend\.env`,
+  prompts for the Neon direct connection URL without displaying it, refuses a
+  target that already has user tables, and reports the imported account count.
+  It leaves the local database unchanged.
+
+  After a successful copy, set Vercel's Production `DATABASE_URL` to the same
+  Neon connection URL, changing the scheme prefix from `postgresql://` to
+  `postgresql+asyncpg://`, then redeploy.
+
   Once deployed, `/health` checks backend reachability. The frontend uses
   same-origin API URLs automatically in production, so it does not rely on a
   `VITE_API_URL` value. Set `CORS_ORIGINS` only if the API must also accept
