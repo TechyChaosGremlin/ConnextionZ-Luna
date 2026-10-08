@@ -1,8 +1,12 @@
 /**
  * Backend API configuration
- * Point to the Python GraphQL backend for auth and profile data
+ * Deployed frontend and backend share a Vercel domain. Keep API requests
+ * same-origin there; local development still targets the local FastAPI server.
  */
-export const BACKEND_API_URL = import.meta.env?.VITE_API_URL || "http://127.0.0.1:8002";
+const configuredBackendUrl = import.meta.env?.VITE_API_URL?.trim().replace(/\/+$/, "");
+
+export const BACKEND_API_URL =
+  import.meta.env?.PROD ? "" : (configuredBackendUrl || "http://127.0.0.1:8002");
 
 export const GRAPHQL_ENDPOINT = `${BACKEND_API_URL}/graphql`;
 export const AUTH_LOGIN_ENDPOINT = `${BACKEND_API_URL}/auth/login`;

@@ -55,23 +55,25 @@
   limiter and can break the post-registration profile request. These pins are
   local-only and do not affect production dependencies.
 
-  ## Deploying the API to Vercel
+  ## Deploying the frontend and API to Vercel
 
-  Deploy the backend as a separate Vercel project from this repository:
+  The root `vercel.json` configures Vercel Services so the Vite frontend and
+  FastAPI backend deploy together in the same Vercel project and share one
+  domain. Keep the Vercel project's **Root Directory** set to the repository
+  root. Requests to `/auth/*`, `/graphql`, `/api/*`, `/media/*`, and `/health`
+  route to the backend; other paths serve the frontend.
 
-  1. Set the Vercel project's **Root Directory** to `backend`. Vercel will use
-     `backend/requirements.txt` and the FastAPI entrypoint in
-     `backend/pyproject.toml`.
-  2. Add the required production environment variables in Vercel:
-     `ENVIRONMENT=production`, `DEBUG=false`, a unique `JWT_SECRET_KEY` with at
-     least 32 characters, and production `DATABASE_URL`, `REDIS_URL`, and
-     `RABBITMQ_URL` values. The app checks Redis and RabbitMQ during startup, so
-     both services must be reachable by the function.
-  3. Set `CORS_ORIGINS` to a JSON list containing the deployed frontend's
-     origin, for example `["https://your-frontend.vercel.app"]`.
-  4. Set `VITE_API_URL` in the frontend Vercel project to the backend deployment
-     URL without a trailing slash, then redeploy the frontend.
+  Add these environment variables to the Vercel project for **Production,
+  Preview, and Development** as needed:
 
-  The GraphQL endpoint is `<backend deployment URL>/graphql`.
+  - `ENVIRONMENT=production` and `DEBUG=false`
+  - A unique `JWT_SECRET_KEY` with at least 32 characters
+  - Production `DATABASE_URL`, `REDIS_URL`, and `RABBITMQ_URL` values. The app
+    requires reachable Redis and RabbitMQ services during startup.
+
+  Once deployed, `/health` checks backend reachability. The frontend uses
+  same-origin API URLs automatically in production, so it does not rely on a
+  `VITE_API_URL` value. Set `CORS_ORIGINS` only if the API must also accept
+  requests from another origin; use a JSON list of exact origins.
 
   
