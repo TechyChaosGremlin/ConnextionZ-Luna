@@ -21,39 +21,37 @@ function Get-PostgresConnectionParts {
         $normalizedConnectionString = $urlToken.Value.TrimEnd([char[]]@("'", '"', ";", ",", ")"))
     }
 
-    $urlMatch = [regex]::Match(
-        $normalizedConnectionString,
-        "^(?<scheme>postgres(?:ql)?(?:\+asyncpg|\+psycopg)?)://(?<userinfo>.+)@(?<host>[^:/?#]+)(?::(?<port>\d+))?/(?<database>[^/?#]+)(?:\?(?<query>[^#]*))?$",
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-    if (-not $urlMatch.Success) {
-        throw "$ParameterName is not a valid PostgreSQL URL. Paste only the URL (starting with postgresql:// or postgres://), or the complete `psql 'URL'` command from Neon."
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($normalizedConnectionString, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "$ParameterName is not a valid PostgreSQL URL. Copy the full direct connection string; URL-special characters in the password must be percent-encoded."
     }
 
-    $scheme = $urlMatch.Groups["scheme"].Value.ToLowerInvariant()
+    $scheme = $uri.Scheme.ToLowerInvariant()
     if ($scheme -notin @("postgresql", "postgres", "postgresql+asyncpg", "postgresql+psycopg")) {
         throw "$ParameterName must use a PostgreSQL URL."
     }
 
-    $credentials = $urlMatch.Groups["userinfo"].Value.Split(":", 2)
+    if ([string]::IsNullOrWhiteSpace($uri.Host) -or [string]::IsNullOrWhiteSpace($uri.AbsolutePath.TrimStart("/")) -or -not [string]::IsNullOrEmpty($uri.Fragment)) {
+        throw "$ParameterName must include a host and database name and must not contain a URL fragment."
+    }
+
+    $credentials = $uri.UserInfo.Split(":", 2)
     if ($credentials.Count -ne 2 -or [string]::IsNullOrWhiteSpace($credentials[0])) {
         throw "$ParameterName must include a database username and password."
     }
 
-    $databaseName = [System.Uri]::UnescapeDataString($urlMatch.Groups["database"].Value)
+    $databaseName = [System.Uri]::UnescapeDataString($uri.AbsolutePath.TrimStart("/"))
     if ([string]::IsNullOrWhiteSpace($databaseName)) {
         throw "$ParameterName must include a database name."
     }
 
-    $port = 5432
-    if ($urlMatch.Groups["port"].Success -and
-        (-not [int]::TryParse($urlMatch.Groups["port"].Value, [ref]$port) -or
-            $port -lt 1 -or $port -gt 65535)) {
+    $port = if ($uri.IsDefaultPort) { 5432 } else { $uri.Port }
+    if ($port -lt 1 -or $port -gt 65535) {
         throw "$ParameterName contains an invalid PostgreSQL port."
     }
 
     return [PSCustomObject]@{
-        Host     = $urlMatch.Groups["host"].Value
+        Host     = $uri.Host
         Port     = $port
         Database = $databaseName
         User     = [System.Uri]::UnescapeDataString($credentials[0])
