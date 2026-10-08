@@ -61,6 +61,9 @@ markers = [
 ]
 filterwarnings = ["error"]
 
+[tool.vercel]
+entrypoint = "app.main:app"
+
 [tool.coverage.run]
 source = ["app"]
 omit = [

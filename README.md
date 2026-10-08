@@ -53,5 +53,25 @@
   The local requirements pin Strawberry and graphql-core to compatible versions:
   graphql-core 3.3 changes parser/execution behavior used by the existing query
   limiter and can break the post-registration profile request. These pins are
-  local-only; production requirements and deployment configuration are unchanged.
+  local-only and do not affect production dependencies.
+
+  ## Deploying the API to Vercel
+
+  Deploy the backend as a separate Vercel project from this repository:
+
+  1. Set the Vercel project's **Root Directory** to `backend`. Vercel will use
+     `backend/requirements.txt` and the FastAPI entrypoint in
+     `backend/pyproject.toml`.
+  2. Add the required production environment variables in Vercel:
+     `ENVIRONMENT=production`, `DEBUG=false`, a unique `JWT_SECRET_KEY` with at
+     least 32 characters, and production `DATABASE_URL`, `REDIS_URL`, and
+     `RABBITMQ_URL` values. The app checks Redis and RabbitMQ during startup, so
+     both services must be reachable by the function.
+  3. Set `CORS_ORIGINS` to a JSON list containing the deployed frontend's
+     origin, for example `["https://your-frontend.vercel.app"]`.
+  4. Set `VITE_API_URL` in the frontend Vercel project to the backend deployment
+     URL without a trailing slash, then redeploy the frontend.
+
+  The GraphQL endpoint is `<backend deployment URL>/graphql`.
+
   
