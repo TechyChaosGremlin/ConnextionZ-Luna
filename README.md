@@ -71,12 +71,16 @@
   - Production `DATABASE_URL`, `REDIS_URL`, and `RABBITMQ_URL` values. The app
     requires reachable Redis and RabbitMQ services during startup.
 
-  To copy accounts from the local PostgreSQL database into a new, empty Neon
-  database, run `.\scripts\migrate-local-db-to-neon.ps1` in PowerShell from the
-  repository root. The script reads the local source URL from `backend\.env`,
-  prompts for the Neon direct connection URL without displaying it, refuses a
-  target that already has user tables, and reports the imported account count.
-  It leaves the local database unchanged.
+  To copy the local PostgreSQL database into a new, empty Neon database, run
+  `.\scripts\migrate-local-db-to-neon.ps1` in PowerShell from the repository
+  root. If Neon already has the app's schema and you want to keep its tables,
+  run `.\scripts\migrate-local-db-to-neon.ps1 -AccountsOnly` instead. That mode
+  appends only local `users` and `profiles` rows in one transaction; unique-key
+  conflicts or schema mismatches abort the import without overwriting existing
+  Neon rows. Either mode reads the local source URL from `backend\.env` and
+  prompts for the Neon direct connection URL without displaying it. Add
+  `-UseClipboard` to use the copied connection URL instead of the hidden prompt.
+  Both modes leave the local database unchanged.
 
   After a successful copy, set Vercel's Production `DATABASE_URL` to the same
   Neon connection URL, changing the scheme prefix from `postgresql://` to
