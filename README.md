@@ -86,6 +86,21 @@
   Neon connection URL, changing the scheme prefix from `postgresql://` to
   `postgresql+asyncpg://`, then redeploy.
 
+  To move the current Neon database to a fresh Supabase project, run
+  `.\scripts\migrate-neon-to-supabase.ps1` from the repository root. The script
+  prompts privately for both database URLs, creates the app schema in Supabase
+  using the repository's Alembic migrations, and imports Neon `public` data in
+  one transaction. It leaves Neon unchanged, preserves Supabase-managed
+  schemas, and excludes the migration version marker and migration-seeded
+  categories. Use Supabase's direct connection URL or its session pooler on
+  port 5432; do not use the transaction pooler. The Supabase `public` schema
+  must be empty before starting.
+
+  After the script reports success, set Vercel's Production `DATABASE_URL` to
+  the Supabase connection URL with the `postgresql+asyncpg://` scheme, then
+  redeploy. Keep the Neon project until sign-in and the deployed app have been
+  verified against Supabase.
+
   Once deployed, `/health` checks backend reachability. The frontend uses
   same-origin API URLs automatically in production, so it does not rely on a
   `VITE_API_URL` value. Set `CORS_ORIGINS` only if the API must also accept
