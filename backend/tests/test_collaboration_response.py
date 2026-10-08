@@ -105,6 +105,9 @@ def patch_repo(monkeypatch, participant, collab, pending_participants=None):
         "removed": False,
         "removed_participant_ids": [],
         "add_participant_calls": 0,
+        "payment_resolution_calls": [],
+        "invitee_rejection_calls": [],
+        "payment_activation_calls": [],
     }
 
     async def fake_ensure_direct_conversation(self, collaboration, accepted_participant):
@@ -136,6 +139,18 @@ def patch_repo(monkeypatch, participant, collab, pending_participants=None):
         # `_create_collaboration` should call this.
         state["add_participant_calls"] += 1
         return p
+
+    async def fake_confirm_collaboration_completion(self, collaboration_id):
+        return None
+
+    async def fake_activate_for_collaboration_acceptance(self, collaboration_id):
+        state["payment_activation_calls"].append(collaboration_id)
+
+    async def fake_cancel_for_collaboration_resolution(self, collaboration_id):
+        state["payment_resolution_calls"].append(collaboration_id)
+
+    async def fake_cancel_for_invitee_decline(self, collaboration_id, declined_user_id):
+        state["invitee_rejection_calls"].append((collaboration_id, declined_user_id))
 
     monkeypatch.setattr(
         "repositories.collaboration_repository.CollaborationRepository.get_participant",
@@ -173,6 +188,26 @@ def patch_repo(monkeypatch, participant, collab, pending_participants=None):
         "services.collaboration_messaging_service.CollaborationMessagingService.ensure_direct_conversation",
         fake_ensure_direct_conversation,
     )
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.confirm_collaboration_completion",
+        fake_confirm_collaboration_completion,
+    )
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.activate_for_collaboration_acceptance",
+        fake_activate_for_collaboration_acceptance,
+    )
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.cancel_for_collaboration_resolution",
+        fake_cancel_for_collaboration_resolution,
+    )
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.cancel_for_invitee_decline",
+        fake_cancel_for_invitee_decline,
+    )
     return state
 
 
@@ -199,6 +234,7 @@ async def test_accept_collaboration_marks_participant_and_collaboration_accepted
     assert participant.accepted is True
     assert participant.accepted_at is not None
     assert collab.status == CollaborationStatus.ACCEPTED
+    assert state["payment_activation_calls"] == [collab.id]
     assert state["removed"] is False
     assert state["messaging_bridge"] == (collab, participant)
     from typing import cast
@@ -291,6 +327,7 @@ async def test_decline_collaboration_removes_participant_and_marks_declined(monk
     assert state["removed"] is True
     assert collab.status == CollaborationStatus.DECLINED
     assert participant.accepted is False
+    assert state["invitee_rejection_calls"] == [(collab.id, user.id)]
     commit_mock: AsyncMock = ctx.db.commit  # type: ignore[assignment]
     commit_mock.assert_awaited_once_with()
     assert len(_stub_analytics) == 1
@@ -307,7 +344,7 @@ async def test_cancel_collaboration_tracks_cancelled_event(monkeypatch, _stub_an
     collab = make_collab(initiator_id=user.id)
     collab.proposed_at = None
     collab.completed_at = None
-    patch_repo(monkeypatch, None, collab)
+    state = patch_repo(monkeypatch, None, collab)
     ctx = make_ctx(user)
     monkeypatch.setattr("api.graphql._collaboration_to_gql", lambda collaboration: collaboration)
 
@@ -318,6 +355,7 @@ async def test_cancel_collaboration_tracks_cancelled_event(monkeypatch, _stub_an
     )
 
     assert _stub_analytics[0]["event_type"] == EventType.COLLAB_CANCELLED
+    assert state["payment_resolution_calls"] == [collab.id]
 
 
 @pytest.mark.asyncio
@@ -326,7 +364,7 @@ async def test_update_collaboration_tracks_proposed_to_accepted_event(monkeypatc
     collab = make_collab(initiator_id=user.id)
     collab.proposed_at = None
     collab.completed_at = None
-    patch_repo(monkeypatch, None, collab)
+    state = patch_repo(monkeypatch, None, collab)
 
     async def fake_get_accepted_participants(self, collaboration):
         return [make_participant(uuid.uuid4(), accepted=True)]
@@ -345,6 +383,7 @@ async def test_update_collaboration_tracks_proposed_to_accepted_event(monkeypatc
     )
 
     assert _stub_analytics[0]["event_type"] == EventType.COLLAB_ACCEPTED
+    assert state["payment_activation_calls"] == [collab.id]
 
 
 @pytest.mark.asyncio
@@ -460,6 +499,7 @@ async def test_declining_one_of_multiple_invitees_keeps_proposal_open(monkeypatc
 
     assert state["removed"] is True
     assert collab.status == CollaborationStatus.PROPOSED
+    assert state["invitee_rejection_calls"] == [(collab.id, user.id)]
 
 
 @pytest.mark.asyncio

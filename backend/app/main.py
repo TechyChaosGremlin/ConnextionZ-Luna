@@ -42,7 +42,7 @@ from features.media.router import router as media_router
 from features.streaming.router import router as streaming_router
 from features.streaming.service import stream_manager
 from services.redis_service import RedisService
-from services.rabbitmq_service import rabbitmq_service
+from services.rabbitmq_service import RabbitMQService, rabbitmq_service
 
 logger = structlog.get_logger()
 shutdown_event = None
@@ -155,34 +155,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     redis_service = RedisService()
     try:
-        await redis_service.connect()
-        logger.info("Redis connected")
-    except Exception as exc:
-        logger.warning("Redis connection failed during startup", error=str(exc))
-        if settings.environment == "production":
-            raise
+        try:
+            await redis_service.connect()
+            if not await redis_service.ping():
+                raise RuntimeError("Redis is unavailable during startup")
+            logger.info("Redis connected")
+        except Exception as exc:
+            logger.warning("Redis connection failed during startup", error_type=type(exc).__name__)
+            if settings.environment == "production":
+                raise
 
-    try:
-        await rabbitmq_service.connect()
-        logger.info("RabbitMQ connected")
-    except Exception as exc:
-        logger.warning("RabbitMQ connection failed during startup", error=str(exc))
-        if settings.environment == "production":
-            raise
+        try:
+            await rabbitmq_service.connect()
+            logger.info("RabbitMQ connected")
+        except Exception as exc:
+            logger.warning("RabbitMQ connection failed during startup", error_type=type(exc).__name__)
+            if settings.environment == "production":
+                raise
 
-    yield
-
-    # Shutdown
-    logger.info("Shutting down ConnextionZ Platform API")
-    await stream_manager.cleanup()
-    try:
-        await redis_service.disconnect()
-    except Exception:
-        pass
-    try:
-        await rabbitmq_service.disconnect()
-    except Exception:
-        pass
+        yield
+    finally:
+        logger.info("Shutting down ConnextionZ Platform API")
+        for dependency, cleanup in (
+            ("streams", stream_manager.cleanup),
+            ("redis", redis_service.disconnect),
+            ("rabbitmq", rabbitmq_service.disconnect),
+        ):
+            try:
+                await cleanup()
+            except Exception as exc:
+                logger.error(
+                    "Dependency cleanup failed",
+                    dependency=dependency,
+                    error_type=type(exc).__name__,
+                )
 
 
 def create_app() -> FastAPI:
@@ -262,26 +268,37 @@ def create_app() -> FastAPI:
             db_ok = await check_db_connection()
             checks["database"] = "ok" if db_ok else "error"
         except Exception as e:
-            logger.error("Health check failed", check="database", error=str(e))
+            logger.error("Health check failed", check="database", error_type=type(e).__name__)
             checks["database"] = "error"
 
+        redis_service = RedisService()
         try:
-            redis_service = RedisService()
             await redis_service.connect()
             redis_ok = await redis_service.ping()
-            await redis_service.disconnect()
             checks["redis"] = "ok" if redis_ok else "error"
         except Exception as e:
-            logger.error("Health check failed", check="redis", error=str(e))
+            logger.error("Health check failed", check="redis", error_type=type(e).__name__)
             checks["redis"] = "error"
+        finally:
+            try:
+                await redis_service.disconnect()
+            except Exception as e:
+                logger.error("Health cleanup failed", check="redis", error_type=type(e).__name__)
+                checks["redis"] = "error"
 
+        rabbitmq_probe = RabbitMQService()
         try:
-            await rabbitmq_service.connect()
-            await rabbitmq_service.disconnect()
+            await rabbitmq_probe.connect()
             checks["rabbitmq"] = "ok"
         except Exception as e:
-            logger.error("Health check failed", check="rabbitmq", error=str(e))
+            logger.error("Health check failed", check="rabbitmq", error_type=type(e).__name__)
             checks["rabbitmq"] = "error"
+        finally:
+            try:
+                await rabbitmq_probe.disconnect()
+            except Exception as e:
+                logger.error("Health cleanup failed", check="rabbitmq", error_type=type(e).__name__)
+                checks["rabbitmq"] = "error"
 
         ready = all(v == "ok" for v in checks.values())
         status = "ready" if ready else "not_ready"

@@ -12,9 +12,11 @@ Provides endpoints for:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -32,27 +34,59 @@ router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
 
 
+class RegisterRequest(BaseModel):
+    email: str
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+def _reject_query_credentials(request: Request, *field_names: str) -> None:
+    if any(field_name in request.query_params for field_name in field_names):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Authentication values must be sent in the request body",
+        )
+
+
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(
-    email: str,
-    username: str,
-    password: str,
+    payload: RegisterRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """
     Register a new user.
 
     Args:
-        email: User's email address
-        username: User's username
-        password: User's plain-text password
+        payload: User's email address, username, and plain-text password
+        request: HTTP request, used to reject credential-bearing query parameters
         db: Database session
 
     Returns:
         Success message and user ID
     """
     # Validate password strength
-    is_valid, errors = check_password_strength(password)
+    _reject_query_credentials(request, "email", "username", "password")
+
+    is_valid, errors = check_password_strength(payload.password)
     if not is_valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -62,7 +96,7 @@ async def register(
     user_repo = UserRepository(db)
 
     # Check if email already exists
-    existing_user = await user_repo.get_by_email(email)
+    existing_user = await user_repo.get_by_email(payload.email)
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -70,7 +104,7 @@ async def register(
         )
 
     # Check if username already exists
-    existing_user = await user_repo.get_by_username(username)
+    existing_user = await user_repo.get_by_username(payload.username)
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -78,10 +112,10 @@ async def register(
         )
 
     # Create new user
-    hashed_password = hash_password(password)
+    hashed_password = hash_password(payload.password)
     new_user = User(
-        email=email,
-        username=username,
+        email=payload.email,
+        username=payload.username,
         hashed_password=hashed_password,
         role=UserRole.USER,  # Default role
         status=AccountStatus.ACTIVE,
@@ -99,16 +133,16 @@ async def register(
 
 @router.post("/login")
 async def login(
-    email: str,
-    password: str,
+    payload: LoginRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """
     Login a user and return access + refresh tokens.
 
     Args:
-        email: User's email address
-        password: User's plain-text password
+        payload: User's email address and plain-text password
+        request: HTTP request, used to reject credential-bearing query parameters
         db: Database session
 
     Returns:
@@ -117,7 +151,8 @@ async def login(
     user_repo = UserRepository(db)
 
     # Get user by email
-    user = await user_repo.get_by_email(email)
+    _reject_query_credentials(request, "email", "password")
+    user = await user_repo.get_by_email(payload.email)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -125,7 +160,7 @@ async def login(
         )
 
     # Verify password
-    if not verify_password(password, user.hashed_password):
+    if not verify_password(payload.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
@@ -155,14 +190,16 @@ async def login(
 
 @router.post("/refresh")
 async def refresh(
-    refresh_token: str,
+    payload: RefreshRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """
     Refresh access token using refresh token.
 
     Args:
-        refresh_token: The refresh token
+        payload: The refresh token
+        request: HTTP request, used to reject credential-bearing query parameters
         db: Database session
 
     Returns:
@@ -170,19 +207,25 @@ async def refresh(
     """
     from features.auth.jwt import decode_token, REFRESH_TOKEN_TYPE, JWTError
 
+    _reject_query_credentials(request, "refresh_token")
     try:
         # Decode refresh token
-        payload = decode_token(refresh_token)
+        token_payload = decode_token(payload.refresh_token)
 
         # Verify it's a refresh token
-        if payload.get("type") != REFRESH_TOKEN_TYPE:
+        if token_payload.get("type") != REFRESH_TOKEN_TYPE:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid refresh token",
             )
 
         # Get user
-        user_id = payload.get("sub")
+        user_id = token_payload.get("sub")
+        if not isinstance(user_id, str) or not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token",
+            )
         user_repo = UserRepository(db)
         user = await user_repo.get_by_id(user_id)
 
@@ -249,19 +292,22 @@ async def logout(
 
 @router.post("/password-reset/request")
 async def request_password_reset(
-    email: str,
+    payload: PasswordResetRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, str]:
     """
     Request a password reset (sends email with reset token).
 
     Args:
-        email: User's email address
+        payload: User's email address
+        request: HTTP request, used to reject query parameters
         db: Database session
 
     Returns:
         Success message (always success to prevent email enumeration)
     """
+    _reject_query_credentials(request, "email")
     # TODO: Implement password reset token generation and email sending
     # For security, always return success even if email doesn't exist
     return {
@@ -271,24 +317,24 @@ async def request_password_reset(
 
 @router.post("/password-reset/confirm")
 async def confirm_password_reset(
-    token: str,
-    new_password: str,
+    payload: PasswordResetConfirmRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, str]:
     """
     Confirm password reset with token.
 
     Args:
-        token: Password reset token
-        new_password: New password
+        payload: Password reset token and new password
+        request: HTTP request, used to reject credential-bearing query parameters
         db: Database session
 
     Returns:
         Success message
     """
+    _reject_query_credentials(request, "token", "new_password")
     # TODO: Implement password reset token validation and password update
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail="Password reset not yet implemented",
     )
-

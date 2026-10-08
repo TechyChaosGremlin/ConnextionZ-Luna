@@ -275,6 +275,10 @@ async def test_update_collaboration_rolls_back_when_status_update_fails(monkeypa
         fake_get_by_id,
     )
     monkeypatch.setattr(
+        "repositories.collaboration_repository.CollaborationRepository.get_by_id_for_update",
+        fake_get_by_id,
+    )
+    monkeypatch.setattr(
         "repositories.collaboration_repository.CollaborationRepository.update",
         fail_update,
     )

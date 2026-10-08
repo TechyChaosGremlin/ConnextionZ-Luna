@@ -430,6 +430,33 @@ class FeedItemType(LegacyPostType):
 
 
 @strawberry.type
+class OnboardingCategoryType:
+    id: UUIDScalar
+    name: str
+    slug: str
+
+
+@strawberry.type
+class OnboardingPreferencesType:
+    collab_types: List[str]
+    response_time: str
+    open_to_collab: bool
+    categories: List[OnboardingCategoryType]
+
+
+@strawberry.input
+class UpdateOnboardingPreferencesInput:
+    collab_types: List[str]
+    response_time: str
+    open_to_collab: bool
+
+
+@strawberry.input
+class UpdateMyOnboardingCategoriesInput:
+    slugs: List[str]
+
+
+@strawberry.type
 class ProfileDetailType:
     id: UUIDScalar
     username: str
@@ -452,6 +479,19 @@ class ProfileDetailType:
     posts: List[LegacyPostType] = strawberry.field(default_factory=list)
     playlists: List["PlaylistType"] = strawberry.field(default_factory=list)
     is_following: bool = False
+
+    @strawberry.field
+    async def onboarding_preferences(
+        self, info: StrawberryInfo[AppContext, None]
+    ) -> OnboardingPreferencesType:
+        """Return onboarding preferences only to the authenticated profile owner."""
+        from repositories.profile_repository import ProfileRepository
+
+        user = info.context.require_auth()
+        profile = await ProfileRepository(info.context.db).get_by_user_id(user.id)
+        if profile is None or profile.id != self.id:
+            raise PermissionError("Onboarding preferences are only available to the profile owner")
+        return _onboarding_preferences_from_profile(profile)
 
 
 @strawberry.type
@@ -1903,6 +1943,24 @@ class Mutation:
         return await _update_profile(info.context, input)
 
     @strawberry.mutation
+    async def update_my_onboarding_preferences(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        input: UpdateOnboardingPreferencesInput,
+    ) -> OnboardingPreferencesType:
+        """Update the authenticated user's onboarding preferences."""
+        return await _update_my_onboarding_preferences(info.context, input)
+
+    @strawberry.mutation
+    async def update_my_onboarding_categories(
+        self,
+        info: StrawberryInfo[AppContext, None],
+        input: UpdateMyOnboardingCategoriesInput,
+    ) -> List[OnboardingCategoryType]:
+        """Replace the authenticated user's onboarding category selection."""
+        return await _update_my_onboarding_categories(info.context, input)
+
+    @strawberry.mutation
     async def delete_account(self, info: StrawberryInfo[AppContext, None]) -> bool:
         """Permanently delete the authenticated user's account and all owned data."""
         return await _delete_account(info.context)
@@ -2745,35 +2803,71 @@ async def _visible_direct_read_posts(ctx, posts):
     return visible_posts
 
 
-_FOR_YOU_CURSOR_PREFIX = "fy1."
+_FOR_YOU_CURSOR_PREFIX = "fy2."
+_LEGACY_FOR_YOU_CURSOR_PREFIX = "fy1."
+_RANKED_FEED_SCOPES = {"for_you", "organic", "viral", "community"}
+_FOLLOWING_FEED_BATCH_SIZE = 100
+_FOLLOWING_FEED_SCAN_LIMIT = 1000
 
 
-def _encode_for_you_cursor(ranked_ids, last_id) -> str:
+def _encode_for_you_cursor(ranked_ids, last_id, scope: str) -> str:
     """Encode the full ranked order + last-served post id into an opaque cursor.
 
-    Format: ``fy1.<last_id>.<id1,id2,...>`` — the trailing list is the complete
+    Format: ``fy2.<scope>.<last_id>.<id1,id2,...>`` — the trailing list is the complete
     ranked post-id order from the request that produced this cursor. Keeping the
     snapshot in the cursor (rather than server-side session state) preserves the
     existing stateless pagination architecture and works across app restarts.
     """
+    if scope not in _RANKED_FEED_SCOPES:
+        raise ValueError("Invalid feed cursor scope")
     joined = ",".join(str(pid) for pid in ranked_ids)
-    return f"{_FOR_YOU_CURSOR_PREFIX}{last_id}.{joined}"
+    return f"{_FOR_YOU_CURSOR_PREFIX}{scope}.{last_id}.{joined}"
 
 
-def _decode_for_you_cursor(cursor):
-    """Decode a snapshot cursor into (ranked_ids, last_id).
+def _decode_for_you_cursor(cursor, expected_scope: str | None = None):
+    """Decode a cursor into (ranked_ids, last_id, scope).
 
-    Returns ``(None, last_id)`` for a legacy plain post-id cursor, so older
-    clients keep working by falling back to locating ``last_id`` in the
-    freshly computed ranking. Raises ValueError for a malformed cursor.
+    Old snapshot cursors are accepted as legacy post-id cursors, so they resume
+    in the current ranking without imposing an unscoped ordering.
     """
     from uuid import UUID as UUID_type
 
-    if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
+    if cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
+        body = cursor[len(_FOR_YOU_CURSOR_PREFIX):]
+        scope, separator, remainder = body.partition(".")
+        if (
+            not separator
+            or scope not in _RANKED_FEED_SCOPES
+            or (expected_scope is not None and scope != expected_scope)
+        ):
+            raise ValueError("Invalid feed cursor")
+        last_str, separator, snapshot_str = remainder.partition(".")
+        if not separator:
+            raise ValueError("Invalid feed cursor")
+    elif cursor.startswith(_LEGACY_FOR_YOU_CURSOR_PREFIX):
+        body = cursor[len(_LEGACY_FOR_YOU_CURSOR_PREFIX):]
+        last_str, separator, snapshot_str = body.partition(".")
+        if not separator:
+            raise ValueError("Invalid feed cursor")
+        try:
+            last_id = UUID_type(last_str)
+            ranked_ids = [UUID_type(part) for part in snapshot_str.split(",")]
+        except ValueError:
+            raise ValueError("Invalid feed cursor") from None
+        if (
+            last_id not in ranked_ids
+            or len(set(ranked_ids)) != len(ranked_ids)
+            or len(ranked_ids) > 350
+        ):
+            raise ValueError("Invalid feed cursor")
+        return None, last_id, None
+    else:
         # Legacy: the whole cursor is just the last post's id.
-        return None, UUID_type(cursor)
-    body = cursor[len(_FOR_YOU_CURSOR_PREFIX):]
-    last_str, _, snapshot_str = body.partition(".")
+        try:
+            return None, UUID_type(cursor), None
+        except ValueError:
+            raise ValueError("Invalid feed cursor") from None
+
     try:
         last_id = UUID_type(last_str)
         ranked_ids = [UUID_type(part) for part in snapshot_str.split(",")]
@@ -2785,13 +2879,13 @@ def _decode_for_you_cursor(cursor):
         or len(ranked_ids) > 350
     ):
         raise ValueError("Invalid feed cursor")
-    return ranked_ids, last_id
+    return ranked_ids, last_id, scope
 
 
-async def _restore_feed_snapshot(post_repo, candidates, cursor):
+async def _restore_feed_snapshot(post_repo, candidates, cursor, scope: str):
     if cursor is None:
         return candidates
-    snapshot_ids, _last_id = _decode_for_you_cursor(cursor)
+    snapshot_ids, _last_id, _scope = _decode_for_you_cursor(cursor, scope)
     if snapshot_ids is None:
         return candidates
     candidates_by_id = {post.id: post for post in candidates}
@@ -2803,10 +2897,10 @@ async def _restore_feed_snapshot(post_repo, candidates, cursor):
     return [candidates_by_id[post_id] for post_id in snapshot_ids if post_id in candidates_by_id]
 
 
-def _resume_ranked_feed(ranked, cursor):
+def _resume_ranked_feed(ranked, cursor, scope: str):
     if cursor is None:
         return ranked, 0
-    snapshot_ids, last_id = _decode_for_you_cursor(cursor)
+    snapshot_ids, last_id, _scope = _decode_for_you_cursor(cursor, scope)
     if snapshot_ids is not None:
         ranked_by_id = {post.id: post for post in ranked}
         anchor_index = snapshot_ids.index(last_id) + 1
@@ -2836,14 +2930,18 @@ async def _feed(
     follow_repo = FollowRepository(ctx.db)
 
     before_id: Optional[uuid.UUID] = None
-    if cursor and algorithm != FeedAlgorithm.PAID:
+    is_ranked_cursor = cursor is not None and cursor.startswith(
+        (_FOR_YOU_CURSOR_PREFIX, _LEGACY_FOR_YOU_CURSOR_PREFIX)
+    )
+    if following and algorithm is None and is_ranked_cursor:
+        raise ValueError("Invalid feed cursor")
+    if cursor and algorithm != FeedAlgorithm.PAID and not is_ranked_cursor:
         # Snapshot cursors (For You) are opaque strings, not bare UUIDs — skip
         # UUID parsing for them and let the For You path decode the snapshot.
-        if not cursor.startswith(_FOR_YOU_CURSOR_PREFIX):
-            try:
-                before_id = UUID_type(cursor)
-            except ValueError:
-                raise ValueError("Invalid feed cursor")
+        try:
+            before_id = UUID_type(cursor)
+        except ValueError:
+            raise ValueError("Invalid feed cursor")
 
     if algorithm is not None:
         followed_ids = await follow_repo.get_following_ids(user.id)
@@ -2865,37 +2963,67 @@ async def _feed(
     if not author_ids:
         return FeedPageType(items=[], next_cursor=None)
 
-    posts = await post_repo.get_feed(
-        user_ids=author_ids, limit=limit + 1, before_id=before_id,
-    )
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
         user.id, author_ids
     )
     following_ids = set(author_ids)
     profile_repo = ProfileRepository(ctx.db)
-    profiles = {
-        creator_id: await profile_repo.get_by_user_id(creator_id)
-        for creator_id in {post.user_id for post in posts}
-    }
-
-    posts = [
-        post
-        for post in posts
-        if _feed_item_is_visible(
-            post,
-            viewer_id=user.id,
-            hidden_creator_ids=hidden_creator_ids,
-            profiles=profiles,
-            following_ids=following_ids,
+    posts = []
+    scan_before_id = before_id
+    scanned_count = 0
+    scan_exhausted = False
+    while len(posts) <= limit and scanned_count < _FOLLOWING_FEED_SCAN_LIMIT:
+        batch_size = min(
+            _FOLLOWING_FEED_BATCH_SIZE,
+            _FOLLOWING_FEED_SCAN_LIMIT - scanned_count,
         )
-    ]
+        batch = await post_repo.get_feed(
+            user_ids=author_ids,
+            limit=batch_size,
+            before_id=scan_before_id,
+        )
+        if not batch:
+            scan_exhausted = True
+            break
+        scanned_count += len(batch)
+        profiles = {
+            profile.user_id: profile
+            for profile in await profile_repo.get_multiple_by_user_ids(
+                list({post.user_id for post in batch})
+            )
+        }
+        posts.extend(
+            post
+            for post in batch
+            if _feed_item_is_visible(
+                post,
+                viewer_id=user.id,
+                hidden_creator_ids=hidden_creator_ids,
+                profiles=profiles,
+                following_ids=following_ids,
+            )
+        )
+        scan_before_id = batch[-1].id
+        if len(batch) < batch_size:
+            scan_exhausted = True
+            break
 
-    has_more = len(posts) > limit
-    if has_more:
+    has_more_visible = len(posts) > limit
+    scan_capped = (
+        not scan_exhausted
+        and scanned_count >= _FOLLOWING_FEED_SCAN_LIMIT
+    )
+    if has_more_visible:
         posts = posts[:limit]
 
     items = [await _post_to_feed_item(ctx, p) for p in posts]
-    next_cursor = str(posts[-1].id) if has_more and posts else None
+    next_cursor = (
+        str(posts[-1].id)
+        if has_more_visible and posts
+        else str(scan_before_id)
+        if scan_capped and scan_before_id is not None
+        else None
+    )
 
     from services.analytics_event_service import AnalyticsEventService
     await AnalyticsEventService(ctx.db).track_impressions_bulk(
@@ -2911,7 +3039,9 @@ async def _feed(
 
 async def _organic_feed(ctx, user, followed_ids, before_id, limit, cursor):
     """Keep Organic on the existing For You candidate and ranking behavior."""
-    return await _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor)
+    return await _for_you_feed(
+        ctx, user, followed_ids, before_id, limit, cursor, pagination_scope="organic"
+    )
 
 
 async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
@@ -2936,7 +3066,9 @@ async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
         since=discovery_since,
         limit=FOR_YOU_DISCOVERY_POOL_SIZE,
     )
-    candidates = await _restore_feed_snapshot(PostRepository(ctx.db), candidates, cursor)
+    candidates = await _restore_feed_snapshot(
+        PostRepository(ctx.db), candidates, cursor, "viral"
+    )
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -2976,7 +3108,7 @@ async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
         )
     ]
 
-    ranked, start_index = _resume_ranked_feed(ranked, cursor)
+    ranked, start_index = _resume_ranked_feed(ranked, cursor, "viral")
 
     page = ranked[start_index : start_index + limit + 1]
     has_more = len(page) > limit
@@ -2985,7 +3117,7 @@ async def _viral_feed(ctx, user, followed_ids, before_id, limit, cursor):
 
     items = [await _post_to_feed_item(ctx, post) for post in page]
     next_cursor = (
-        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        _encode_for_you_cursor([post.id for post in ranked], page[-1].id, "viral")
         if has_more and page
         else None
     )
@@ -3092,7 +3224,7 @@ async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
             for post in pool
         }.values()
     )
-    candidates = await _restore_feed_snapshot(post_repo, candidates, cursor)
+    candidates = await _restore_feed_snapshot(post_repo, candidates, cursor, "community")
     eligible_creator_ids = followed_creator_ids | set(affinity_creator_ids)
     candidates = [post for post in candidates if post.user_id in eligible_creator_ids]
 
@@ -3142,7 +3274,7 @@ async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
 
     ranked = [post for post, _score in sorted(scored, key=community_sort_key, reverse=True)]
 
-    ranked, start_index = _resume_ranked_feed(ranked, cursor)
+    ranked, start_index = _resume_ranked_feed(ranked, cursor, "community")
 
     page = ranked[start_index : start_index + limit + 1]
     has_more = len(page) > limit
@@ -3151,7 +3283,7 @@ async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
 
     items = [await _post_to_feed_item(ctx, post) for post in page]
     next_cursor = (
-        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        _encode_for_you_cursor([post.id for post in ranked], page[-1].id, "community")
         if has_more and page
         else None
     )
@@ -3167,7 +3299,9 @@ async def _community_feed(ctx, user, followed_ids, before_id, limit, cursor):
     return FeedPageType(items=items, next_cursor=next_cursor)
 
 
-async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> FeedPageType:
+async def _for_you_feed(
+    ctx, user, followed_ids, before_id, limit, cursor, pagination_scope="for_you"
+) -> FeedPageType:
     """Personalized "For You" feed: candidate generation + deterministic scoring.
 
     Candidate sources (bounded pools, unioned and deduped by post id):
@@ -3175,9 +3309,9 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
       2. Affinity pool — recent posts from creators the viewer has demonstrated
          affinity for (real interaction history via the unified signal log)
          but does not follow.
-      3. Interest pool — recent published posts whose tags overlap the viewer's
-         demonstrated interest topics (tags on posts they actively engaged
-         with), excluding their own/follow graph.
+      3. Interest pool — recent published posts whose tags overlap topics from
+         the viewer's engaged posts or persisted onboarding categories,
+         excluding their own/follow graph.
       4. Discovery pool — recent public posts beyond the follow graph; the
          controlled organic-discovery and cold-start source (no popularity,
          follower-count, or verification requirement to enter).
@@ -3197,6 +3331,7 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
     from datetime import timedelta, timezone
     from repositories.content_repository import PostRepository
     from repositories.profile_repository import ProfileRepository
+    from repositories.category_repository import CategoryRepository
     from repositories.social_repository import FeedSafetyRepository, PostInteractionRepository
     from repositories.analytics_repository import AnalyticsRepository
     import importlib
@@ -3232,6 +3367,8 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
         else []
     )
     interest_tags = await analytics_repo.user_interest_tags(user.id)
+    category_slugs = await CategoryRepository(ctx.db).get_slugs_by_user_id(user.id)
+    interest_tags.extend(slug for slug in category_slugs if slug not in interest_tags)
     interest_pool = await post_repo.get_interest_pool(
         interest_tags,
         exclude_user_ids=own_and_followed_ids,
@@ -3253,7 +3390,9 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
             for post in pool
         }.values()
     )
-    candidates = await _restore_feed_snapshot(post_repo, candidates, cursor)
+    candidates = await _restore_feed_snapshot(
+        post_repo, candidates, cursor, pagination_scope
+    )
 
     candidate_creator_ids = {post.user_id for post in candidates}
     hidden_creator_ids = await FeedSafetyRepository(ctx.db).get_hidden_creator_ids(
@@ -3325,7 +3464,7 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
     # and no cross-page duplicates even if engagement changes mid-pagination.
     # Backward-compatible: a legacy plain post-id cursor still works (we fall
     # back to locating that post in the freshly computed ranking).
-    ranked, start_index = _resume_ranked_feed(ranked, cursor)
+    ranked, start_index = _resume_ranked_feed(ranked, cursor, pagination_scope)
 
     page = ranked[start_index : start_index + limit + 1]
     has_more = len(page) > limit
@@ -3334,7 +3473,9 @@ async def _for_you_feed(ctx, user, followed_ids, before_id, limit, cursor) -> Fe
 
     items = [await _post_to_feed_item(ctx, p) for p in page]
     next_cursor = (
-        _encode_for_you_cursor([post.id for post in ranked], page[-1].id)
+        _encode_for_you_cursor(
+            [post.id for post in ranked], page[-1].id, pagination_scope
+        )
         if has_more and page
         else None
     )
@@ -4034,6 +4175,13 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
 
     repo = ProfileRepository(ctx.db)
     viewer_profile = await repo.get_by_user_id(ctx.user.id)
+    viewer_categories = [
+        category.slug
+        for category in (getattr(viewer_profile, "categories", None) or [])
+        if getattr(viewer_profile, "deleted_at", None) is None
+        and isinstance(getattr(category, "slug", None), str)
+        and category.slug
+    ]
     
     # Parse cursor for pagination
  # Parse cursor for pagination
@@ -4141,8 +4289,14 @@ async def _discover_creators(ctx, query, tags, first, after) -> CreatorCardConne
         viewer_tags = viewer_profile.tags or [] if viewer_profile else []
         profile_tags = profile.tags or []
 
-        viewer_tags_list = list(viewer_tags or [])
-        profile_tags_list = list(profile_tags or [])
+        viewer_tags_list = list(viewer_tags or []) + viewer_categories
+        profile_categories = [
+            category.slug
+            for category in (getattr(profile, "categories", None) or [])
+            if isinstance(getattr(category, "slug", None), str)
+            and category.slug
+        ]
+        profile_tags_list = list(profile_tags or []) + profile_categories
         viewer_interest_set = {
             tag.strip().lower()
             for tag in viewer_tags_list
@@ -4911,6 +5065,95 @@ async def _update_profile(ctx, input) -> ProfileDetailType:
     return await _profile_to_detail(ctx, profile)
 
 
+_ONBOARDING_COLLAB_TYPES = frozenset(
+    {
+        "Paid Collaboration",
+        "Free / Creative Collab",
+        "Duet / Remix",
+        "Podcast / Interview",
+        "Brand Deal",
+    }
+)
+_ONBOARDING_RESPONSE_TIMES = frozenset({"< 1 hour", "< 4 hours", "< 24 hours"})
+
+
+def _onboarding_preferences_from_profile(profile) -> OnboardingPreferencesType:
+    return OnboardingPreferencesType(
+        collab_types=list(profile.onboarding_collab_types or []),
+        response_time=profile.response_time,
+        open_to_collab=profile.open_to_collab,
+        categories=[
+            OnboardingCategoryType(id=category.id, name=category.name, slug=category.slug)
+            for category in profile.categories
+        ],
+    )
+
+
+async def _update_my_onboarding_categories(
+    ctx, input: UpdateMyOnboardingCategoriesInput
+) -> List[OnboardingCategoryType]:
+    from repositories.category_repository import CategoryRepository
+    from repositories.profile_repository import ProfileRepository
+    from app.models.user import Profile
+
+    user = ctx.require_auth()
+    slugs = input.slugs
+    if not slugs:
+        raise ValueError("Select at least one onboarding category")
+    if len(slugs) != len(set(slugs)):
+        raise ValueError("Onboarding category selections must not contain duplicates")
+
+    categories = await CategoryRepository(ctx.db).get_by_slugs(slugs)
+    by_slug = {category.slug: category for category in categories}
+    if len(by_slug) != len(slugs):
+        raise ValueError("One or more onboarding categories are unknown")
+    selected = [by_slug[slug] for slug in slugs]
+
+    profile_repo = ProfileRepository(ctx.db)
+    async with ctx.db.begin_nested():
+        profile = await profile_repo.get_by_user_id(user.id)
+        if profile is None:
+            profile = Profile(user_id=user.id, display_name=user.username)
+            await profile_repo.create(profile)
+        profile.categories = selected
+        await ctx.db.flush()
+    await ctx.db.commit()
+    return [
+        OnboardingCategoryType(id=category.id, name=category.name, slug=category.slug)
+        for category in selected
+    ]
+
+
+async def _update_my_onboarding_preferences(
+    ctx, input: UpdateOnboardingPreferencesInput
+) -> OnboardingPreferencesType:
+    from repositories.profile_repository import ProfileRepository
+    from app.models.user import Profile
+
+    user = ctx.require_auth()
+    if (
+        not input.collab_types
+        or len(input.collab_types) != len(set(input.collab_types))
+        or any(value not in _ONBOARDING_COLLAB_TYPES for value in input.collab_types)
+    ):
+        raise ValueError("Choose one or more valid onboarding collaboration types")
+    if input.response_time not in _ONBOARDING_RESPONSE_TIMES:
+        raise ValueError("Choose a valid onboarding response time")
+
+    profile_repo = ProfileRepository(ctx.db)
+    profile = await profile_repo.get_by_user_id(user.id)
+    if profile is None:
+        profile = Profile(user_id=user.id, display_name=user.username)
+        await profile_repo.create(profile)
+
+    profile.onboarding_collab_types = list(input.collab_types)
+    profile.response_time = input.response_time
+    profile.open_to_collab = input.open_to_collab
+    await profile_repo.update(profile)
+    await ctx.db.commit()
+    return _onboarding_preferences_from_profile(profile)
+
+
 async def _create_post(ctx, input) -> PostType:
     """Create a new post."""
     from repositories.content_repository import PostRepository
@@ -4939,6 +5182,7 @@ async def _create_post(ctx, input) -> PostType:
 async def _delete_post(ctx, id) -> bool:
     """Soft-delete a post. Only the author or admin can delete."""
     from repositories.content_repository import PostRepository
+    from services.media_lifecycle_service import delete_post_media
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
@@ -4949,6 +5193,7 @@ async def _delete_post(ctx, id) -> bool:
     if post.user_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the post author can delete this post")
 
+    await delete_post_media(ctx.db, id)
     success = await post_repo.soft_delete(id)
     if success:
         await ctx.db.commit()
@@ -5265,6 +5510,17 @@ async def _accept_collaboration(ctx, id) -> CollaborationParticipantType:
             await repo.remove_participant(pending_participant)
         await repo.update(collab)
 
+        from repositories.collaboration_payment_repository import (
+            CollaborationPaymentRepository,
+        )
+        from services.collaboration_payment_service import (
+            CollaborationPaymentService,
+        )
+
+        await CollaborationPaymentService(
+            CollaborationPaymentRepository(ctx.db)
+        ).activate_for_collaboration_acceptance(collab.id)
+
         from repositories.messaging_repository import ConversationRepository
         from services.collaboration_messaging_service import CollaborationMessagingService
 
@@ -5321,11 +5577,30 @@ async def _decline_collaboration(ctx, id) -> bool:
     if collab.status != CollaborationStatus.PROPOSED:
         raise ValueError("Collaboration invitation is no longer pending")
 
+    previous_status = collab.status
     try:
-        await repo.remove_participant(participant)
         pending_participants = await repo.get_pending_participants(collab)
-        if not pending_participants:
+        pending_after_decline = [
+            pending
+            for pending in pending_participants
+            if pending.id != participant.id
+        ]
+        if not pending_after_decline:
             collab._update_collaboration(CollaborationStatus.DECLINED)
+            await repo.update(collab)
+
+        from repositories.collaboration_payment_repository import (
+            CollaborationPaymentRepository,
+        )
+        from services.collaboration_payment_service import (
+            CollaborationPaymentService,
+        )
+
+        await CollaborationPaymentService(
+            CollaborationPaymentRepository(ctx.db)
+        ).cancel_for_invitee_decline(collab.id, user.id)
+
+        await repo.remove_participant(participant)
         await repo.update(collab)
 
         from app.models.analytics import EventType
@@ -5340,6 +5615,7 @@ async def _decline_collaboration(ctx, id) -> bool:
         await ctx.db.commit()
     except Exception:
         await ctx.db.rollback()
+        collab.status = previous_status
         raise
     return True
 
@@ -5358,7 +5634,7 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
     except ValueError:
         raise ValueError("Invalid collaboration ID")
 
-    collab = await repo.get_by_id(collab_id)
+    collab = await repo.get_by_id_for_update(collab_id)
     if not collab or getattr(collab, "deleted_at", None) is not None:
         raise ValueError("Collaboration not found")
 
@@ -5394,6 +5670,42 @@ async def _update_collaboration(ctx, id, input) -> CollaborationType:
 
         collab.updated_at = datetime.now(timezone.utc)
         await repo.update(collab)
+        if next_status == CollaborationStatus.ACCEPTED.value:
+            from repositories.collaboration_payment_repository import (
+                CollaborationPaymentRepository,
+            )
+            from services.collaboration_payment_service import (
+                CollaborationPaymentService,
+            )
+
+            await CollaborationPaymentService(
+                CollaborationPaymentRepository(ctx.db)
+            ).activate_for_collaboration_acceptance(collab_id)
+        elif next_status == CollaborationStatus.COMPLETED.value:
+            from repositories.collaboration_payment_repository import (
+                CollaborationPaymentRepository,
+            )
+            from services.collaboration_payment_service import (
+                CollaborationPaymentService,
+            )
+
+            await CollaborationPaymentService(
+                CollaborationPaymentRepository(ctx.db)
+            ).confirm_collaboration_completion(collab_id)
+        elif next_status in {
+            CollaborationStatus.CANCELLED.value,
+            CollaborationStatus.DECLINED.value,
+        }:
+            from repositories.collaboration_payment_repository import (
+                CollaborationPaymentRepository,
+            )
+            from services.collaboration_payment_service import (
+                CollaborationPaymentService,
+            )
+
+            await CollaborationPaymentService(
+                CollaborationPaymentRepository(ctx.db)
+            ).cancel_for_collaboration_resolution(collab_id)
         if status is not None and (
             (
                 previous_state[0].value == CollaborationStatus.PROPOSED.value
@@ -6462,7 +6774,10 @@ async def _comments(ctx, post_id, limit) -> List[CommentGQLType]:
 
 
 async def _delete_account(ctx) -> bool:
+    from services.media_lifecycle_service import delete_user_media
+
     user = ctx.require_auth()
+    await delete_user_media(ctx.db, user.id)
     await ctx.db.delete(user)
     await ctx.db.commit()
     return True
@@ -7382,6 +7697,7 @@ def create_graphql_router(
 async def _graphql_user_from_token(db, token: str) -> tuple[User | None, str | None]:
     """Load only active, non-revoked access-token identities into GraphQL context."""
     from features.auth.jwt import JWTError, decode_token, is_token_blacklisted
+    from app.models.user import AccountStatus
     from repositories.user_repository import UserRepository
 
     try:
@@ -7401,4 +7717,6 @@ async def _graphql_user_from_token(db, token: str) -> tuple[User | None, str | N
         return None, None
 
     user = await UserRepository(db).get_by_id(user_id)
-    return (user, token_id) if user is not None else (None, None)
+    if user is None or user.status != AccountStatus.ACTIVE:
+        return None, None
+    return user, token_id

@@ -4,6 +4,8 @@ Global exception handlers for the ConnextionZ Platform API.
 All errors are returned in the standardized format:
     { "error": { "code": str, "message": str, "details": dict | None } }
 
+Handler logs contain only diagnostic metadata, not exception text or request data.
+
 Per architecture standards (docs/LEAD_ARCHITECT_TASKS.md §Architecture Standards).
 """
 
@@ -118,10 +120,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
         logger.warning(
             "application_error",
-            code=exc.code,
-            message=exc.message,
+            error_type=type(exc).__name__,
             status=exc.http_status,
-            path=request.url.path,
         )
         return _build_error_response(
             code=exc.code,
@@ -151,9 +151,8 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.warning(
             "http_exception",
             code=code,
-            detail=str(exc.detail),
+            error_type=type(exc).__name__,
             status=exc.status_code,
-            path=request.url.path,
         )
         response = _build_error_response(
             code=code,
@@ -179,8 +178,8 @@ def register_exception_handlers(app: FastAPI) -> None:
 
         logger.warning(
             "validation_error",
-            errors=field_errors,
-            path=request.url.path,
+            error_type=type(exc).__name__,
+            error_count=len(field_errors),
         )
         return _build_error_response(
             code="VALIDATION_ERROR",
@@ -191,11 +190,11 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        logger.exception(
+        logger.error(
             "unhandled_error",
             error_type=type(exc).__name__,
-            error=str(exc),
-            path=request.url.path,
+            exc_info=False,
+            stack_info=False,
         )
         return _build_error_response(
             code="INTERNAL_ERROR",

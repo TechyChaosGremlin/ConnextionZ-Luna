@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
@@ -23,10 +24,12 @@ from app.rate_limits import (
 from features.auth.middleware import get_current_active_user
 from repositories.content_repository import MediaRepository, PostRepository
 from services.analytics_event_service import AnalyticsEventService
+from services.media_lifecycle_service import delete_media_records
 from services.media_storage import MediaStorageError, media_storage
 
 router = APIRouter(prefix="/media", tags=["media"])
 upload_volume_limiter = ActionRateLimiter(UPLOAD_VOLUME_LIMITS)
+logger = logging.getLogger(__name__)
 
 
 def _can_manage(user: User, owner_id: uuid.UUID) -> bool:
@@ -86,7 +89,7 @@ async def upload_media(
         file_size_bytes=stored.file_size_bytes,
         storage_provider="s3",
         storage_key=stored.storage_key,
-        is_processed=True,
+        is_processed=False,
     )
     try:
         await MediaRepository(db).create(media)
@@ -103,7 +106,7 @@ async def upload_media(
         try:
             await media_storage.delete(stored.storage_key)
         except MediaStorageError:
-            pass
+            logger.error("Failed to clean up media after a database upload failure")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Media upload failed",
@@ -166,13 +169,19 @@ async def delete_media(
     if not _can_manage(current_user, media.user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to delete media")
     try:
-        await media_storage.delete(media.storage_key)
+        await delete_media_records(db, [media])
     except MediaStorageError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Media deletion failed"
         ) from exc
-    await MediaRepository(db).soft_delete(media)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Media deletion failed",
+        )
 
 
 def _media_payload(media: Media) -> dict[str, object]:

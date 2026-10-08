@@ -297,6 +297,14 @@ def stub_shared_dependencies(monkeypatch):
         fake_user_interest_tags,
     )
 
+    async def fake_category_slugs(self, user_id):
+        return []
+
+    monkeypatch.setattr(
+        "repositories.category_repository.CategoryRepository.get_slugs_by_user_id",
+        fake_category_slugs,
+    )
+
     async def fake_get_interest_pool(
         self, interest_tags, exclude_user_ids=None, since=None, limit=60
     ):
@@ -554,6 +562,107 @@ async def test_feed_pagination_returns_next_cursor_and_subsequent_page(monkeypat
     second_page = await _feed(ctx, cursor=first_page.next_cursor, limit=2, following=True)
     assert [item.id for item in second_page.items] == [post_ids[0]]
     assert second_page.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_following_feed_scans_past_hidden_batch_without_ending_early(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    hidden_creator = make_user("hidden")
+    visible_creator = make_user("visible")
+    post_ids = _ordered_post_ids(3)
+    posts = [
+        make_post(hidden_creator.id, post_ids[2]),
+        make_post(hidden_creator.id, post_ids[1]),
+        make_post(visible_creator.id, post_ids[0]),
+    ]
+    stub_feed_posts(monkeypatch, posts)
+    stub_hidden_creators(monkeypatch, {hidden_creator.id})
+    await follow_graph.follow(viewer.id, hidden_creator.id)
+    await follow_graph.follow(viewer.id, visible_creator.id)
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=1, following=True)
+
+    assert [item.id for item in page.items] == [post_ids[0]]
+    assert page.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_following_feed_bounds_hidden_candidate_scanning_and_continues(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    hidden_creator = make_user("hidden")
+    visible_creator = make_user("visible")
+    post_ids = _ordered_post_ids(1002)
+    posts = [
+        make_post(hidden_creator.id, post_id)
+        for post_id in reversed(post_ids[1:])
+    ] + [make_post(visible_creator.id, post_ids[0])]
+    calls = []
+
+    async def paged_feed(self, user_ids, content_types=None, limit=20, before_id=None):
+        calls.append((limit, before_id))
+        candidates = [post for post in posts if post.user_id in user_ids]
+        candidates.sort(key=lambda post: post.id, reverse=True)
+        if before_id is not None:
+            candidates = [post for post in candidates if post.id < before_id]
+        return candidates[:limit]
+
+    monkeypatch.setattr(
+        "repositories.content_repository.PostRepository.get_feed", paged_feed
+    )
+    stub_hidden_creators(monkeypatch, {hidden_creator.id})
+    await follow_graph.follow(viewer.id, hidden_creator.id)
+    await follow_graph.follow(viewer.id, visible_creator.id)
+    ctx = make_ctx(viewer)
+
+    first_page = await _feed(ctx, None, 1, True)
+
+    assert first_page.items == []
+    assert first_page.next_cursor is not None
+    assert len(calls) == 10
+
+    second_page = await _feed(ctx, first_page.next_cursor, 1, True)
+
+    assert [item.id for item in second_page.items] == [post_ids[0]]
+    assert second_page.next_cursor is None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [None, FeedAlgorithm.ORGANIC, FeedAlgorithm.VIRAL, FeedAlgorithm.COMMUNITY, "following"],
+)
+@pytest.mark.parametrize("candidate_count", [0, 3])
+@pytest.mark.asyncio
+async def test_feed_empty_or_all_hidden_candidates_are_terminal(
+    monkeypatch, follow_graph, mode, candidate_count
+):
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    posts = [
+        make_post(creator.id, uuid.UUID(int=index + 1))
+        for index in range(candidate_count)
+    ]
+    stub_feed_posts(monkeypatch, posts)
+    stub_discovery_pool(monkeypatch, posts)
+    stub_creator_affinity(monkeypatch, {creator.id: 1.0})
+    stub_recent_post_engagement(monkeypatch, {})
+    stub_hidden_creators(monkeypatch, {creator.id})
+    if mode != FeedAlgorithm.VIRAL:
+        await follow_graph.follow(viewer.id, creator.id)
+
+    page = await _feed(
+        make_ctx(viewer),
+        None,
+        10,
+        mode == "following",
+        None if mode == "following" else mode,
+    )
+
+    assert page.items == []
+    assert page.next_cursor is None
 
 
 @pytest.mark.asyncio
@@ -864,10 +973,13 @@ async def test_for_you_does_not_treat_own_posts_as_followed(monkeypatch, follow_
     assert [item.id for item in page.items][0] == stranger_id
 
 
+@pytest.mark.parametrize("alternative_post_id", [1, 10])
 @pytest.mark.asyncio
-async def test_for_you_diversity_caps_consecutive_posts_per_creator(monkeypatch, follow_graph):
-    """Even if one creator has the top-scoring posts, no more than
-    MAX_CONSECUTIVE_PER_CREATOR of their posts should appear back-to-back."""
+async def test_for_you_diversity_caps_consecutive_posts_per_creator(
+    monkeypatch, follow_graph, alternative_post_id
+):
+    """Authoritative engagement makes the dominant posts rank first; an
+    available alternate must break their streak regardless of UUID ordering."""
     from repositories.feed_ranking import MAX_CONSECUTIVE_PER_CREATOR
 
     viewer = make_user("viewer")
@@ -877,12 +989,21 @@ async def test_for_you_diversity_caps_consecutive_posts_per_creator(monkeypatch,
 
     dominant_posts = [
         make_post(dominant_creator.id, pid, created_at=now, view_count=1000, like_count=500)
-        for pid in _ordered_post_ids(4)
+        for pid in [uuid.UUID(int=value) for value in range(2, 6)]
     ]
-    other_post = make_post(other_creator.id, _ordered_post_ids(1)[0], created_at=now, view_count=1)
+    other_post = make_post(
+        other_creator.id, uuid.UUID(int=alternative_post_id), created_at=now, view_count=1
+    )
     stub_feed_posts(monkeypatch, [])
     stub_discovery_pool(monkeypatch, dominant_posts + [other_post])
     stub_hidden_creators(monkeypatch)
+    stub_recommendation_engagement_counts(
+        monkeypatch,
+        {
+            post.id: {"views": post.view_count, "likes": post.like_count}
+            for post in dominant_posts + [other_post]
+        },
+    )
 
     page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
 
@@ -896,6 +1017,16 @@ async def test_for_you_diversity_caps_consecutive_posts_per_creator(monkeypatch,
         streak = streak + 1 if curr == prev else 1
         max_streak = max(max_streak, streak)
     assert max_streak <= MAX_CONSECUTIVE_PER_CREATOR
+    assert creators_in_order == [
+        dominant_creator.id,
+        dominant_creator.id,
+        other_creator.id,
+        dominant_creator.id,
+        dominant_creator.id,
+    ]
+    assert {item.id for item in page.items} == {
+        post.id for post in dominant_posts + [other_post]
+    }
 
 
 @pytest.mark.asyncio
@@ -963,6 +1094,81 @@ async def test_for_you_pagination_is_stable_across_pages(monkeypatch, follow_gra
 
 
 @pytest.mark.asyncio
+async def test_for_you_pagination_supports_pages_larger_than_default(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    post_ids = _ordered_post_ids(125)
+    posts = [
+        make_post(creator.id, post_id, view_count=index)
+        for index, post_id in enumerate(post_ids)
+    ]
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, posts)
+    stub_recommendation_engagement_counts(
+        monkeypatch, {post.id: {"views": post.view_count} for post in posts}
+    )
+
+    first_page = await _feed(make_ctx(viewer), None, 110, False)
+    second_page = await _feed(
+        make_ctx(viewer), first_page.next_cursor, 110, False
+    )
+
+    first_ids = {item.id for item in first_page.items}
+    second_ids = {item.id for item in second_page.items}
+    assert len(first_ids) == 110
+    assert len(second_ids) == 15
+    assert first_ids.isdisjoint(second_ids)
+    assert first_ids | second_ids == set(post_ids)
+    assert second_page.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_ranked_feed_cursor_cannot_be_reused_with_another_algorithm(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    creator = make_user("creator")
+    post_ids = _ordered_post_ids(3)
+    posts = [
+        make_post(creator.id, post_id, view_count=100 - index)
+        for index, post_id in enumerate(post_ids)
+    ]
+    stub_feed_posts(monkeypatch, [])
+    stub_discovery_pool(monkeypatch, posts)
+    stub_recommendation_engagement_counts(
+        monkeypatch, {post.id: {"views": post.view_count} for post in posts}
+    )
+    stub_recent_post_engagement(monkeypatch, {})
+
+    organic_page = await _feed(
+        make_ctx(viewer), None, 1, False, FeedAlgorithm.ORGANIC
+    )
+    assert organic_page.next_cursor is not None
+
+    with pytest.raises(ValueError, match="Invalid feed cursor"):
+        await _feed(
+            make_ctx(viewer),
+            organic_page.next_cursor,
+            1,
+            False,
+            FeedAlgorithm.VIRAL,
+        )
+
+
+@pytest.mark.asyncio
+async def test_following_feed_rejects_ranked_snapshot_cursor(monkeypatch, follow_graph):
+    from api.graphql import _encode_for_you_cursor
+
+    post_id = uuid.uuid4()
+    cursor = _encode_for_you_cursor([post_id], post_id, "organic")
+
+    with pytest.raises(ValueError, match="Invalid feed cursor"):
+        await _feed(make_ctx(make_user("viewer")), cursor, 10, True)
+
+
+@pytest.mark.asyncio
 async def test_for_you_pagination_snapshot_cursor_survives_mid_pagination_drift(
     monkeypatch, follow_graph
 ):
@@ -1009,7 +1215,7 @@ async def test_for_you_pagination_snapshot_cursor_survives_mid_pagination_drift(
     first_ids = [item.id for item in first_page.items]
     assert len(first_ids) == 2
     # Snapshot cursor embeds the full ranked order, not just the last id.
-    assert first_page.next_cursor.startswith("fy1.")
+    assert first_page.next_cursor.startswith("fy2.")
 
     # Drift: b2's engagement jumps so it would now outrank the remaining posts,
     # and a brand-new top post enters the pool. Page 2 must continue the page-1
@@ -1031,12 +1237,12 @@ async def test_for_you_pagination_snapshot_cursor_survives_mid_pagination_drift(
     assert set(first_ids).isdisjoint(second_ids)
 
 
+@pytest.mark.parametrize("snapshot_cursor", [False, True])
 @pytest.mark.asyncio
 async def test_for_you_pagination_accepts_legacy_plain_post_id_cursor(
-    monkeypatch, follow_graph
+    monkeypatch, follow_graph, snapshot_cursor
 ):
-    """Backward compatibility: a plain post-id cursor (pre-snapshot clients)
-    still resumes by locating that post in the freshly computed ranking."""
+    """Legacy plain-id and unscoped snapshot cursors resume in the live ranking."""
     viewer = make_user("viewer")
     creator = make_user("creator")
     now = datetime.now(timezone.utc)
@@ -1056,9 +1262,12 @@ async def test_for_you_pagination_accepts_legacy_plain_post_id_cursor(
         },
     )
 
-    page = await _feed(
-        make_ctx(viewer), cursor=str(post_ids[0]), limit=2, following=False
+    cursor = (
+        f"fy1.{post_ids[0]}.{','.join(str(post_id) for post_id in post_ids)}"
+        if snapshot_cursor
+        else str(post_ids[0])
     )
+    page = await _feed(make_ctx(viewer), cursor=cursor, limit=2, following=False)
 
     assert [item.id for item in page.items] == post_ids[1:]
     assert page.next_cursor is None
@@ -1121,6 +1330,49 @@ async def test_for_you_interest_pool_includes_tag_matching_posts(monkeypatch, fo
     page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
 
     assert [item.id for item in page.items] == [music_post_id]
+
+
+@pytest.mark.asyncio
+async def test_for_you_adds_authenticated_users_canonical_categories_to_interest_pool(
+    monkeypatch, follow_graph
+):
+    viewer = make_user("viewer")
+    stranger = make_user("stranger")
+    post_id = _ordered_post_ids(1)[0]
+    post = make_post(
+        stranger.id,
+        post_id,
+        created_at=datetime.now(timezone.utc),
+        tags=["gaming"],
+    )
+    requested_users = []
+    requested_tags = []
+
+    async def category_slugs(self, user_id):
+        requested_users.append(user_id)
+        return ["gaming"]
+
+    async def interest_pool(self, interest_tags, **kwargs):
+        requested_tags.extend(interest_tags)
+        return [post] if "gaming" in interest_tags else []
+
+    monkeypatch.setattr(
+        "repositories.category_repository.CategoryRepository.get_slugs_by_user_id",
+        category_slugs,
+    )
+    monkeypatch.setattr(
+        "repositories.content_repository.PostRepository.get_interest_pool",
+        interest_pool,
+    )
+    stub_feed_posts(monkeypatch, [])
+    stub_user_interest_tags(monkeypatch, [])
+    stub_hidden_creators(monkeypatch)
+
+    page = await _feed(make_ctx(viewer), cursor=None, limit=10, following=False)
+
+    assert requested_users == [viewer.id]
+    assert requested_tags == ["gaming"]
+    assert [item.id for item in page.items] == [post_id]
 
 
 @pytest.mark.asyncio
@@ -1537,13 +1789,15 @@ async def test_graphql_invalid_algorithm_never_dispatches(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_organic_delegates_unchanged_to_for_you(monkeypatch, follow_graph):
+async def test_organic_delegates_to_for_you_with_its_cursor_scope(monkeypatch, follow_graph):
     handler = AsyncMock(return_value=object())
     monkeypatch.setattr("api.graphql._for_you_feed", handler)
     ctx = make_ctx(make_user("viewer"))
     result = await _feed(ctx, None, 7, True, FeedAlgorithm.ORGANIC)
     assert result is handler.return_value
-    handler.assert_awaited_once_with(ctx, ctx.current_user, [], None, 7, None)
+    handler.assert_awaited_once_with(
+        ctx, ctx.current_user, [], None, 7, None, pagination_scope="organic"
+    )
 
 
 @pytest.mark.asyncio
@@ -1683,6 +1937,25 @@ async def test_feed_snapshot_lookup_excludes_deleted_and_unpublished_posts():
     assert "posts.status =" in str(compiled)
     assert ContentStatus.PUBLISHED in compiled.params.values()
     assert [post_id] in compiled.params.values()
+
+
+@pytest.mark.asyncio
+async def test_feed_repository_orders_by_its_uuid_keyset_cursor():
+    from repositories.content_repository import PostRepository
+
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [])
+    )
+
+    await PostRepository(db).get_feed(
+        user_ids=[uuid.uuid4()], limit=2, before_id=uuid.uuid4()
+    )
+
+    statement = db.execute.await_args.args[0]
+    compiled = statement.compile()
+    assert "posts.id <" in str(compiled)
+    assert "ORDER BY posts.id DESC" in str(compiled)
 
 
 @pytest.mark.parametrize(("algorithm", "limit", "message"), [

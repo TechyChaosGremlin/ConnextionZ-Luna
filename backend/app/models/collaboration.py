@@ -110,6 +110,12 @@ class Collaboration(Base, TimestampMixin, SoftDeleteMixin):
         lazy="selectin",
         cascade="all, delete-orphan",
     )
+    payment: Mapped["CollaborationPayment | None"] = relationship(
+        "CollaborationPayment",
+        back_populates="collaboration",
+        uselist=False,
+        passive_deletes="all",
+    )
 
     def _update_collaboration(self, new_status: CollaborationStatus | str) -> None:
         """Validate and apply a collaboration status transition."""

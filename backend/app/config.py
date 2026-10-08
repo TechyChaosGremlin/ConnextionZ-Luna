@@ -3,16 +3,79 @@ ConnextionZ Platform — Application Configuration.
 
 Uses pydantic-settings to load from environment / .env file.
 All secrets and connection strings are sourced from environment variables.
+DEBUG accepts case-insensitive boolean spellings with surrounding whitespace.
+Invalid DEBUG values are rejected; production still requires DEBUG=false.
 """
 
 from __future__ import annotations
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import unquote, urlsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_INSECURE_DEFAULT_PASSWORDS = {
+    "password",
+    "guest",
+    "default",
+    "changeme",
+    "change-me",
+    "123456",
+    "postgres",
+    "redis",
+    "rabbitmq",
+}
+_LOCAL_HOSTS = {"localhost", "localhost.localdomain"}
+_DEBUG_BOOLEAN_ADAPTER = TypeAdapter(bool)
+
+
+def _is_local_host(hostname: str) -> bool:
+    if hostname in _LOCAL_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_production_url(
+    value: str,
+    setting_name: str,
+    allowed_schemes: set[str],
+    *,
+    require_username: bool = True,
+) -> None:
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        username = unquote(parsed.username or "").lower()
+        password = unquote(parsed.password or "").lower()
+    except ValueError:
+        raise ValueError(f"{setting_name} must be a valid production connection URL.") from None
+
+    if parsed.scheme not in allowed_schemes or not hostname:
+        raise ValueError(
+            f"{setting_name} must use a supported scheme and specify a hostname."
+        )
+    if _is_local_host(hostname):
+        raise ValueError(f"{setting_name} must not use a localhost endpoint in production.")
+    if (require_username and not username) or not password:
+        raise ValueError(
+            f"{setting_name} must include explicit non-default credentials in production."
+        )
+    if (
+        username == "guest"
+        or password in _INSECURE_DEFAULT_PASSWORDS
+        or username == password
+    ):
+        raise ValueError(
+            f"{setting_name} must not use default or insecure credentials in production."
+        )
 
 
 class Settings(BaseSettings):
@@ -23,13 +86,27 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     # ── Application ──────────────────────────────────────────────
     debug: bool = Field(default=False)
-    environment: Literal["development", "staging", "production"] = Field(
+    environment: Literal["development", "test", "local", "staging", "production"] = Field(
         default="development"
     )
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug(cls, value: object) -> bool:
+        """Validate DEBUG without including its supplied value in the error."""
+        if isinstance(value, str):
+            value = value.strip()
+        try:
+            return _DEBUG_BOOLEAN_ADAPTER.validate_python(value)
+        except ValidationError:
+            raise ValueError(
+                "DEBUG must be a boolean: true/false, 1/0, yes/no, or on/off."
+            ) from None
 
     # ── JWT Authentication ───────────────────────────────────────
     jwt_secret_key: SecretStr = Field(
@@ -89,12 +166,14 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = Field(default=SecretStr(""))
     anthropic_api_key: SecretStr = Field(default=SecretStr(""))
 
-    # ── AWS ──────────────────────────────────────────────────────
-    aws_access_key_id: str = Field(default="test")
-    aws_secret_access_key: SecretStr = Field(default=SecretStr("test"))
-    aws_region: str = Field(default="us-east-1")
+    # ── Media storage (AWS S3 or explicitly configured S3-compatible endpoint) ──
+    aws_access_key_id: str | None = Field(default=None)
+    aws_secret_access_key: SecretStr | None = Field(default=None)
+    aws_region: str | None = Field(default=None)
     aws_endpoint_url: str = Field(default="")
-    aws_s3_bucket: str = Field(default="connextionz-media")
+    aws_s3_bucket: str | None = Field(default=None)
+    media_max_image_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    media_max_video_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
 
     # ── Streaming ────────────────────────────────────────────────
     ffmpeg_path: str = Field(default="ffmpeg")
@@ -139,9 +218,26 @@ class Settings(BaseSettings):
     enable_agentic_router: bool = Field(default=True)
     enable_realtime_notifications: bool = Field(default=True)
 
+    # ── Collaboration payments ───────────────────────────────────
+    collaboration_payment_provider: Literal["disabled", "fake"] = Field(
+        default="disabled"
+    )
+    collaboration_payment_real_money_enabled: bool = Field(default=False)
+
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":
         """Ensure critical secrets and runtime flags are safe in production."""
+        if self.collaboration_payment_real_money_enabled:
+            raise ValueError(
+                "Real-money collaboration payments are not supported by any configured provider"
+            )
+        if (
+            self.environment == "production"
+            and self.collaboration_payment_provider == "fake"
+        ):
+            raise ValueError(
+                "The fake collaboration payment provider cannot be selected in production"
+            )
         if self.environment == "production":
             if self.debug:
                 raise ValueError("FATAL: DEBUG must be disabled in production.")
@@ -152,6 +248,46 @@ class Settings(BaseSettings):
                 )
             if len(self.jwt_secret_key.get_secret_value()) < 32:
                 raise ValueError("FATAL: JWT_SECRET_KEY must be at least 32 characters long in production.")
+            required_urls = {
+                "database_url": "DATABASE_URL",
+                "redis_url": "REDIS_URL",
+                "rabbitmq_url": "RABBITMQ_URL",
+            }
+            missing_urls = [
+                env_name
+                for field_name, env_name in required_urls.items()
+                if field_name not in self.model_fields_set
+                or not getattr(self, field_name).strip()
+            ]
+            if missing_urls:
+                raise ValueError(
+                    "Production requires explicit configuration for: "
+                    + ", ".join(missing_urls)
+                    + "."
+                )
+
+            _validate_production_url(
+                self.database_url,
+                "DATABASE_URL",
+                {"postgresql+asyncpg"},
+            )
+            if self.database_url_sync.strip():
+                _validate_production_url(
+                    self.database_url_sync,
+                    "DATABASE_URL_SYNC",
+                    {"postgresql+psycopg"},
+                )
+            _validate_production_url(
+                self.redis_url,
+                "REDIS_URL",
+                {"redis", "rediss"},
+                require_username=False,
+            )
+            _validate_production_url(
+                self.rabbitmq_url,
+                "RABBITMQ_URL",
+                {"amqp", "amqps"},
+            )
         return self
 
     # ── Rate Limiting ────────────────────────────────────────────

@@ -47,7 +47,13 @@ export interface OnboardingSetup {
   responseTime: string;
 }
 
-export default function Onboarding({ onDone }: { onDone: (setup: OnboardingSetup | null) => void }) {
+export default function Onboarding({
+  onDone,
+  error,
+}: {
+  onDone: (setup: OnboardingSetup | null) => void;
+  error?: string | null;
+}) {
   const [step, setStep]                       = useState<OnbStep>(1);
   const [selectedCats, setSelectedCats]       = useState<string[]>([]);
   const [selectedCollabs, setSelectedCollabs] = useState<string[]>([]);
@@ -84,6 +90,7 @@ export default function Onboarding({ onDone }: { onDone: (setup: OnboardingSetup
         <StepDots step={step} total={3} />
         <span className="text-white/35 text-[12px]">Step {step} of 3</span>
       </div>
+      {error && <p role="alert" className="px-6 pb-3 text-sm text-red-300 lg:px-0">{error}</p>}
 
       {/* Step content */}
       <div className={`flex-1 overflow-y-auto lg:overflow-visible ${GUTTER}`}>

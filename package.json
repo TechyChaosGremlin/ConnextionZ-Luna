@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
-    "test:frontend": "node --experimental-strip-types --test src/app/analytics-utils.test.ts src/app/profile-validation.test.ts src/app/auth-store.test.ts src/app/paid-feed.test.ts && npm run test:paid-ui",
+    "test:frontend": "node --experimental-strip-types --test src/app/analytics-utils.test.ts src/app/profile-validation.test.ts src/app/auth-store.test.ts src/app/feed-pagination.test.ts src/app/paid-feed.test.ts && npm run test:paid-ui",
     "test:paid-ui": "node scripts/run-paid-ui-tests.mjs",
     "api:server": "python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8002",
     "api:test": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/run-backend-tests.ps1",
