@@ -101,17 +101,64 @@ def assert_rate_limited(response, retry_after_limit=60):
     assert 1 <= int(response.headers["Retry-After"]) <= retry_after_limit
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "query", "body"),
+    [
+        (
+            "/auth/register",
+            {"email": "url@example.test", "password": "url-secret"},
+            {"email": "body@example.test", "username": "body-user", "password": "body-secret"},
+        ),
+        (
+            "/auth/login",
+            {"email": "url@example.test", "password": "url-secret"},
+            {"email": "body@example.test", "password": "body-secret"},
+        ),
+        (
+            "/auth/refresh",
+            {"refresh_token": "url-secret"},
+            {"refresh_token": "body-secret"},
+        ),
+        (
+            "/auth/password-reset/confirm",
+            {"token": "url-secret", "new_password": "url-secret"},
+            {"token": "body-token", "new_password": "body-password"},
+        ),
+    ],
+)
+async def test_auth_values_in_query_are_rejected(client, path, query, body):
+    response = await client.post(path, params=query, json=body)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "Authentication values must be sent in the request body"
+    )
+    assert "url-secret" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_query_only_login_is_not_accepted(client, auth_harness):
+    response = await client.post(
+        "/auth/login",
+        params={"email": "url@example.test", "password": "url-secret"},
+    )
+
+    assert response.status_code == 422
+    auth_harness.repository.get_by_email.assert_not_awaited()
+
+
 async def post_login(client, email="user@example.com", password="correct-password"):
     return await client.post(
         "/auth/login",
-        params={"email": email, "password": password},
+        json={"email": email, "password": password},
     )
 
 
 async def post_register(client, suffix="user"):
     return await client.post(
         "/auth/register",
-        params={
+        json={
             "email": f"{suffix}@example.com",
             "username": suffix,
             "password": "Strong-password1!",
@@ -161,7 +208,7 @@ async def test_register_has_its_own_tighter_ip_bucket(client, auth_harness):
 async def test_refresh_has_a_separate_endpoint_bucket(client, auth_harness):
     for _ in range(30):
         response = await client.post(
-            "/auth/refresh", params={"refresh_token": "refresh-token"}
+            "/auth/refresh", json={"refresh_token": "refresh-token"}
         )
         assert response.status_code == 200
         assert response.json() == {
@@ -171,7 +218,7 @@ async def test_refresh_has_a_separate_endpoint_bucket(client, auth_harness):
         }
 
     assert_rate_limited(
-        await client.post("/auth/refresh", params={"refresh_token": "refresh-token"})
+        await client.post("/auth/refresh", json={"refresh_token": "refresh-token"})
     )
     assert auth_harness.repository.get_by_id.await_count == 30
 
@@ -201,7 +248,7 @@ async def test_auth_endpoints_do_not_consume_each_others_buckets(client, auth_ha
     assert_rate_limited(await post_login(client, password="wrong-password"))
     assert (await post_register(client, "independent")).status_code == 201
     assert (
-        await client.post("/auth/refresh", params={"refresh_token": "refresh-token"})
+        await client.post("/auth/refresh", json={"refresh_token": "refresh-token"})
     ).status_code == 200
     assert (
         await client.post(
@@ -224,7 +271,7 @@ async def test_successful_auth_responses_remain_unchanged(client, auth_harness):
     assert login.json()["token_type"] == "bearer"
 
     refresh = await client.post(
-        "/auth/refresh", params={"refresh_token": "refresh-token"}
+        "/auth/refresh", json={"refresh_token": "refresh-token"}
     )
     assert refresh.status_code == 200
     assert set(refresh.json()) == {"access_token", "token_type", "expires_in"}

@@ -216,6 +216,12 @@ The active middleware retains a global limit of **60 HTTP requests per IP per
 60 seconds** (configurable via `rate_limit_per_minute`). Health endpoints are exempt.
 The tier limits above are not yet implemented.
 
+REST authentication request values are sent as JSON bodies. Registration uses
+`email`, `username`, and `password`; login uses `email` and `password`; refresh
+uses `refresh_token`. Credential-bearing query parameters are rejected. Access
+tokens continue to be returned in the existing JSON response and supplied to
+protected routes in the `Authorization: Bearer` header.
+
 REST authentication endpoints also have independent IP-based sliding-window
 buckets:
 
@@ -479,7 +485,7 @@ This avoids streaming large files through the API server.
 | Endpoint | Purpose | Kubernetes Probe |
 |----------|---------|-----------------|
 | `GET /health` | Basic liveness | `livenessProbe` |
-| `GET /health/ready` | Dependency readiness (DB, Redis, MQ) | `readinessProbe` |
+| `GET /health/ready` | Dependency readiness (DB, Redis, MQ); `200` when ready, `503` otherwise | `readinessProbe` |
 | `GET /health/live` | Application alive | `livenessProbe` |
 
 ## 14. Content Security & Input Validation

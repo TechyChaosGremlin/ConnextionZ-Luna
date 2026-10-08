@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.graphql import (
     AppContext,
@@ -52,7 +53,9 @@ def make_user(username: str = "alice", role: UserRole = UserRole.CREATOR) -> Use
 
 
 def make_ctx(user: User | None) -> AppContext:
-    return AppContext(db=AsyncMock(), current_user=user, session_id="sess-test")
+    return AppContext(
+        db=AsyncMock(spec=AsyncSession), current_user=user, session_id="sess-test"
+    )
 
 
 def make_collab(initiator_id, status=CollaborationStatus.PROPOSED, deleted_at=None) -> SimpleNamespace:
@@ -121,6 +124,15 @@ def patch_collab_repo(
     async def fake_get_accepted_participants(self, c):
         return list(accepted_participants or [])
 
+    async def fake_confirm_collaboration_completion(self, collaboration_id):
+        return None
+
+    async def fake_activate_for_collaboration_acceptance(self, collaboration_id):
+        return None
+
+    async def fake_cancel_for_collaboration_resolution(self, collaboration_id):
+        return None
+
     async def fake_get_milestone_by_id(self, milestone_id):
         if milestone is not None and _uuid(milestone_id) == milestone.id:
             return milestone
@@ -136,12 +148,30 @@ def patch_collab_repo(
         return m
 
     monkeypatch.setattr(f"{repo_path}.get_by_id", fake_get_by_id)
+    monkeypatch.setattr(
+        f"{repo_path}.get_by_id_for_update", fake_get_by_id
+    )
     monkeypatch.setattr(f"{repo_path}.get_participant", fake_get_participant)
     monkeypatch.setattr(f"{repo_path}.get_accepted_participants", fake_get_accepted_participants)
     monkeypatch.setattr(f"{repo_path}.get_milestone_by_id", fake_get_milestone_by_id)
     monkeypatch.setattr(f"{repo_path}.update", fake_update)
     monkeypatch.setattr(f"{repo_path}.update_milestone", fake_update_milestone)
     monkeypatch.setattr(f"{repo_path}.add_milestone", fake_add_milestone)
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.confirm_collaboration_completion",
+        fake_confirm_collaboration_completion,
+    )
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.activate_for_collaboration_acceptance",
+        fake_activate_for_collaboration_acceptance,
+    )
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.cancel_for_collaboration_resolution",
+        fake_cancel_for_collaboration_resolution,
+    )
 # ── Collaboration detail (_collaboration) ─────────────────────────────────────
 
 
@@ -366,6 +396,68 @@ async def test_status_transitions_set_lifecycle_timestamps(monkeypatch):
     )
     assert collab.started_at == started_at
     assert collab.completed_at is not None
+    assert ctx.db.add.call_count == 3
+    assert ctx.db.flush.await_count == 3
+    assert ctx.db.commit.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_authoritative_completion_confirms_payment_before_commit(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, status=CollaborationStatus.IN_PROGRESS)
+    patch_collab_repo(monkeypatch, collab=collab)
+    observed = []
+
+    async def confirm_completion(self, collaboration_id):
+        observed.append(
+            (collaboration_id, collab.status, collab.completed_at is not None)
+        )
+
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.confirm_collaboration_completion",
+        confirm_completion,
+    )
+
+    await _update_collaboration(
+        make_ctx(owner),
+        str(collab.id),
+        SimpleNamespace(status=SimpleNamespace(value="completed")),
+    )
+
+    assert observed == [(collab.id, CollaborationStatus.COMPLETED, True)]
+
+
+@pytest.mark.asyncio
+async def test_payment_completion_failure_rolls_back_collaboration_completion(monkeypatch):
+    owner = make_user(username="owner")
+    collab = make_collab(owner.id, status=CollaborationStatus.IN_PROGRESS)
+    patch_collab_repo(monkeypatch, collab=collab)
+
+    async def reject_completion(self, collaboration_id):
+        assert collaboration_id == collab.id
+        raise ValueError("Payment completion requires an active payment with an authorized hold")
+
+    monkeypatch.setattr(
+        "services.collaboration_payment_service."
+        "CollaborationPaymentService.confirm_collaboration_completion",
+        reject_completion,
+    )
+    ctx = make_ctx(owner)
+
+    with pytest.raises(ValueError, match="authorized hold"):
+        await _update_collaboration(
+            ctx,
+            str(collab.id),
+            SimpleNamespace(status=SimpleNamespace(value="completed")),
+        )
+
+    assert collab.status == CollaborationStatus.IN_PROGRESS
+    assert collab.completed_at is None
+    ctx.db.rollback.assert_awaited_once_with()
+    ctx.db.commit.assert_not_awaited()
+
+
 # ── Add milestone (_add_milestone) ────────────────────────────────────────────
 
 

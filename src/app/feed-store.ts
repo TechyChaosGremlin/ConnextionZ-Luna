@@ -79,6 +79,7 @@ export type FeedStatus = "loading" | "ready" | "error";
 
 export interface FeedState {
   items: FeedVideo[];
+  cursor: string | null;
   status: FeedStatus;
   error: string;
   /** A page after the first is in flight — the spinner at the end of the list. */
@@ -93,6 +94,7 @@ export interface FeedState {
 
 export function useFeed(following = false): FeedState {
   const [items, setItems] = useState<FeedVideo[]>([]);
+  const [pageCursor, setPageCursor] = useState<string | null>(null);
   const [status, setStatus] = useState<FeedStatus>("loading");
   const [error, setError] = useState("");
   const [loadingMore, setLoadingMore] = useState(false);
@@ -121,6 +123,7 @@ export function useFeed(following = false): FeedState {
       if (!append) { setError(result.error); setStatus("error"); }
       return;
     }
+    setPageCursor(result.value.cursor);
     cursor.current = result.value.cursor;
     setReachedEnd(result.value.cursor === null);
     setItems((previous) => {
@@ -135,6 +138,7 @@ export function useFeed(following = false): FeedState {
     requestGeneration.current += 1;
     inFlight.current = false;
     cursor.current = null;
+    setPageCursor(null);
     setItems([]);
     setReachedEnd(false);
     void load(null, false);
@@ -147,9 +151,10 @@ export function useFeed(following = false): FeedState {
 
   const reload = useCallback(() => {
     cursor.current = null;
+    setPageCursor(null);
     setReachedEnd(false);
     void load(null, false);
   }, [load]);
 
-  return { items, status, error, loadingMore, reachedEnd, loadMore, reload };
+  return { items, cursor: pageCursor, status, error, loadingMore, reachedEnd, loadMore, reload };
 }

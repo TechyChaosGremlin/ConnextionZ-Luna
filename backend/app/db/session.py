@@ -73,13 +73,20 @@ async def check_db_connection() -> bool:
 
     Returns:
         True if connection is successful, False otherwise
+
+    Failures log only the exception type, never connection details or tracebacks.
     """
     try:
         async with async_engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
             return True
     except Exception as e:
-        logger.error("Database connection failed", error=str(e))
+        logger.error(
+            "Database connection failed",
+            error_type=type(e).__name__,
+            exc_info=False,
+            stack_info=False,
+        )
         return False
 
 

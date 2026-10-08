@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.requests import Request
 
 from api.graphql import AppContext, LoginInput, RegisterInput, _login, _register
 from app.models.user import AccountStatus, User
@@ -66,10 +67,22 @@ async def test_graphql_signup_returns_active_unverified_user_that_can_log_in():
 @pytest.mark.asyncio
 async def test_rest_signup_returns_active_unverified_user_that_can_log_in():
     db = AsyncMock()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/auth/register",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
     signup = await auth_router.register(
-        email="rest@example.com",
-        username="restuser",
-        password="StrongPass123!",
+        auth_router.RegisterRequest(
+            email="rest@example.com",
+            username="restuser",
+            password="StrongPass123!",
+        ),
+        request,
         db=db,
     )
 
@@ -78,8 +91,8 @@ async def test_rest_signup_returns_active_unverified_user_that_can_log_in():
     assert user.email_verified is False
 
     login = await auth_router.login(
-        email="rest@example.com",
-        password="StrongPass123!",
+        auth_router.LoginRequest(email="rest@example.com", password="StrongPass123!"),
+        request,
         db=db,
     )
     assert login["access_token"]

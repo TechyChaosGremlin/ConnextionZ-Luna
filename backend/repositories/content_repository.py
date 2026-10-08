@@ -120,7 +120,9 @@ class PostRepository(BaseRepository[Post]):
             stmt = stmt.where(Post.content_type.in_(content_types))
         if before_id:
             stmt = stmt.where(Post.id < before_id)
-        stmt = stmt.order_by(Post.created_at.desc()).limit(limit)
+        # ``before_id`` is the keyset cursor, so the result order must use the
+        # same UUIDv7 key to remain stable across pages.
+        stmt = stmt.order_by(Post.id.desc()).limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
@@ -534,6 +536,14 @@ class MediaRepository(BaseRepository[Media]):
         result = await self.db.execute(
             select(Media)
             .where(Media.post_id == post_id, Media.deleted_at.is_(None))
+            .order_by(Media.created_at.asc())
+        )
+        return list(result.scalars().all())
+
+    async def get_by_user_id(self, user_id: uuid.UUID) -> list[Media]:
+        result = await self.db.execute(
+            select(Media)
+            .where(Media.user_id == user_id, Media.deleted_at.is_(None))
             .order_by(Media.created_at.asc())
         )
         return list(result.scalars().all())

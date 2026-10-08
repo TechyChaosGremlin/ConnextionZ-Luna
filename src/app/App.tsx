@@ -10,6 +10,7 @@ import { InboxScreen } from "./Inbox";
 import { ThemeContext, useTheme } from "./ThemeContext";
 import { creatorById, type FeedVideo } from "./creators";
 import { useFeed } from "./feed-store";
+import { shouldLoadNextFeedPage } from "./feed-pagination.ts";
 import { addComment, deleteComment, editComment, fetchComments, likeComment, reportComment, type GraphQLComment, trackPostWatch, unlikeComment } from "./profile-graphql";
 import { activateFollowGraph, useFollow } from "./follow-store";
 import { activateLikeGraph, useLike } from "./like-store";
@@ -844,7 +845,7 @@ export default function App() {
   const touchStartY = useRef(0);
   const pausedRef = useRef(paused);
 
-  const { items: feedItems, status: feedStatus, error: feedError, loadMore, reachedEnd, reload } = useFeed(feedTab === "following");
+  const { items: feedItems, cursor: feedCursor, status: feedStatus, error: feedError, loadMore, reachedEnd, reload } = useFeed(feedTab === "following");
 
   useEffect(() => {
     activatePosts(account?.email ?? null);
@@ -892,8 +893,8 @@ export default function App() {
   // A page after the next is requested a slide before it is needed, so
   // scrolling never waits on a page that is still in flight.
   useEffect(() => {
-    if (!reachedEnd && idx >= feed.length - 2) loadMore();
-  }, [idx, feed.length, reachedEnd, loadMore]);
+    if (shouldLoadNextFeedPage(idx, feed.length, feedCursor, reachedEnd)) loadMore();
+  }, [idx, feed.length, feedCursor, reachedEnd, loadMore]);
 
   const goNext = useCallback(() => { if (idx < feed.length - 1) { setDir(1); setIdx((i) => i + 1); } }, [idx, feed.length]);
   const goPrev = useCallback(() => { if (idx > 0) { setDir(-1); setIdx((i) => i - 1); } }, [idx]);

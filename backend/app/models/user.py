@@ -13,7 +13,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -89,16 +89,23 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
 
     # Relationships
     profile: Mapped["Profile | None"] = relationship(
-        "Profile", back_populates="user", uselist=False, lazy="selectin"
+        "Profile",
+        back_populates="user",
+        uselist=False,
+        lazy="selectin",
+        passive_deletes="all",
     )
     sessions: Mapped[list["Session"]] = relationship(
-        "Session", back_populates="user", lazy="selectin"
+        "Session",
+        back_populates="user",
+        lazy="selectin",
+        passive_deletes="all",
     )
     stream_sessions: Mapped[list["StreamSession"]] = relationship(  # noqa: F821
-        "StreamSession", back_populates="owner"
+        "StreamSession", back_populates="owner", passive_deletes="all"
     )
     connected_stream_accounts: Mapped[list["ConnectedStreamAccount"]] = relationship(  # noqa: F821
-        "ConnectedStreamAccount", back_populates="user"
+        "ConnectedStreamAccount", back_populates="user", passive_deletes="all"
     )
 
     def __repr__(self) -> str:
@@ -148,9 +155,15 @@ class Profile(Base, TimestampMixin, SoftDeleteMixin):
     open_to_collab: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     private_account: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     response_time: Mapped[str] = mapped_column(String(50), default="< 4 hours", nullable=False)
+    onboarding_collab_types: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="profile")
+    categories: Mapped[list["Category"]] = relationship(
+        "Category", secondary="profile_categories", back_populates="profiles", lazy="selectin"
+    )
 
     def __repr__(self) -> str:
         return f"<Profile id={self.id!r} display_name={self.display_name!r}>"

@@ -26,6 +26,7 @@ from app.models import Base  # noqa: E402
 import app.models.user  # noqa: E402, F401
 import app.models.content  # noqa: E402, F401
 import app.models.collaboration  # noqa: E402, F401
+import app.models.collaboration_payment  # noqa: E402, F401
 import app.models.reputation  # noqa: E402, F401
 import app.models.embedding  # noqa: E402, F401
 import app.models.notification  # noqa: E402, F401
@@ -40,7 +41,7 @@ settings = get_settings()
 sync_url = settings.sync_database_url
 
 if sync_url:
-    config.set_main_option("sqlalchemy.url", sync_url)
+    config.set_main_option("sqlalchemy.url", sync_url.replace("%", "%%"))
 
 # ── Metadata target ──────────────────────────────────────────────
 target_metadata = Base.metadata

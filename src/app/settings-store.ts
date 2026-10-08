@@ -3,7 +3,9 @@
 // Everything the Settings screens read and write, persisted per account so
 // signing in as someone else does not inherit the previous user's preferences.
 //
-// ⚠️  PROTOTYPE PERSISTENCE — localStorage, same caveats as `auth-store`.
+// Preferences remain cached here for the synchronous Settings UI. The
+// non-category onboarding fields are persisted to the authenticated profile
+// and this cache is refreshed from the server during onboarding.
 //
 // ── Replacing this with a real backend ──────────────────────────────────────
 // Keep the exported signatures and the Settings UI needs no changes:

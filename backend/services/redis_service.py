@@ -47,7 +47,7 @@ class RedisService:
     async def disconnect(self) -> None:
         """Close Redis connection pool."""
         if self.redis:
-            await self.redis.close()
+            await self.redis.aclose()
 
     async def ping(self) -> bool:
         """Check Redis connectivity."""

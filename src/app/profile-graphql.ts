@@ -116,9 +116,25 @@ export type GraphQLProfile = {
   following?: number | null;
   openToCollab?: boolean | null;
   responseTime?: string | null;
+  onboardingPreferences?: OnboardingPreferences | null;
   isFollowing?: boolean | null;
   posts?: GraphQLPost[] | null;
   playlists?: GraphQLPlaylist[] | null;
+};
+
+export type OnboardingPreferences = {
+  collabTypes: string[];
+  responseTime: string;
+  openToCollab: boolean;
+  categories: OnboardingCategory[];
+};
+
+export type OnboardingPreferenceValues = Omit<OnboardingPreferences, "categories">;
+
+export type OnboardingCategory = {
+  id: string;
+  name: string;
+  slug: string;
 };
 
 import { BACKEND_API_URL, GRAPHQL_ENDPOINT } from "./api-config.ts";
@@ -590,6 +606,12 @@ export async function fetchMeProfile(): Promise<GraphQLProfile | null> {
         following
         openToCollab
         responseTime
+        onboardingPreferences {
+          collabTypes
+          responseTime
+          openToCollab
+          categories { id name slug }
+        }
         isFollowing
         posts {
           id
@@ -621,6 +643,91 @@ export async function fetchMeProfile(): Promise<GraphQLProfile | null> {
   `);
 
   return data?.me ?? null;
+}
+
+export async function fetchMyOnboardingPreferences(): Promise<Result<OnboardingPreferences>> {
+  const result = await graphqlRequestResult<{
+    me: { onboardingPreferences: OnboardingPreferences } | null;
+  }>(`
+    query MyOnboardingPreferences {
+      me {
+        onboardingPreferences {
+          collabTypes
+          responseTime
+          openToCollab
+          categories { id name slug }
+        }
+      }
+    }
+  `);
+  if (!result.ok) return result;
+  const preferences = result.value.me?.onboardingPreferences;
+  if (
+    !preferences ||
+    !Array.isArray(preferences.collabTypes) ||
+    !Array.isArray(preferences.categories) ||
+    typeof preferences.responseTime !== "string" ||
+    typeof preferences.openToCollab !== "boolean"
+  ) {
+    return { ok: false, error: "The server sent back unexpected onboarding preferences." };
+  }
+  return { ok: true, value: preferences };
+}
+
+export async function updateMyOnboardingCategories(
+  slugs: string[],
+): Promise<Result<OnboardingCategory[]>> {
+  const result = await graphqlRequestResult<{
+    updateMyOnboardingCategories: OnboardingCategory[] | null;
+  }>(`
+    mutation UpdateMyOnboardingCategories($input: UpdateMyOnboardingCategoriesInput!) {
+      updateMyOnboardingCategories(input: $input) {
+        id
+        name
+        slug
+      }
+    }
+  `, { input: { slugs } });
+  if (!result.ok) return result;
+  const categories = result.value.updateMyOnboardingCategories;
+  if (
+    !Array.isArray(categories) ||
+    categories.some((category) =>
+      typeof category.id !== "string" ||
+      typeof category.name !== "string" ||
+      typeof category.slug !== "string"
+    )
+  ) {
+    return { ok: false, error: "The server did not confirm onboarding categories were saved." };
+  }
+  return { ok: true, value: categories };
+}
+
+export async function updateMyOnboardingPreferences(
+  preferences: OnboardingPreferenceValues,
+): Promise<Result<OnboardingPreferenceValues>> {
+  const result = await graphqlRequestResult<{
+    updateMyOnboardingPreferences: OnboardingPreferenceValues | null;
+  }>(`
+    mutation UpdateMyOnboardingPreferences($input: UpdateOnboardingPreferencesInput!) {
+      updateMyOnboardingPreferences(input: $input) {
+        collabTypes
+        responseTime
+        openToCollab
+      }
+    }
+  `, { input: preferences });
+  if (!result.ok) return result;
+  const saved = result.value.updateMyOnboardingPreferences;
+  if (
+    !saved ||
+    !Array.isArray(saved.collabTypes) ||
+    typeof saved.responseTime !== "string" ||
+    typeof saved.openToCollab !== "boolean"
+  ) {
+    return { ok: false, error: "The server did not confirm onboarding preferences were saved." };
+  }
+  return { ok: true, value: saved };
 }
 
 export async function fetchProfileByUsername(username: string): Promise<GraphQLProfile | null> {

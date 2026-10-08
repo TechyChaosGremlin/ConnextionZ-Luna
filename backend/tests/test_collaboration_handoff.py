@@ -33,6 +33,7 @@ def make_profile(user: User, **overrides):
         social_links=None, tags=["music"], follower_count=0, following_count=0,
         collaboration_count=0, total_likes=0, open_to_collab=True,
         private_account=False, deleted_at=None, created_at=now, updated_at=now,
+        categories=[],
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -606,6 +607,93 @@ async def test_discover_creators_passes_normalized_complementary_interests_to_sc
         (item["shared_interests"], item["complementary_interests"])
         for item in scoring_inputs
     ] == [(1, 0), (0, 2)]
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_uses_only_authenticated_viewer_categories(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, _, profiles, db = discovery_dependencies
+    other_viewer = make_user("other_viewer")
+    viewer_profiles = {
+        viewer.id: make_profile(
+            viewer,
+            tags=[],
+            categories=[SimpleNamespace(slug="music")],
+        ),
+        other_viewer.id: make_profile(
+            other_viewer,
+            tags=[],
+            categories=[SimpleNamespace(slug="art")],
+        ),
+        **{profile.user_id: profile for profile in profiles},
+    }
+    profiles[0].tags = []
+    profiles[0].categories = [SimpleNamespace(slug="music")]
+    profiles[1].tags = []
+    profiles[1].categories = [SimpleNamespace(slug="art")]
+    scoring_inputs = []
+
+    async def get_profile(self, user_id):
+        return viewer_profiles.get(user_id)
+
+    monkeypatch.setattr(
+        "repositories.profile_repository.ProfileRepository.get_by_user_id",
+        get_profile,
+    )
+    monkeypatch.setattr(
+        "api.graphql.calculate_collaboration_score",
+        lambda **kwargs: scoring_inputs.append(kwargs) or 0.0,
+    )
+
+    await discover_with_dependencies(viewer, db)
+    first_viewer_inputs = list(scoring_inputs)
+    scoring_inputs.clear()
+    await discover_with_dependencies(other_viewer, db)
+
+    assert [item["shared_interests"] for item in first_viewer_inputs] == [1, 0]
+    assert [item["shared_interests"] for item in scoring_inputs] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_discover_creators_ignores_soft_deleted_viewer_categories(
+    monkeypatch,
+    discovery_dependencies,
+):
+    viewer, _, profiles, db = discovery_dependencies
+    viewer_profile = make_profile(
+        viewer,
+        tags=[],
+        categories=[SimpleNamespace(slug="music")],
+        deleted_at=datetime.now(timezone.utc),
+    )
+    profiles[0].tags = []
+    profiles[0].categories = [SimpleNamespace(slug="music")]
+    profiles[1].tags = []
+    profiles[1].categories = [SimpleNamespace(slug="art")]
+
+    async def get_profile(self, user_id):
+        if user_id == viewer.id:
+            return viewer_profile
+        return next(
+            (profile for profile in profiles if profile.user_id == user_id),
+            None,
+        )
+
+    scoring_inputs = []
+    monkeypatch.setattr(
+        "repositories.profile_repository.ProfileRepository.get_by_user_id",
+        get_profile,
+    )
+    monkeypatch.setattr(
+        "api.graphql.calculate_collaboration_score",
+        lambda **kwargs: scoring_inputs.append(kwargs) or 0.0,
+    )
+
+    await discover_with_dependencies(viewer, db)
+
+    assert [item["shared_interests"] for item in scoring_inputs] == [0, 0]
 
 
 @pytest.mark.asyncio

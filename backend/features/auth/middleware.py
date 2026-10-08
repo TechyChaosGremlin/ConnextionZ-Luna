@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.dependencies import get_db_session
 from app.models.user import User, AccountStatus, UserRole
-from features.auth.jwt import decode_token, JWTError, is_token_blacklisted
+from features.auth.jwt import ACCESS_TOKEN_TYPE, decode_token, JWTError, is_token_blacklisted
 from repositories.user_repository import UserRepository
 
 # HTTP Bearer security scheme
@@ -47,7 +47,7 @@ async def get_current_user(
         token = credentials.credentials
         payload = decode_token(token)
 
-        if payload.get("type") not in {"access", "refresh"}:
+        if payload.get("type") != ACCESS_TOKEN_TYPE:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token type",
@@ -164,4 +164,3 @@ async def get_current_creator_user(
             detail="Creator access required",
         )
     return current_user
-

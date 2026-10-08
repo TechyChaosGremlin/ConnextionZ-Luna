@@ -16,14 +16,14 @@ ConnextionZ uses environment variables for all secrets and configuration. Secret
 # 1. Copy the template
 cp .env.example .env
 
-# 2. Generate secure random values for each CHANGE_ME entry
+# 2. Generate URL-safe random passwords and a JWT signing key
 #    On Linux/macOS:
-openssl rand -base64 32
+openssl rand -hex 32
 
 #    On Windows (PowerShell):
-[Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
+(-join (1..64 | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }))
 
-# 3. Edit .env and replace every CHANGE_ME_* value
+# 3. Copy the root .env.example to .env and replace every required blank value
 ```
 
 ## Environment Variable Inventory
@@ -39,31 +39,36 @@ openssl rand -base64 32
 | `ANTHROPIC_API_KEY` | LLM | **Secret** | Anthropic API key (if using cloud LLM) |
 | `AWS_ACCESS_KEY_ID` | Cloud | **Secret** | AWS IAM access key |
 | `AWS_SECRET_ACCESS_KEY` | Cloud | **Secret** | AWS IAM secret key |
+| `AWS_S3_BUCKET` | Media storage | Configuration | Approved private beta bucket; required |
+| `AWS_REGION` | Media storage | Configuration | Approved bucket region; required |
+| `AWS_ENDPOINT_URL` | Media storage | Configuration | Optional approved S3-compatible endpoint; blank only for AWS S3 |
+| `MEDIA_MAX_IMAGE_BYTES` | Media storage | Configuration | Optional positive image upload limit in bytes; defaults to 8 MiB |
+| `MEDIA_MAX_VIDEO_BYTES` | Media storage | Configuration | Optional positive video upload limit in bytes; defaults to 512 MiB |
 
-## Docker Compose Integration
+## Canonical Docker Compose Integration
 
-The `docker/docker-compose.yml` file references environment variables using `${VAR:-default}` syntax:
+The canonical beta-like deployment uses the root `docker-compose.yml` and
+`Dockerfile`. Compose reads root `.env` for variable substitution; the root
+`.env.example` is its matching template. The older `docker/docker-compose.yml`
+and `docker/Dockerfile.backend` are legacy development scaffolding, not the
+beta deployment path.
 
-```yaml
-environment:
-  - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
-```
+Root Compose requires `JWT_SECRET_KEY`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`,
+`RABBITMQ_USER`, `RABBITMQ_PASSWORD`, and `CORS_ORIGINS`; it supplies no
+development credential defaults. Use URL-safe passwords because Compose
+embeds them in the PostgreSQL, Redis, and RabbitMQ connection URLs. The API
+uses `postgresql+asyncpg` at runtime and `postgresql+psycopg` for Alembic, with
+dependency service hostnames `postgres`, `redis`, and `rabbitmq`.
 
-This means:
-- If `POSTGRES_PASSWORD` is set in your `.env` file → uses that value.
-- If not set → falls back to the default (`password`), which is **only safe for local dev**.
-
-**For any shared or production-like environment, always set real values in `.env`.**
-
-### docker-compose auto-loading
-
-Docker Compose automatically reads `.env` from the project root. When you run:
+Start the stack and apply migrations explicitly:
 
 ```bash
-docker compose -f docker/docker-compose.yml up
+docker compose up --build -d
+docker compose run --rm api alembic upgrade head
 ```
 
-It will pick up all variables defined in your `.env` file.
+Do not commit root `.env`. The Docker build context excludes `.env` and
+`.env.*`; runtime settings are injected through the Compose environment.
 
 ## Production Secrets
 
@@ -97,7 +102,7 @@ resource "aws_secretsmanager_secret_version" "jwt" {
 
 ## LocalStack Notes
 
-For local development, LocalStack accepts any AWS credentials. The defaults in `.env.example` (`test` / `test`) are fine for local use. Do NOT use real AWS credentials in local dev.
+For local development, use locally approved S3-compatible credentials/configuration if exercising object storage. No storage credentials are supplied by `.env.example`; tests inject a mock client. Do NOT use real AWS credentials in local dev.
 
 ## Verifying Your Setup
 

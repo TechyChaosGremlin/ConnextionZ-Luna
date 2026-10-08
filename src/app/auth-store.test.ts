@@ -13,7 +13,13 @@ import {
   signInWithProvider,
   startSession,
 } from "./auth-store.ts";
-import { graphqlRequestResult } from "./profile-graphql.ts";
+import {
+  fetchMyOnboardingPreferences,
+  graphqlRequestResult,
+  updateMyOnboardingPreferences,
+} from "./profile-graphql.ts";
+import { saveMyOnboardingCategories } from "./onboarding-store.ts";
+import { loadPreferences } from "./settings-store.ts";
 
 class MemoryStorage {
   private values = new Map<string, string>();
@@ -68,10 +74,12 @@ test("sign-in authenticates with the backend and loads the authenticated profile
 
   assert.equal(result.ok, true);
   assert.equal(requests[0].url.pathname, "/auth/login");
-  assert.equal(requests[0].url.searchParams.get("email"), "creator@example.com");
-  assert.equal(requests[0].url.searchParams.get("password"), "server-password");
+  assert.equal(requests[0].url.search, "");
   assert.equal(requests[0].init?.method, "POST");
-  assert.equal(requests[0].init?.body, undefined);
+  assert.deepEqual(JSON.parse(requests[0].init?.body as string), {
+    email: "creator@example.com",
+    password: "server-password",
+  });
   assert.equal(requests[1].url.pathname, "/graphql");
   assert.equal((requests[1].init?.headers as Record<string, string>).Authorization, `Bearer ${accessToken}`);
   assert.equal(JSON.parse(sessionStorage.getItem("connextionz.accessToken")!), accessToken);
@@ -87,10 +95,10 @@ test("registration uses backend fields and establishes a JWT session", async () 
     sub: "new-id", email: "new.creator@example.com", username: "new.creator", role: "user",
     exp: Math.floor(Date.now() / 1000) + 900,
   });
-  const requests: URL[] = [];
-  globalThis.fetch = async (input) => {
+  const requests: { url: URL; init?: RequestInit }[] = [];
+  globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
-    requests.push(url);
+    requests.push({ url, init });
     if (url.pathname === "/auth/register") return Response.json({ user_id: "new-id" }, { status: 201 });
     if (url.pathname === "/auth/login") {
       return Response.json({ access_token: accessToken, refresh_token: "refresh-token", token_type: "bearer" });
@@ -105,10 +113,15 @@ test("registration uses backend fields and establishes a JWT session", async () 
   });
 
   assert.equal(result.ok, true);
-  assert.equal(requests[0].pathname, "/auth/register");
-  assert.equal(requests[0].searchParams.get("email"), "new.creator@example.com");
-  assert.equal(requests[0].searchParams.get("username"), "new.creator");
-  assert.equal(requests[1].pathname, "/auth/login");
+  assert.equal(requests[0].url.pathname, "/auth/register");
+  assert.equal(requests[0].url.search, "");
+  assert.deepEqual(JSON.parse(requests[0].init?.body as string), {
+    email: "new.creator@example.com",
+    username: "new.creator",
+    password: "StrongPass123!",
+  });
+  assert.equal(requests[1].url.pathname, "/auth/login");
+  assert.equal(requests[1].url.search, "");
   assert.equal(result.value.firstName, "New");
   assert.equal(result.value.profile?.displayName, "New Creator");
   assert.equal(getAccessToken(), accessToken);
@@ -190,7 +203,10 @@ test("GraphQL refreshes an expiring access token and sends the new bearer token"
     const url = new URL(String(input));
     requests.push({ url, init });
     if (url.pathname === "/auth/refresh") {
-      assert.equal(url.searchParams.get("refresh_token"), "refresh-token");
+      assert.equal(url.search, "");
+      assert.deepEqual(JSON.parse(init?.body as string), {
+        refresh_token: "refresh-token",
+      });
       return Response.json({ access_token: freshToken, token_type: "bearer", expires_in: 900 });
     }
     return Response.json({ data: { health: "ok" } });
@@ -202,6 +218,95 @@ test("GraphQL refreshes an expiring access token and sends the new bearer token"
   assert.equal((requests[1].init?.headers as Record<string, string>).Authorization, `Bearer ${freshToken}`);
   assert.equal(getAccessToken(), freshToken);
   assert.deepEqual(result, { ok: true, value: { health: "ok" } });
+});
+
+test("onboarding preferences load and save through authenticated GraphQL operations", async () => {
+  const accessToken = tokenFor({
+    sub: "creator-id",
+    email: "creator@example.com",
+    username: "creator",
+    role: "creator",
+    exp: Math.floor(Date.now() / 1000) + 900,
+  });
+  sessionStorage.setItem("connextionz.accessToken", JSON.stringify(accessToken));
+  const saved = {
+    collabTypes: ["Duet / Remix", "Brand Deal"],
+    responseTime: "< 1 hour",
+    openToCollab: false,
+  };
+  const loaded = {
+    ...saved,
+    categories: [{ id: "category-1", name: "Music", slug: "music" }],
+  };
+  const requests: { body: { query: string; variables?: Record<string, unknown> }; headers: Headers }[] = [];
+  globalThis.fetch = async (_input, init) => {
+    requests.push({
+      body: JSON.parse(String(init?.body)),
+      headers: new Headers(init?.headers),
+    });
+    if (requests.length === 1) {
+      return Response.json({ data: { me: { onboardingPreferences: loaded } } });
+    }
+    return Response.json({ data: { updateMyOnboardingPreferences: saved } });
+  };
+
+  assert.deepEqual(await fetchMyOnboardingPreferences(), { ok: true, value: loaded });
+  assert.deepEqual(await updateMyOnboardingPreferences(saved), { ok: true, value: saved });
+  assert.match(requests[0].body.query, /me\s*\{\s*onboardingPreferences/);
+  assert.equal(requests[1].body.variables?.input && JSON.stringify(requests[1].body.variables.input), JSON.stringify(saved));
+  assert.ok(requests[0].headers.get("Authorization")?.startsWith("Bearer "));
+  assert.ok(requests[1].headers.get("Authorization")?.startsWith("Bearer "));
+});
+
+test("onboarding categories use authenticated GraphQL and mirror confirmed selections locally", async () => {
+  const accessToken = tokenFor({
+    sub: "creator-id",
+    email: "creator@example.com",
+    username: "creator",
+    role: "creator",
+    exp: Math.floor(Date.now() / 1000) + 900,
+  });
+  sessionStorage.setItem("connextionz.accessToken", JSON.stringify(accessToken));
+  const categories = [
+    { id: "category-1", name: "Music", slug: "music" },
+    { id: "category-2", name: "Fitness", slug: "fitness" },
+  ];
+  let request: { body: { query: string; variables: { input: { slugs: string[] } } }; headers: Headers } | null = null;
+  globalThis.fetch = async (_input, init) => {
+    request = {
+      body: JSON.parse(String(init?.body)),
+      headers: new Headers(init?.headers),
+    };
+    return Response.json({ data: { updateMyOnboardingCategories: categories } });
+  };
+
+  const result = await saveMyOnboardingCategories("creator@example.com", ["Music", "Fitness"]);
+
+  assert.deepEqual(result, { ok: true, value: categories });
+  assert.ok(request);
+  assert.match(request.body.query, /updateMyOnboardingCategories/);
+  assert.deepEqual(request.body.variables.input, { slugs: ["music", "fitness"] });
+  assert.ok(request.headers.get("Authorization")?.startsWith("Bearer "));
+  assert.deepEqual(loadPreferences("creator@example.com").categories, ["Music", "Fitness"]);
+});
+
+test("failed onboarding category save does not mirror the requested selection locally", async () => {
+  const accessToken = tokenFor({
+    sub: "creator-id",
+    email: "creator@example.com",
+    username: "creator",
+    role: "creator",
+    exp: Math.floor(Date.now() / 1000) + 900,
+  });
+  sessionStorage.setItem("connextionz.accessToken", JSON.stringify(accessToken));
+  globalThis.fetch = async () => Response.json({
+    errors: [{ message: "Unknown onboarding category" }],
+  });
+
+  const result = await saveMyOnboardingCategories("creator@example.com", ["Music"]);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(loadPreferences("creator@example.com").categories, []);
 });
 
 test("logout revokes with the bearer token and clears tab-scoped auth state", async () => {

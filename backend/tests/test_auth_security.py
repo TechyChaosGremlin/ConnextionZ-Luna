@@ -1,52 +1,117 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import uuid
 
 import pytest
+import pytest_asyncio
 import redis.exceptions
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 
 from api.graphql import _graphql_user_from_token
-from features.auth.jwt import blacklist_token, is_token_blacklisted
+from app.models.user import AccountStatus, User, UserRole
+from features.auth.jwt import (
+    blacklist_token,
+    create_access_token,
+    decode_token,
+    is_token_blacklisted,
+)
 from features.auth.router import logout
 from repositories.user_repository import UserRepository
+from services.redis_service import RedisService
+
+
+@pytest_asyncio.fixture
+async def live_redis():
+    service = RedisService()
+    try:
+        try:
+            await service.connect()
+            assert service.redis is not None
+            await service.redis.ping()
+        except redis.exceptions.AuthenticationError:
+            raise
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+            pytest.skip("Configured Redis is unreachable; token blacklist integration requires Redis.")
+        yield service
+    finally:
+        if service.redis is not None:
+            await service.disconnect()
 
 
 @pytest.mark.asyncio
-async def test_blacklist_token_marks_jti():
-    try:
-        from services.redis_service import RedisService
-        redis = RedisService()
-        await redis.connect()
-        await redis.disconnect()
-    except Exception:
-        pytest.skip("Redis is not running in this environment; skipping token blacklist integration test.")
+async def test_redis_disconnect_uses_supported_async_close():
+    service = RedisService()
+    service.redis = AsyncMock()
 
-    jti = "test-jti-123"
+    await service.disconnect()
+
+    service.redis.aclose.assert_awaited_once()
+    service.redis.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_blacklist_token_marks_jti(live_redis):
+    jti = f"alpha-blacklist-{uuid.uuid4().hex}"
     exp = datetime.now(timezone.utc) + timedelta(minutes=5)
 
-    await blacklist_token(jti, exp)
-
-    assert await is_token_blacklisted(jti) is True
+    try:
+        assert await blacklist_token(jti, exp) is True
+        assert await is_token_blacklisted(jti) is True
+        assert live_redis.redis is not None
+        assert 0 < await live_redis.redis.ttl(f"blacklist:{jti}") <= 300
+    finally:
+        assert live_redis.redis is not None
+        await live_redis.redis.delete(f"blacklist:{jti}")
 
 
 @pytest.mark.asyncio
-async def test_blacklist_token_ignores_expired_token():
-    try:
-        from services.redis_service import RedisService
-        redis = RedisService()
-        await redis.connect()
-        await redis.disconnect()
-    except Exception:
-        pytest.skip("Redis is not running in this environment; skipping token blacklist integration test.")
-
-    jti = "expired-jti-456"
+async def test_blacklist_token_ignores_expired_token(live_redis):
+    jti = f"alpha-expired-{uuid.uuid4().hex}"
     exp = datetime.now(timezone.utc) - timedelta(minutes=1)
 
-    await blacklist_token(jti, exp)
+    try:
+        assert await blacklist_token(jti, exp) is True
+        assert await is_token_blacklisted(jti) is False
+        assert live_redis.redis is not None
+        assert await live_redis.redis.exists(f"blacklist:{jti}") == 0
+    finally:
+        assert live_redis.redis is not None
+        await live_redis.redis.delete(f"blacklist:{jti}")
 
-    assert await is_token_blacklisted(jti) is False
+
+@pytest.mark.asyncio
+async def test_live_redis_logout_revokes_graphql_access(monkeypatch, live_redis):
+    user = User(
+        id=uuid.uuid4(),
+        email="alpha-redis@example.test",
+        username="alpha_redis",
+        role=UserRole.USER,
+        status=AccountStatus.ACTIVE,
+    )
+    token = create_access_token(user, expires_delta=timedelta(minutes=5))
+    jti = decode_token(token)["jti"]
+    user_lookup = AsyncMock(return_value=user)
+    monkeypatch.setattr(UserRepository, "get_by_id", user_lookup)
+
+    try:
+        authenticated_user, _session_id = await _graphql_user_from_token(AsyncMock(), token)
+        assert authenticated_user is user
+        user_lookup.reset_mock()
+
+        result = await logout(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=token),
+            AsyncMock(),
+        )
+
+        assert result == {"message": "Logged out successfully"}
+        assert await is_token_blacklisted(jti) is True
+        assert await _graphql_user_from_token(AsyncMock(), token) == (None, None)
+        user_lookup.assert_not_awaited()
+    finally:
+        assert live_redis.redis is not None
+        await live_redis.redis.delete(f"blacklist:{jti}")
 
 
 @pytest.mark.asyncio
@@ -122,4 +187,27 @@ async def test_graphql_context_fails_closed_when_revocation_store_is_unavailable
     user, session_id = await _graphql_user_from_token(AsyncMock(), "valid-token")
 
     assert user is None
+    assert session_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [AccountStatus.SUSPENDED, AccountStatus.BANNED, AccountStatus.PENDING_VERIFICATION],
+)
+async def test_graphql_context_rejects_non_active_accounts(monkeypatch, status):
+    user = SimpleNamespace(id="user-id", status=status)
+    monkeypatch.setattr(
+        "features.auth.jwt.decode_token",
+        lambda token: {"type": "access", "jti": "inactive-user-jti", "sub": "user-id"},
+    )
+    monkeypatch.setattr("features.auth.jwt.is_token_blacklisted", AsyncMock(return_value=False))
+    monkeypatch.setattr(UserRepository, "get_by_id", AsyncMock(return_value=user))
+
+    authenticated_user, session_id = await _graphql_user_from_token(
+        AsyncMock(),
+        "valid-but-inactive-account-token",
+    )
+
+    assert authenticated_user is None
     assert session_id is None

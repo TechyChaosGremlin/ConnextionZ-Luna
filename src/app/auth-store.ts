@@ -223,10 +223,11 @@ async function responseError(response: Response, fallback: string): Promise<stri
 export async function signIn(email: string, password: string): Promise<Result<Account>> {
   clearAccessTokens();
   try {
-    const params = new URLSearchParams({ email: normalize(email), password });
-    const response = await fetch(`${AUTH_LOGIN_ENDPOINT}?${params.toString()}`, {
+    const response = await fetch(AUTH_LOGIN_ENDPOINT, {
       method: "POST",
       credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: normalize(email), password }),
     });
     if (!response.ok) {
       return { ok: false, error: await responseError(response, "Incorrect email or password.") };
@@ -311,11 +312,12 @@ export async function register(input: {
 }): Promise<Result<Account>> {
   const email = normalize(input.email);
   const username = handleFromEmail(email).slice(0, 24) || "creator";
-  const params = new URLSearchParams({ email, username, password: input.password });
   try {
-    const response = await fetch(`${AUTH_REGISTER_ENDPOINT}?${params.toString()}`, {
+    const response = await fetch(AUTH_REGISTER_ENDPOINT, {
       method: "POST",
       credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, username, password: input.password }),
     });
     if (!response.ok) {
       return { ok: false, error: await responseError(response, "Could not create your account.") };
@@ -449,10 +451,11 @@ export async function refreshAccessToken(): Promise<string | null> {
   const refreshToken = getRefreshToken();
   if (!refreshToken) return null;
   try {
-    const params = new URLSearchParams({ refresh_token: refreshToken });
-    const response = await fetch(`${AUTH_REFRESH_ENDPOINT}?${params.toString()}`, {
+    const response = await fetch(AUTH_REFRESH_ENDPOINT, {
       method: "POST",
       credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken }),
     });
     if (!response.ok) {
       clearAccessTokens();

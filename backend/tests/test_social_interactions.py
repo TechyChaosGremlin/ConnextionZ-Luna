@@ -36,6 +36,7 @@ from api.graphql import (
     _share_post_legacy,
     _unread_notification_count,
 )
+from app.models.notification import NotificationType
 from app.models.user import AccountStatus, User, UserRole
 from repositories.social_repository import PostInteractionRepository
 
@@ -140,13 +141,14 @@ async def test_like_then_unlike_post(monkeypatch):
     async def fake_count_likes(self, post_id):
         return 1 if liked_state["liked"] else 0
 
+    notification = AsyncMock()
     monkeypatch.setattr("repositories.content_repository.PostRepository.get_by_id", fake_get_by_id)
     monkeypatch.setattr("repositories.social_repository.PostInteractionRepository.has_liked", fake_has_liked)
     monkeypatch.setattr("repositories.social_repository.PostInteractionRepository.toggle_like", fake_toggle_like)
     monkeypatch.setattr("repositories.social_repository.PostInteractionRepository.count_likes", fake_count_likes)
     monkeypatch.setattr(
         "repositories.notification_repository.NotificationRepository.create_notification",
-        AsyncMock(),
+        notification,
     )
 
     liked_result = await _like_post_legacy(ctx, post.id, like=True)
@@ -156,6 +158,14 @@ async def test_like_then_unlike_post(monkeypatch):
     unliked_result = await _like_post_legacy(ctx, post.id, like=False)
     assert unliked_result.liked is False
     assert unliked_result.likes == 0
+    notification.assert_awaited_once_with(
+        user_id=post.user_id,
+        type=NotificationType.NEW_LIKE,
+        title="New like",
+        body=f"{user.username} liked your post",
+        actor_id=user.id,
+        data={"post_id": str(post.id)},
+    )
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,8 @@ import { useCallback, useState }                                from "react";
 import { motion, AnimatePresence }                              from "motion/react";
 import { Check, AlertCircle }                                   from "lucide-react";
 import { updateProfile, profileOf, startSession, type Account } from "./auth-store";
+import { updateMyOnboardingPreferences } from "./profile-graphql";
+import { saveMyOnboardingCategories } from "./onboarding-store";
 import { loadPreferences, savePreferences }                     from "./settings-store";
 
 import BrandPanel                      from "./components/BrandPanel"
@@ -141,6 +143,7 @@ export function AuthFlow({ onAuthenticated }: { onAuthenticated: (account: Accou
   const [resetToken, setResetToken] = useState<string | null>(null);
   /** The account being onboarded — onboarding needs somewhere to write its picks. */
   const [pending, setPending] = useState<Account | null>(null);
+  const [onboardingError, setOnboardingError] = useState<string | null>(null);
 
   /** Opens the session and hands the account to the app. */
   const enter = useCallback((account: Account) => {
@@ -157,12 +160,32 @@ export function AuthFlow({ onAuthenticated }: { onAuthenticated: (account: Accou
     if (!account) return;
     if (!setup) { enter(account); return; }
 
+    setOnboardingError(null);
+    const savedPreferences = await updateMyOnboardingPreferences({
+      collabTypes: setup.collabTypes,
+      responseTime: setup.responseTime,
+      openToCollab: setup.openToCollab,
+    });
+    if (!savedPreferences.ok) {
+      setOnboardingError(savedPreferences.error);
+      return;
+    }
+
+    const savedCategories = await saveMyOnboardingCategories(account.email, setup.categories);
+    if (!savedCategories.ok) {
+      setOnboardingError(savedCategories.error);
+      return;
+    }
+
     const prefs = loadPreferences(account.email);
     savePreferences(account.email, {
       ...prefs,
-      categories: setup.categories,
-      responseTime: setup.responseTime,
-      collab: { ...prefs.collab, types: setup.collabTypes, openToCollab: setup.openToCollab },
+      responseTime: savedPreferences.value.responseTime,
+      collab: {
+        ...prefs.collab,
+        types: savedPreferences.value.collabTypes,
+        openToCollab: savedPreferences.value.openToCollab,
+      },
     });
 
     const result = await updateProfile(account.email, {
@@ -241,7 +264,7 @@ export function AuthFlow({ onAuthenticated }: { onAuthenticated: (account: Accou
                   )}
                   {screen === "onboarding" && (
                     <motion.div key="ob" {...slideUp} transition={trans} className={pane}>
-                      <Onboarding onDone={completeOnboarding} />
+                      <Onboarding onDone={completeOnboarding} error={onboardingError} />
                     </motion.div>
                   )}
                 </AnimatePresence>
