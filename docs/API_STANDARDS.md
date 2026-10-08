@@ -485,7 +485,7 @@ This avoids streaming large files through the API server.
 | Endpoint | Purpose | Kubernetes Probe |
 |----------|---------|-----------------|
 | `GET /health` | Basic liveness | `livenessProbe` |
-| `GET /health/ready` | Dependency readiness (DB, Redis, MQ) | `readinessProbe` |
+| `GET /health/ready` | Dependency readiness (DB, Redis, MQ); `200` when ready, `503` otherwise | `readinessProbe` |
 | `GET /health/live` | Application alive | `livenessProbe` |
 
 ## 14. Content Security & Input Validation

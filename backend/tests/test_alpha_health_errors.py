@@ -66,7 +66,7 @@ async def test_readiness_reports_each_dependency_failure(health_dependencies, fa
     ) as client:
         response = await client.get("/health/ready")
 
-    assert response.status_code == 200
+    assert response.status_code == (200 if failure is None else 503)
     expected_checks = {"database": "ok", "redis": "ok", "rabbitmq": "ok"}
     if failure is not None:
         expected_checks[failure.split("_")[0]] = "error"

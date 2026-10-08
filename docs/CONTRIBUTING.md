@@ -947,9 +947,9 @@ of TLS/host enforcement.
 
 ##### Migration readiness and rollback
 
-- The canonical graph has **one base (`001`), one head (`213`), 39 revisions**,
+- The canonical graph has **one base (`001`), one head (`217`), 43 revisions**,
   with existing merge points intact. The deployment tail is:
-  **206 -> 207 -> 208 -> 209 -> 210 -> 211 -> 212 -> 213**.
+  **206 -> 207 -> 208 -> 209 -> 210 -> 211 -> 212 -> 213 -> 214 -> 215 -> 216 -> 217**.
 - Revisions 207-210 remain required schema dependencies despite disabled Paid
   delivery. They were executed only as part of isolated migration validation;
   their functionality, formulas, flags, and migration code were unchanged.
@@ -993,8 +993,8 @@ Controlled deployment checklist (operator actions, **not executed here**):
    Configure proxy trust/TLS at the actual deployment boundary; no local
    production server or shared process was started/stopped by this task.
 6. Check `/health` healthy and `/health/live` alive, then require
-   `/health/ready` JSON `status == "ready"` and all three dependency checks
-   `ok`. HTTP 200 alone is not a readiness gate. Check `X-Request-ID`,
+   `/health/ready` HTTP 200, JSON `status == "ready"`, and all three dependency
+   checks `ok`; dependency failures return HTTP 503. Check `X-Request-ID`,
    structured errors, CORS, and security headers through the deployed proxy.
    Readiness does not check migration revision, media storage, or FFmpeg;
    verify those independently.

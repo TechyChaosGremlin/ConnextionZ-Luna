@@ -303,7 +303,10 @@ def create_app() -> FastAPI:
         ready = all(v == "ok" for v in checks.values())
         status = "ready" if ready else "not_ready"
 
-        return {"status": status, "checks": checks}
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": status, "checks": checks},
+        )
 
     @app.get("/health/live", tags=["health"])
     async def liveness_check() -> dict:
