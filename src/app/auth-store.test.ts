@@ -126,6 +126,44 @@ test("local credentials cannot authenticate when the backend is unavailable", as
   assert.equal(getAccessToken(), null);
 });
 
+test("registration surfaces the FastAPI error envelope without attempting login", async () => {
+  const requests: URL[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(new URL(String(input)));
+    return Response.json({
+      error: { code: "CONFLICT", message: "Email already registered" },
+    }, { status: 409 });
+  };
+
+  const result = await register({
+    firstName: "Local", lastName: "Test", email: "local@example.com", password: "StrongPass123!",
+  });
+
+  assert.deepEqual(result, { ok: false, error: "Email already registered" });
+  assert.deepEqual(requests.map((url) => url.pathname), ["/auth/register"]);
+  assert.equal(getAccessToken(), null);
+});
+
+test("login surfaces the FastAPI error envelope", async () => {
+  globalThis.fetch = async () => Response.json({
+    error: { code: "UNAUTHORIZED", message: "Invalid credentials" },
+  }, { status: 401 });
+
+  assert.deepEqual(await signIn("local@example.com", "incorrect"), {
+    ok: false, error: "Invalid credentials",
+  });
+});
+
+test("registration preserves legacy FastAPI detail errors", async () => {
+  globalThis.fetch = async () => Response.json({
+    detail: { message: "Password too weak", errors: ["Use a special character"] },
+  }, { status: 400 });
+
+  assert.deepEqual(await register({
+    firstName: "Local", lastName: "Test", email: "local@example.com", password: "weak",
+  }), { ok: false, error: "Password too weak" });
+});
+
 test("legacy local passwords are scrubbed and unsupported auth paths fail closed", async () => {
   localStorage.setItem("connextionz.accounts", JSON.stringify([
     { firstName: "Local", lastName: "Only", email: "local@example.com", password: "plaintext", providers: [] },

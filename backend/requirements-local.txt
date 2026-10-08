@@ -1,0 +1,4 @@
+# Local development only; not used by production dependency installation.
+-r requirements.txt
+strawberry-graphql==0.327.1
+graphql-core==3.2.12

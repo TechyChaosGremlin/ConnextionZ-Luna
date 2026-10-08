@@ -209,7 +209,9 @@ function tokenClaims(token: string): {
 async function responseError(response: Response, fallback: string): Promise<string> {
   const body = await response.json().catch(() => null) as {
     detail?: string | { message?: string; errors?: string[] };
+    error?: { message?: string };
   } | null;
+  if (body?.error?.message) return body.error.message;
   if (typeof body?.detail === "string") return body.detail;
   if (body?.detail?.message) return body.detail.message;
   if (body?.detail?.errors?.length) return body.detail.errors.join(" ");
