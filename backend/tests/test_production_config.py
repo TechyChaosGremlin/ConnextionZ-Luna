@@ -178,6 +178,29 @@ def test_production_accepts_explicit_secure_dependency_urls():
     assert derived_sync_url.sync_database_url.startswith("postgresql+psycopg://")
 
 
+def test_postgres_beta_production_does_not_require_external_services():
+    values = _production_values(infrastructure_mode="postgres_beta")
+    values.pop("redis_url")
+    values.pop("rabbitmq_url")
+    assert _TestSettings(**values).infrastructure_mode == "postgres_beta"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"jwt_secret_key": "change-me-in-production-32-bytes-minimum"},
+        {"debug": True},
+        {"database_url": ""},
+        {"infrastructure_mode": "typo"},
+    ],
+)
+def test_postgres_beta_preserves_production_guards(overrides):
+    values = _production_values(infrastructure_mode="postgres_beta")
+    values.update(overrides)
+    with pytest.raises(ValidationError):
+        _TestSettings(**values)
+
+
 def test_supabase_transaction_pooler_disables_statement_cache_and_app_pool():
     options = _engine_options_for_url(
         "postgresql+asyncpg://db-user:db-password"

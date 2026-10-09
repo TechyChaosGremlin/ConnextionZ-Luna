@@ -52,6 +52,9 @@ class RabbitMQService:
 
     async def connect(self) -> None:
         """Establish RabbitMQ connection with retry logic."""
+        if settings.infrastructure_mode == "postgres_beta":
+            logger.error("RabbitMQ is disabled in PostgreSQL beta mode")
+            raise RuntimeError("Background queues are disabled in PostgreSQL beta mode")
         if self._connection and not self._connection.is_closed:
             return
 

@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     environment: Literal["development", "test", "local", "staging", "production"] = Field(
         default="development"
     )
+    infrastructure_mode: Literal["full", "postgres_beta"] = Field(default="full")
 
     @field_validator("debug", mode="before")
     @classmethod
@@ -248,11 +249,11 @@ class Settings(BaseSettings):
                 )
             if len(self.jwt_secret_key.get_secret_value()) < 32:
                 raise ValueError("FATAL: JWT_SECRET_KEY must be at least 32 characters long in production.")
-            required_urls = {
-                "database_url": "DATABASE_URL",
-                "redis_url": "REDIS_URL",
-                "rabbitmq_url": "RABBITMQ_URL",
-            }
+            required_urls = {"database_url": "DATABASE_URL"}
+            if self.infrastructure_mode == "full":
+                required_urls.update(
+                    redis_url="REDIS_URL", rabbitmq_url="RABBITMQ_URL"
+                )
             missing_urls = [
                 env_name
                 for field_name, env_name in required_urls.items()
@@ -277,17 +278,18 @@ class Settings(BaseSettings):
                     "DATABASE_URL_SYNC",
                     {"postgresql+psycopg"},
                 )
-            _validate_production_url(
-                self.redis_url,
-                "REDIS_URL",
-                {"redis", "rediss"},
-                require_username=False,
-            )
-            _validate_production_url(
-                self.rabbitmq_url,
-                "RABBITMQ_URL",
-                {"amqp", "amqps"},
-            )
+            if self.infrastructure_mode == "full":
+                _validate_production_url(
+                    self.redis_url,
+                    "REDIS_URL",
+                    {"redis", "rediss"},
+                    require_username=False,
+                )
+                _validate_production_url(
+                    self.rabbitmq_url,
+                    "RABBITMQ_URL",
+                    {"amqp", "amqps"},
+                )
         return self
 
     # ── Rate Limiting ────────────────────────────────────────────

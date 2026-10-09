@@ -68,8 +68,9 @@
 
   - `ENVIRONMENT=production` and `DEBUG=false`
   - A unique `JWT_SECRET_KEY` with at least 32 characters
-  - Production `DATABASE_URL`, `REDIS_URL`, and `RABBITMQ_URL` values. The app
-    requires reachable Redis and RabbitMQ services during startup.
+  - Production `DATABASE_URL`. With the default `INFRASTRUCTURE_MODE=full`,
+    also provide `REDIS_URL` and `RABBITMQ_URL`; both services must be reachable
+    during startup. The PostgreSQL-only reduced beta below does not require them.
 
   To copy the local PostgreSQL database into a new, empty Neon database, run
   `.\scripts\migrate-local-db-to-neon.ps1` in PowerShell from the repository
@@ -114,5 +115,28 @@
   same-origin API URLs automatically in production, so it does not rely on a
   `VITE_API_URL` value. Set `CORS_ORIGINS` only if the API must also accept
   requests from another origin; use a JSON list of exact origins.
+
+  ### PostgreSQL-only reduced beta
+
+  Set `INFRASTRUCTURE_MODE=postgres_beta` to run without Redis or RabbitMQ.
+  Keep `ENVIRONMENT=production`, `DEBUG=false`, a private `JWT_SECRET_KEY`
+  of at least 32 characters, `DATABASE_URL`, and JSON `CORS_ORIGINS` configured.
+  Apply Alembic migration 218 using the direct/session `DATABASE_URL_SYNC`
+  before deploying this mode. It adds the persistent `token_revocations` table;
+  startup and `/health/ready` fail if that table cannot be queried. Logout
+  commits revocations before reporting success, and authentication fails closed
+  if the store is unavailable. Expired revocations are cleaned up on logout.
+
+  This mode disables broker-backed background queues and their dead-letter
+  delivery; attempts to connect to RabbitMQ report an explicit error. The
+  current HTTP/GraphQL routes do not enqueue broker jobs. This does not provide
+  a durable worker or promise that streaming/background tasks survive Vercel
+  instance shutdown. Existing per-instance rate limits are unchanged and are
+  not a distributed abuse-control system.
+
+  If switching an existing Redis-backed deployment to this mode, rotate the
+  JWT signing secret to invalidate outstanding tokens: Redis blacklist entries
+  are not copied into PostgreSQL. `INFRASTRUCTURE_MODE=full` remains the default
+  and continues to require Redis and RabbitMQ.
 
   

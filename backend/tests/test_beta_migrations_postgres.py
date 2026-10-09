@@ -25,14 +25,14 @@ def migration_config():
 
 def test_canonical_migration_graph_has_one_head_and_ordered_beta_tail():
     script = ScriptDirectory.from_config(migration_config())
-    assert script.get_heads() == ["217"]
+    assert script.get_heads() == ["218"]
     assert script.get_bases() == ["001"]
     assert [
         revision.revision for revision in script.iterate_revisions("head", "206")
     ] == [
-        "217", "216", "215", "214", "213", "212", "211", "210", "209", "208", "207"
+        "218", "217", "216", "215", "214", "213", "212", "211", "210", "209", "208", "207"
     ]
-    assert len(list(script.walk_revisions())) == 43
+    assert len(list(script.walk_revisions())) == 44
 
 
 def test_alembic_cli_works_from_backend_directory():
@@ -44,7 +44,7 @@ def test_alembic_cli_works_from_backend_directory():
         timeout=30,
         check=True,
     )
-    assert result.stdout.strip() == "217 (head)"
+    assert result.stdout.strip() == "218 (head)"
 
 
 def test_migration_configuration_accepts_percent_encoded_credentials(monkeypatch):
@@ -167,7 +167,7 @@ def test_fresh_upgrade_and_beta_tail_rollback(
             ))
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "217"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "218"
         inspector = inspect(connection)
         assert {
             "paid_campaigns", "paid_deliveries", "paid_interaction_contexts",
@@ -218,7 +218,7 @@ def test_fresh_upgrade_and_beta_tail_rollback(
         assert "playlists" in inspect(connection).get_table_names()
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "217"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "218"
         assert connection.execute(text("SELECT count(*) FROM categories")).scalar() == 9
         if preexisting_playlist:
             assert connection.execute(text(

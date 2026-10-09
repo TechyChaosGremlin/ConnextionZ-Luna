@@ -43,6 +43,7 @@ from features.streaming.router import router as streaming_router
 from features.streaming.service import stream_manager
 from services.redis_service import RedisService
 from services.rabbitmq_service import RabbitMQService, rabbitmq_service
+from services.token_revocation_store import check_revocation_store
 
 logger = structlog.get_logger()
 shutdown_event = None
@@ -152,6 +153,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup
     configure_logging()
     logger.info("Starting ConnextionZ Platform API", environment=settings.environment)
+
+    if settings.infrastructure_mode == "postgres_beta":
+        try:
+            await check_revocation_store()
+            logger.info("PostgreSQL beta mode enabled", background_queue="disabled")
+            yield
+        except Exception as exc:
+            logger.error("PostgreSQL beta lifecycle failed", error_type=type(exc).__name__)
+            raise
+        finally:
+            try:
+                await stream_manager.cleanup()
+            except Exception as exc:
+                logger.error(
+                    "Dependency cleanup failed",
+                    dependency="streams",
+                    error_type=type(exc).__name__,
+                )
+        return
 
     redis_service = RedisService()
     try:
@@ -270,6 +290,28 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error("Health check failed", check="database", error_type=type(e).__name__)
             checks["database"] = "error"
+
+        if settings.infrastructure_mode == "postgres_beta":
+            try:
+                await check_revocation_store()
+                checks["token_revocations"] = "ok"
+            except Exception as exc:
+                logger.error(
+                    "Health check failed",
+                    check="token_revocations",
+                    error_type=type(exc).__name__,
+                )
+                checks["token_revocations"] = "error"
+            ready = all(value == "ok" for value in checks.values())
+            return JSONResponse(
+                status_code=200 if ready else 503,
+                content={
+                    "status": "ready" if ready else "not_ready",
+                    "checks": checks,
+                    "infrastructure_mode": "postgres_beta",
+                    "background_queue": "disabled",
+                },
+            )
 
         redis_service = RedisService()
         try:

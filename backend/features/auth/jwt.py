@@ -142,6 +142,11 @@ async def is_token_blacklisted(jti: str) -> bool:
     Returns:
         True if token is blacklisted, False otherwise
     """
+    if settings.infrastructure_mode == "postgres_beta":
+        from services.token_revocation_store import is_revoked
+
+        return await is_revoked(jti)
+
     from services.redis_service import RedisService
 
     redis_service = RedisService()
@@ -167,6 +172,11 @@ async def blacklist_token(jti: str, exp: datetime) -> bool:
         jti: The JWT ID to blacklist
         exp: Token expiration time
     """
+    if settings.infrastructure_mode == "postgres_beta":
+        from services.token_revocation_store import revoke
+
+        return await revoke(jti, exp)
+
     from services.redis_service import RedisService
 
     redis_service = RedisService()
