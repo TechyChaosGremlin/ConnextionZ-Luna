@@ -3,8 +3,10 @@ import httpx
 
 from pydantic import SecretStr, ValidationError
 from pydantic_settings import SettingsConfigDict
+from sqlalchemy.pool import NullPool
 
 from app.config import Settings
+from app.db.session import _engine_options_for_url
 from app.main import create_app
 
 
@@ -174,6 +176,61 @@ def test_production_accepts_explicit_secure_dependency_urls():
     derived_sync_url = _production_settings()
     assert derived_sync_url.database_url_sync == ""
     assert derived_sync_url.sync_database_url.startswith("postgresql+psycopg://")
+
+
+def test_supabase_transaction_pooler_disables_statement_cache_and_app_pool():
+    options = _engine_options_for_url(
+        "postgresql+asyncpg://db-user:db-password"
+        "@aws-0-region.pooler.supabase.com:6543/postgres"
+    )
+
+    assert options["poolclass"] is NullPool
+    assert options["connect_args"] == {
+        "timeout": 10,
+        "ssl": "require",
+        "statement_cache_size": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+asyncpg://db-user:db-password"
+        "@db.project-ref.supabase.co:5432/postgres",
+        "postgresql+asyncpg://db-user:db-password"
+        "@aws-0-region.pooler.supabase.com:5432/postgres",
+    ],
+)
+def test_supabase_direct_and_session_connections_require_ssl_and_keep_pooling(
+    database_url,
+):
+    options = _engine_options_for_url(database_url)
+
+    assert options["connect_args"] == {"timeout": 10, "ssl": "require"}
+    assert options["pool_pre_ping"] is True
+    assert options["pool_size"] == 10
+    assert options["max_overflow"] == 20
+    assert "poolclass" not in options
+
+
+def test_supabase_explicit_ssl_settings_are_preserved():
+    options = _engine_options_for_url(
+        "postgresql+asyncpg://db-user:db-password"
+        "@db.project-ref.supabase.co:5432/postgres?sslmode=verify-full"
+    )
+
+    assert options["connect_args"] == {"timeout": 10}
+
+
+def test_non_supabase_database_on_port_6543_keeps_existing_pooling():
+    options = _engine_options_for_url(
+        "postgresql+asyncpg://db-user:db-password@db.example.test:6543/app"
+    )
+
+    assert options["connect_args"] == {"timeout": 10}
+    assert options["pool_pre_ping"] is True
+    assert options["pool_size"] == 10
+    assert options["max_overflow"] == 20
 
 
 def test_production_configuration_errors_do_not_echo_connection_secrets():

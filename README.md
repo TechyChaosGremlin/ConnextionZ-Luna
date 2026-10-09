@@ -96,10 +96,19 @@
   port 5432; do not use the transaction pooler. The Supabase `public` schema
   must be empty before starting.
 
+  Configure the app's `DATABASE_URL` with the Supabase connection URL using the
+  `postgresql+asyncpg://` scheme. For Vercel/serverless deployments, use the
+  transaction pooler (port 6543); the backend disables asyncpg's statement
+  cache and application-side pool for that mode. For persistent deployments,
+  use the direct connection or session pooler (port 5432). Keep
+  `DATABASE_URL_SYNC` on the `postgresql+psycopg://` scheme and use a direct
+  or session-pooler URL for Alembic migrations; do not run migrations through
+  the transaction pooler. Supabase SSL is required automatically unless the
+  URL specifies its own SSL setting.
+
   After the script reports success, set Vercel's Production `DATABASE_URL` to
-  the Supabase connection URL with the `postgresql+asyncpg://` scheme, then
-  redeploy. Keep the Neon project until sign-in and the deployed app have been
-  verified against Supabase.
+  the Supabase transaction-pooler URL, then redeploy. Keep the Neon project
+  until sign-in and the deployed app have been verified against Supabase.
 
   Once deployed, `/health` checks backend reachability. The frontend uses
   same-origin API URLs automatically in production, so it does not rely on a

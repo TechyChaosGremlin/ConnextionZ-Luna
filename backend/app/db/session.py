@@ -9,23 +9,47 @@ Provides:
 
 from __future__ import annotations
 
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 from app.models.base import Base
+
+
+def _engine_options_for_url(database_url: str) -> dict[str, Any]:
+    """Configure SSL and pooling for Supabase connection modes."""
+    url = make_url(database_url)
+    host = (url.host or "").lower()
+    is_supabase = host.endswith(".supabase.co") or host.endswith(
+        ".pooler.supabase.com"
+    )
+    is_transaction_pooler = is_supabase and url.port == 6543
+
+    connect_args: dict[str, Any] = {"timeout": 10}
+    if is_supabase and "sslmode" not in url.query and "ssl" not in url.query:
+        connect_args["ssl"] = "require"
+    if is_transaction_pooler:
+        connect_args["statement_cache_size"] = 0
+        return {"connect_args": connect_args, "poolclass": NullPool}
+
+    return {
+        "connect_args": connect_args,
+        "pool_pre_ping": True,
+        "pool_size": 10,
+        "max_overflow": 20,
+    }
+
 
 # Create async engine
 async_engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
     future=True,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-    connect_args={"timeout": 10},
+    **_engine_options_for_url(settings.database_url),
 )
 
 # Create async session factory
