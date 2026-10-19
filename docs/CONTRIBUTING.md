@@ -1119,6 +1119,24 @@ account-deletion PostgreSQL check and live media storage remain explicitly
 unverified environment prerequisites; this is not a claim of production or
 full beta sign-off.
 
+##### Focused account-deletion privacy follow-up
+
+On 2026-10-18, the dedicated
+[`test_account_profile_and_category_deletions_cascade_and_deleted_users_are_excluded`](../backend/tests/test_onboarding_deletion_postgres.py)
+selector passed against a uniquely named disposable local PostgreSQL database:
+**1 passed, 0 skipped in 2.57 seconds, exit code 0**. The isolated fixture was
+corrected to include the canonical `Post.__table__` and `Media.__table__`
+dependencies required by account media cleanup; only
+[`test_onboarding_deletion_postgres.py`](../backend/tests/test_onboarding_deletion_postgres.py)
+was changed. No migrations were run. The temporary database was dropped and
+its absence verified, and `ONBOARDING_TEST_DATABASE_URL` was restored.
+
+This focused result verifies the selector's account/profile/category cascade
+checks and exclusion of soft-deleted users/profiles from category lookup. It
+does not comprehensively certify every account-deletion path or a deployed
+environment. The Task 4 notes above remain the historical state at that task's
+close.
+
 #### Week 8 Task 5: final beta launch checklist and readiness decision
 
 This final focused readiness review reconciles the recorded Week 6 completion,

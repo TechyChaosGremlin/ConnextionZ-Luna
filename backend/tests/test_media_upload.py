@@ -5,10 +5,12 @@ from __future__ import annotations
 import io
 import uuid
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException, UploadFile
+from pydantic import SecretStr
 from starlette.requests import Request
 
 from app.models.user import AccountStatus, User, UserRole
@@ -49,6 +51,41 @@ def make_request() -> Request:
             "client": ("192.0.2.1", 1234),
             "server": ("test", 80),
         }
+    )
+
+
+def test_storage_presigned_url_uses_sigv4(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "aws_s3_bucket", "test-bucket")
+    monkeypatch.setattr(settings, "aws_region", "us-east-1")
+    monkeypatch.setattr(settings, "aws_access_key_id", "dummy-access-key")
+    monkeypatch.setattr(
+        settings, "aws_secret_access_key", SecretStr("dummy-secret-access-key")
+    )
+    monkeypatch.setattr(
+        settings,
+        "aws_endpoint_url",
+        "https://placeholder.storage.example/storage/v1/s3",
+    )
+
+    client = MediaStorage()._get_client()
+    url = client.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": "test-bucket",
+            "Key": "uploads/user-id/media-id.png",
+        },
+        ExpiresIn=300,
+    )
+    parsed = urlsplit(url)
+    query = parse_qs(parsed.query)
+
+    assert query["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
+    assert "X-Amz-Signature" in query
+    assert "AWSAccessKeyId" not in query
+    assert parsed.path == (
+        "/storage/v1/s3/test-bucket/uploads/user-id/media-id.png"
     )
 
 

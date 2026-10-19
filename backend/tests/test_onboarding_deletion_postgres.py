@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from api.graphql import AppContext, _delete_account
 from app.models.category import Category, profile_categories
+from app.models.content import Media, Post
 from app.models.streaming import (
     ConnectedStreamAccount,
     StreamPlatform,
@@ -44,6 +45,8 @@ async def onboarding_store():
         User.__table__,
         Profile.__table__,
         AuthSession.__table__,
+        Post.__table__,
+        Media.__table__,
         StreamSession.__table__,
         ConnectedStreamAccount.__table__,
         Category.__table__,

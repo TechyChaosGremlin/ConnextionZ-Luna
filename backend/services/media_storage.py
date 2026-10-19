@@ -11,6 +11,7 @@ from pathlib import Path
 
 import boto3
 from boto3.exceptions import Boto3Error
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import HTTPException, UploadFile, status
 
@@ -99,6 +100,7 @@ class MediaStorage:
                 aws_secret_access_key=secret_access_key.get_secret_value(),
                 region_name=region,
                 endpoint_url=settings.aws_endpoint_url or None,
+                config=Config(signature_version="s3v4"),
             )
         except (BotoCoreError, ClientError) as exc:
             raise MediaStorageError("Unable to initialize media storage") from exc
