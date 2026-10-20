@@ -22,10 +22,10 @@
 // searched for anything yet.
 
 import { type Result } from "./auth-store";
-import { CREATORS, FEED, registerCreator, type Creator, type FeedVideo, creatorById } from "./creators";
-import { noteFollowState } from "./follow-store";
+import { CREATORS, FEED, registerCreator, type Creator, type FeedVideo } from "./creators";
+import { followStateRevision, noteFollowState } from "./follow-store";
+import { likeStateRevision, noteLikeState } from "./like-store";
 import { SOUNDS, type Sound } from "./TrendingSounds";
-import { ownFeedVideos } from "./posts-store";
 import {
   clearSearchHistoryRemote, fetchSearchHistory, fetchSearchSuggestions, fetchTrendingSearches,
   recordSearch, removeSearchHistoryEntryRemote, searchHashtags, searchPosts, searchProfiles,
@@ -115,9 +115,6 @@ export const suggestedCreators = (limit = 6): Creator[] =>
 
 // ─── SEARCHING ───────────────────────────────────────────────────────────────
 
-/** Posts the viewer published are searchable too — they are in the same feed. */
-const searchableVideos = (): FeedVideo[] => [...ownFeedVideos(), ...FEED];
-
 function run(query: string, remoteCreators?: Creator[]): SearchResults {
   const words = terms(query);
   if (!words.length) return EMPTY_RESULTS;
@@ -130,28 +127,24 @@ function run(query: string, remoteCreators?: Creator[]): SearchResults {
     return exact(b) - exact(a) || b.followers - a.followers;
   });
 
-  const videos = searchableVideos().filter((v) => {
-    const creator = creatorById(v.creatorId);
-    const who = creator ? `${creator.username} ${creator.displayName}` : "";
-    return matches(`${v.caption} ${v.hashtags.join(" ")} ${v.audio} ${who}`, words);
-  }).sort((a, b) => b.views - a.views);
-
   const sounds = SOUNDS.filter((s) =>
     matches(`${s.title} ${s.creator} ${s.genre}`, words),
   ).sort((a, b) => a.rank - b.rank);
 
   const hashtags = HASHTAG_INDEX.filter((h) => matches(h.tag, words));
 
-  return { creators, videos, sounds, hashtags, creatorsCursor: null, videosCursor: null, hashtagsCursor: null };
+  return { creators, videos: [], sounds, hashtags, creatorsCursor: null, videosCursor: null, hashtagsCursor: null };
 }
 
-function toCreator(profile: GraphQLProfileSummary): Creator {
-  if (profile.isFollowing != null) noteFollowState(profile.id, profile.isFollowing);
-  return registerCreator(profile);
+function toCreator(profile: GraphQLProfileSummary, readRevision: number): Creator {
+  const creator = registerCreator(profile);
+  if (profile.isFollowing != null) noteFollowState(creator.id, profile.isFollowing, readRevision, profile.followers ?? undefined);
+  return creator;
 }
 
-function toVideo(post: GraphQLFeedItem): FeedVideo {
-  const creator = registerCreator(post.creator);
+function toVideo(post: GraphQLFeedItem, likeRevision: number, followRevision: number): FeedVideo {
+  const creator = toCreator(post.creator, followRevision);
+  noteLikeState(post.id, post.isLiked ?? false, post.likes, likeRevision);
   return {
     id: post.id,
     creatorId: creator.id,
@@ -162,6 +155,11 @@ function toVideo(post: GraphQLFeedItem): FeedVideo {
     comments: post.comments ?? 0,
     shares: post.shares ?? 0,
     saves: post.saves ?? 0,
+    isLiked: post.isLiked ?? false,
+    isSaved: post.isSaved ?? false,
+    isShared: post.isShared ?? false,
+    mediaUrl: post.mediaUrl ?? undefined,
+    durationSec: post.durationSec ?? undefined,
     hashtags: post.hashtags ?? [],
     audio: post.audio ?? "Original Sound",
     ...(post.collabWith ? { collabWith: post.collabWith } : {}),
@@ -186,17 +184,20 @@ export async function search(query: string, filters: SearchFilters = {}): Promis
   }
   if (!normalise(query)) return { ok: true, value: EMPTY_RESULTS };
 
+  const likeRevision = likeStateRevision();
+  const followRevision = followStateRevision();
   const [profiles, posts, hashtags] = await Promise.all([
     searchProfiles(query, null, 20, toProfileFilters(filters)),
     searchPosts(query, null, 20, toPostFilters(filters)),
     searchHashtags(query, null, 20),
   ]);
 
-  const remoteCreators = profiles.ok ? profiles.value.profiles.map(toCreator) : undefined;
+  if (!posts.ok) return posts;
+  const remoteCreators = profiles.ok ? profiles.value.profiles.map((profile) => toCreator(profile, followRevision)) : undefined;
   const results = run(query, remoteCreators);
   if (profiles.ok) results.creatorsCursor = profiles.value.nextCursor;
   if (posts.ok) {
-    results.videos = posts.value.items.map(toVideo);
+    results.videos = posts.value.items.map((post) => toVideo(post, likeRevision, followRevision));
     results.videosCursor = posts.value.nextCursor;
   }
   if (hashtags.ok) {
@@ -210,18 +211,21 @@ export async function search(query: string, filters: SearchFilters = {}): Promis
 export async function loadMoreCreators(
   query: string, cursor: string | null, filters: SearchFilters = {},
 ): Promise<Result<{ creators: Creator[]; nextCursor: string | null }>> {
+  const readRevision = followStateRevision();
   const result = await searchProfiles(query, cursor, 20, toProfileFilters(filters));
   if (!result.ok) return result;
-  return { ok: true, value: { creators: result.value.profiles.map(toCreator), nextCursor: result.value.nextCursor } };
+  return { ok: true, value: { creators: result.value.profiles.map((profile) => toCreator(profile, readRevision)), nextCursor: result.value.nextCursor } };
 }
 
 /** Pages in the next batch of posts for a query already on screen. */
 export async function loadMoreVideos(
   query: string, cursor: string | null, filters: SearchFilters = {},
 ): Promise<Result<{ videos: FeedVideo[]; nextCursor: string | null }>> {
+  const likeRevision = likeStateRevision();
+  const followRevision = followStateRevision();
   const result = await searchPosts(query, cursor, 20, toPostFilters(filters));
   if (!result.ok) return result;
-  return { ok: true, value: { videos: result.value.items.map(toVideo), nextCursor: result.value.nextCursor } };
+  return { ok: true, value: { videos: result.value.items.map((post) => toVideo(post, likeRevision, followRevision)), nextCursor: result.value.nextCursor } };
 }
 
 /** Pages in the next batch of hashtags for a query already on screen. */
@@ -334,4 +338,3 @@ export function clearSearches(): string[] {
   if (!isOffline()) void clearSearchHistoryRemote();
   return [];
 }
-

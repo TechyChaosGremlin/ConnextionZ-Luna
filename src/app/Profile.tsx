@@ -11,10 +11,8 @@
 // moment it is saved, with no refetch and no second copy of the identity.
 //
 // ── Replacing this with a real backend ──────────────────────────────────────
-// The screen takes a `Creator` and handlers; it never fetches. Point the caller
-// at `GET /creators/:handle` (and `GET /me` for the owner) and nothing here
-// changes. Follow state already comes from `follow-store.ts`, which owns its own
-// endpoint seam.
+// The supplied identity gives the first paint; GraphQL refreshes the profile
+// and viewer-specific interaction state when the screen opens.
 
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
@@ -25,7 +23,8 @@ import { useTheme } from "./ThemeContext";
 import { ACCENT, useTokens, EmptyState } from "./settings-ui";
 import { registerCreator, type Creator, OWN_PLAYLISTS, OWN_STATS } from "./creators";
 import { useOwnContent } from "./posts-store";
-import { noteFollowState, useFollowerCount, useFollowingCount } from "./follow-store";
+import { followStateRevision, noteFollowState, useFollowerCount, useFollowingCount } from "./follow-store";
+import { likeStateRevision, noteLikeState } from "./like-store";
 import { useSession, useViewer } from "./session";
 import { updateAvatar, type Result } from "./auth-store";
 import {
@@ -55,8 +54,10 @@ export function useOwnCreator(): Creator {
 
   useEffect(() => {
     let active = true;
+    const readRevision = likeStateRevision();
     fetchMeProfile().then((profile) => {
       if (!active || !profile) return;
+      profile.posts?.forEach((post) => noteLikeState(post.id, post.isLiked ?? false, post.likes, readRevision));
       setRemoteProfile({
         id: profile.id,
         username: profile.username,
@@ -126,7 +127,7 @@ export function useOwnCreator(): Creator {
 // ─── SCREEN ──────────────────────────────────────────────────────────────────
 
 export function ProfileScreen({
-  creator, isOwner, onBack, onEditProfile, onOpenSettings, onOpenDashboard, onOpenProfile,
+  creator: initialCreator, isOwner, onBack, onEditProfile, onOpenSettings, onOpenDashboard, onOpenProfile,
   onMessage, onCollab, onShare, onOpenPost, canOpenPost,
 }: {
   creator: Creator;
@@ -150,6 +151,10 @@ export function ProfileScreen({
   const isDark = useTheme();
   const t = useTokens(isDark);
   const { account, setAccount } = useSession();
+  const [loadedCreator, setLoadedCreator] = useState<{ username: string; viewer: string; creator: Creator } | null>(null);
+  const [profileLoadError, setProfileLoadError] = useState("");
+  const creator = !isOwner && loadedCreator?.username === initialCreator.username && loadedCreator.viewer === account.email
+    ? loadedCreator.creator : initialCreator;
   const [tab, setTab] = useState<ProfileTab>("posts");
   const [connections, setConnections] = useState<"followers" | "following" | null>(null);
   const [avatarSaving, setAvatarSaving] = useState(false);
@@ -159,6 +164,41 @@ export function ProfileScreen({
   // Reads the store, not the prop: it moves the instant a follow toggles and
   // takes the server's own count as soon as a follow/unfollow resolves.
   const followerCount = useFollowerCount(creator);
+
+  useEffect(() => {
+    setProfileLoadError("");
+    if (isOwner) return;
+    let active = true;
+    const followRevision = followStateRevision();
+    const likeRevision = likeStateRevision();
+    void fetchProfileByUsername(initialCreator.username).then((profile) => {
+      if (!active) return;
+      if (!profile) { setProfileLoadError("Could not load this profile. Reopen it to try again."); return; }
+      const registered = registerCreator(profile);
+      if (profile.isFollowing != null) {
+        noteFollowState(registered.id, profile.isFollowing, followRevision, profile.followers ?? undefined);
+      }
+      profile.posts?.forEach((post) => noteLikeState(post.id, post.isLiked ?? false, post.likes, likeRevision));
+      setLoadedCreator({
+        username: initialCreator.username,
+        viewer: account.email,
+        creator: {
+          ...registered,
+          bio: profile.bio ?? "",
+          location: profile.location ?? "",
+          website: profile.website ?? "",
+          collabStatus: profile.collabStatus ?? registered.collabStatus,
+          responseTime: profile.responseTime ?? registered.responseTime,
+          posts: (profile.posts ?? []).map((post) => ({
+            id: post.id, thumbnail: post.thumbnail, caption: post.caption,
+            views: post.views, likes: post.likes, collabWith: post.collabWith ?? undefined,
+          })),
+          playlists: profile.playlists ?? [],
+        },
+      });
+    });
+    return () => { active = false; };
+  }, [initialCreator.username, isOwner, account.email]);
 
   const collabPosts = useMemo(() => creator.posts.filter((p) => p.collabWith), [creator.posts]);
 
@@ -231,6 +271,7 @@ export function ProfileScreen({
         </div>
 
         <div className="px-5 -mt-11 pb-28">
+          {profileLoadError && <p role="alert" className="relative mb-3 text-sm" style={{ color: t.body }}>{profileLoadError}</p>}
           {/* ── Identity ── */}
           <div className="flex items-end justify-between gap-3 mb-4">
             {isOwner ? (
@@ -428,6 +469,7 @@ function ConnectionsSheet({
       const state = prev[which];
       if (state.loading || (state.loadedOnce && !state.error && state.cursor === null)) return prev;
       const next = { ...prev, [which]: { ...state, loading: true, error: null } };
+      const readRevision = followStateRevision();
       void fetchPage(which, state.cursor).then((result) => {
         if (!result.ok) {
           setPages((current) => ({ ...current, [which]: { ...current[which], loading: false, error: result.error } }));
@@ -446,7 +488,7 @@ function ConnectionsSheet({
         }));
         // Seed the follow graph so each row's button is right the instant it renders.
         page.profiles.forEach((profile) => {
-          if (profile.isFollowing != null) noteFollowState(registerCreator(profile).id, profile.isFollowing);
+          if (profile.isFollowing != null) noteFollowState(registerCreator(profile).id, profile.isFollowing, readRevision, profile.followers ?? undefined);
         });
       });
       return next;

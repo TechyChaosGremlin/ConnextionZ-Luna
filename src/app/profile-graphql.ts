@@ -300,7 +300,7 @@ export async function fetchFeedPageFromApi(cursor: string | null, limit = 10, fo
           isSaved
           isShared
           collabWith
-          creator { id username displayName avatarUrl avatarColor verified collabScore collabCount followers following openToCollab }
+          creator { id username displayName avatarUrl avatarColor verified collabScore collabCount followers following openToCollab isFollowing }
         }
       }
     }
@@ -429,7 +429,7 @@ export async function searchPosts(
         items {
           id thumbnail mediaUrl caption views likes isLiked hashtags audio visibility
           allowComments allowCollabs durationSec comments shares saves isSaved isShared collabWith
-          creator { id username displayName avatarUrl avatarColor verified }
+          creator { id username displayName avatarUrl avatarColor verified followers isFollowing }
         }
       }
     }
@@ -577,7 +577,8 @@ export async function graphqlRequestResult<T>(query: string, variables?: Record<
     return { ok: false, error: json.errors[0]?.message || "That request could not be completed." };
   }
 
-  return { ok: true, value: json.data as T };
+  if (!json.data) return { ok: false, error: "The server did not confirm the request." };
+  return { ok: true, value: json.data };
 }
 
 async function graphqlRequest<T>(query: string, variables?: Record<string, unknown>): Promise<T | null> {
@@ -620,6 +621,7 @@ export async function fetchMeProfile(): Promise<GraphQLProfile | null> {
           caption
           views
           likes
+          isLiked
           hashtags
           audio
           visibility
@@ -629,6 +631,8 @@ export async function fetchMeProfile(): Promise<GraphQLProfile | null> {
           comments
           shares
           saves
+          isSaved
+          isShared
           collabWith
         }
         playlists {
@@ -759,6 +763,7 @@ export async function fetchProfileByUsername(username: string): Promise<GraphQLP
           caption
           views
           likes
+          isLiked
           hashtags
           audio
           visibility
@@ -768,6 +773,8 @@ export async function fetchProfileByUsername(username: string): Promise<GraphQLP
           comments
           shares
           saves
+          isSaved
+          isShared
           collabWith
         }
         playlists {

@@ -357,29 +357,33 @@ export function registerCreator(input: {
   followers?: number | null;
   following?: number | null;
   openToCollab?: boolean | null;
+  isFollowing?: boolean | null;
 }): Creator {
   const username = input.username.trim().replace(/^@/, "").toLowerCase();
-  const existingByUsername = BY_USERNAME.get(username);
-  if (existingByUsername) {
-    existingByUsername.username = input.username;
-    existingByUsername.displayName = input.displayName || input.username;
-    existingByUsername.avatarUrl = input.avatarUrl ?? existingByUsername.avatarUrl;
-    existingByUsername.avatarColor = input.avatarColor ?? existingByUsername.avatarColor;
-    existingByUsername.verified = input.verified ?? existingByUsername.verified;
-    existingByUsername.collabScore = input.collabScore ?? existingByUsername.collabScore;
-    existingByUsername.collabCount = input.collabCount ?? existingByUsername.collabCount;
-    existingByUsername.followers = input.followers ?? existingByUsername.followers;
-    existingByUsername.following = input.following ?? existingByUsername.following;
-    existingByUsername.openToCollab = input.openToCollab ?? existingByUsername.openToCollab;
-    return existingByUsername;
+  const existing = BY_ID.get(input.id);
+  if (existing) {
+    const previousUsername = existing.username.trim().replace(/^@/, "").toLowerCase();
+    if (previousUsername !== username && BY_USERNAME.get(previousUsername) === existing) {
+      BY_USERNAME.delete(previousUsername);
+    }
+    existing.username = input.username;
+    existing.displayName = input.displayName || input.username;
+    existing.avatarUrl = input.avatarUrl ?? existing.avatarUrl;
+    existing.avatarColor = input.avatarColor ?? existing.avatarColor;
+    existing.verified = input.verified ?? existing.verified;
+    existing.collabScore = input.collabScore ?? existing.collabScore;
+    existing.collabCount = input.collabCount ?? existing.collabCount;
+    existing.followers = input.followers == null
+      ? existing.followers
+      : input.followers - (input.isFollowing ? 1 : 0);
+    existing.following = input.following ?? existing.following;
+    existing.openToCollab = input.openToCollab ?? existing.openToCollab;
+    BY_USERNAME.set(username, existing);
+    return existing;
   }
 
-  const existingById = BY_ID.get(input.id);
-  const id = existingById && existingById.username !== username
-    ? `api:${input.id}:${username}`
-    : input.id;
   const creator: Creator = {
-    id,
+    id: input.id,
     username: input.username,
     displayName: input.displayName || input.username,
     avatarUrl: input.avatarUrl ?? "",
@@ -392,7 +396,7 @@ export function registerCreator(input: {
     collabStatus: "Open to Collaboration",
     collabScore: input.collabScore ?? 0,
     collabCount: input.collabCount ?? 0,
-    followers: input.followers ?? 0,
+    followers: (input.followers ?? 0) - (input.isFollowing ? 1 : 0),
     following: input.following ?? 0,
     openToCollab: input.openToCollab ?? true,
     responseTime: "< 4 hours",

@@ -15,7 +15,7 @@
 // rather than retrofitted once latency becomes real.
 
 import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
-import { getAccessToken, type Result } from "./auth-store";
+import { type Result } from "./auth-store";
 import { registerCreator, type Creator, creatorById } from "./creators";
 import { fetchMyFollowing, followProfile, type GraphQLFollowResult, unfollowProfile } from "./profile-graphql";
 
@@ -23,6 +23,10 @@ import { fetchMyFollowing, followProfile, type GraphQLFollowResult, unfollowProf
 
 /** The account whose graph is loaded; null when signed out. */
 let activeEmail: string | null = null;
+let revision = 0;
+let accountRevision = 0;
+let changed = new Map<string, number>();
+export const followStateRevision = () => revision;
 let following = new Set<string>();
 /** In-flight toggles, so every button for a creator shows the same pending state. */
 let pending = new Set<string>();
@@ -57,24 +61,22 @@ function subscribe(listener: () => void) {
  * so the next user never inherits the previous one's graph.
  */
 export function activateFollowGraph(email: string | null) {
-  if (email === null) {
-    activeEmail = null;
-    following = new Set();
-    pending = new Set();
-    followerCounts = new Map();
-    publish();
-    return;
-  }
-  if (activeEmail === email.trim().toLowerCase()) return;
-  activeEmail = email.trim().toLowerCase();
+  const normalizedEmail = email?.trim().toLowerCase() ?? null;
+  if (activeEmail === normalizedEmail) return;
+  activeEmail = normalizedEmail;
+  const account = accountRevision = ++revision;
+  changed = new Map();
   following = new Set();
   pending = new Set();
   followerCounts = new Map();
   publish();
+  if (!activeEmail) return;
+  const readRevision = revision;
   void fetchMyFollowing().then((profiles) => {
-    if (profiles === null || activeEmail !== email.trim().toLowerCase()) return;
-    following = new Set(profiles.map((profile) => registerCreator(profile).id));
-    publish();
+    if (profiles === null || account !== accountRevision) return;
+    profiles.forEach((profile) => {
+      noteFollowState(registerCreator(profile).id, true, readRevision, profile.followers ?? undefined);
+    });
   });
 }
 
@@ -91,10 +93,13 @@ export const followingIds = () => idsSnapshot;
  * separate full-list request. No-op when signed out — there is no graph to
  * merge server truth into.
  */
-export function noteFollowState(creatorId: string, value: boolean) {
-  if (!activeEmail || following.has(creatorId) === value) return;
+export function noteFollowState(creatorId: string, value: boolean, readRevision = revision, followers?: number) {
+  if (!activeEmail || readRevision < accountRevision || pending.has(creatorId) || (changed.get(creatorId) ?? 0) > readRevision) return;
   following = new Set(following);
   value ? following.add(creatorId) : following.delete(creatorId);
+  if (followers !== undefined) {
+    followerCounts = new Map(followerCounts).set(creatorId, followers - (value ? 1 : 0));
+  }
   publish();
 }
 
@@ -110,17 +115,6 @@ function applyFollowerCount(creatorId: string, followersExcludingViewer: number)
 /** The network seam. Resolves once the follow is durable. */
 async function requestFollow(creatorId: string, next: boolean): Promise<Result<GraphQLFollowResult>> {
   if (!activeEmail) return { ok: false, error: "Sign in to follow creators." };
-  if (!getAccessToken()) {
-    const creator = creatorById(creatorId);
-    return {
-      ok: true,
-      value: {
-        following: next,
-        followers: (creator?.followers ?? 0) + (next ? 1 : 0),
-        followingCount: following.size,
-      },
-    };
-  }
   const identifier = creatorById(creatorId)?.username ?? creatorId;
   return next ? followProfile(identifier) : unfollowProfile(identifier);
 }
@@ -131,6 +125,8 @@ async function requestFollow(creatorId: string, next: boolean): Promise<Result<G
  */
 export async function toggleFollow(creatorId: string): Promise<Result<boolean>> {
   if (pending.has(creatorId)) return { ok: false, error: "" };
+  if (!activeEmail) return { ok: false, error: "Sign in to follow creators." };
+  const account = accountRevision;
 
   const previous = following.has(creatorId);
   const next = !previous;
@@ -139,9 +135,12 @@ export async function toggleFollow(creatorId: string): Promise<Result<boolean>> 
   following = new Set(following);
   next ? following.add(creatorId) : following.delete(creatorId);
   pending = new Set(pending).add(creatorId);
+  changed.set(creatorId, ++revision);
   publish();
 
   const result = await requestFollow(creatorId, next);
+  if (account !== accountRevision) return { ok: false, error: "Your account changed. Try again." };
+  changed.set(creatorId, ++revision);
 
   pending = new Set(pending);
   pending.delete(creatorId);
@@ -156,6 +155,8 @@ export async function toggleFollow(creatorId: string): Promise<Result<boolean>> 
 
   // The server's counts are authoritative — apply them now instead of waiting
   // on whatever refetch might happen next.
+  following = new Set(following);
+  result.value.following ? following.add(creatorId) : following.delete(creatorId);
   applyFollowerCount(creatorId, result.value.followers - (result.value.following ? 1 : 0));
   publish();
   return { ok: true, value: result.value.following };
@@ -219,4 +220,3 @@ export function useFollowingCreators(): Creator[] {
     [ids],
   );
 }
-

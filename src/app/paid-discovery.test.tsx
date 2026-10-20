@@ -210,7 +210,7 @@ test("local Paid route is separate, viewer-scoped, returns to Discover, and pres
   assert.match(app, /onOpenPaid=\{\(\) => setScreen\("paid"\)\}/);
   assert.match(app, /screen === "paid" && <PaidDiscoveryScreen key=\{account.email\} viewerKey=\{account.email\}/);
   assert.match(app, /onBack=\{\(\) => setScreen\("discover"\)\}/);
-  assert.match(app, /useFeed\(feedTab === "following"\)/);
+  assert.match(app, /useFeed\(feedTab === "following", account\?\.email \?\? null\)/);
   assert.match(app, /useState<"forYou" \| "following">\("forYou"\)/);
   assert.doesNotMatch(app, /usePaidFeed|paidFeedItems|toDisplayVideo\(.*paid/);
   const page = await readFile("src/app/PaidDiscovery.tsx", "utf8");

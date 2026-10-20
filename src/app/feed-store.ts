@@ -9,17 +9,15 @@
 // content it already has, and the next page is requested a slide *before* it is
 // needed rather than at the moment the user hits the bottom.
 //
-// ⚠️  PROTOTYPE — pages are generated from the seeded feed rather than fetched.
-//
-// ── Replacing this with a real backend ──────────────────────────────────────
-//   fetchFeedPage(cursor) → GET /feed?cursor=…   → { items, cursor }
+// Pages come exclusively from the API; demo IDs are not database post IDs.
 // A null cursor means "no more". `useFeed` needs no changes: it already treats
 // the cursor as opaque, which is what a real cursor-paginated API requires.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type Result } from "./auth-store";
-import { FEED, registerCreator, type FeedVideo } from "./creators";
-import { noteLikeState } from "./like-store";
+import { registerCreator, type FeedVideo } from "./creators";
+import { likeStateRevision, noteLikeState } from "./like-store";
+import { followStateRevision, noteFollowState } from "./follow-store";
 import { noteSaveState } from "./save-store";
 import { noteShareState } from "./share-store";
 import { fetchFeedPageFromApi } from "./profile-graphql";
@@ -35,17 +33,19 @@ export async function fetchFeedPage(cursor: string | null, following = false): P
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
     return { ok: false, error: "You're offline. Reconnect to load the feed." };
   }
+  const likeRevision = likeStateRevision();
+  const followRevision = followStateRevision();
   const page = await fetchFeedPageFromApi(cursor, 10, following);
-  if (!page && cursor === null && !following) {
-    return { ok: true, value: { items: FEED, cursor: null } };
-  }
   if (!page) return { ok: false, error: "The feed could not be loaded. Try again." };
   return {
     ok: true,
     value: {
       items: page.items.map((post): FeedVideo => {
         const creator = registerCreator(post.creator);
-        noteLikeState(post.id, post.isLiked ?? false, post.likes);
+        noteLikeState(post.id, post.isLiked ?? false, post.likes, likeRevision);
+        if (post.creator.isFollowing != null) {
+          noteFollowState(creator.id, post.creator.isFollowing, followRevision, post.creator.followers ?? undefined);
+        }
         noteSaveState(post.id, post.isSaved ?? false, post.saves ?? 0);
         noteShareState(post.id, post.shares ?? 0, post.isShared ?? false);
         return {
@@ -92,7 +92,7 @@ export interface FeedState {
   reload: () => void;
 }
 
-export function useFeed(following = false): FeedState {
+export function useFeed(following = false, viewerKey: string | null = null): FeedState {
   const [items, setItems] = useState<FeedVideo[]>([]);
   const [pageCursor, setPageCursor] = useState<string | null>(null);
   const [status, setStatus] = useState<FeedStatus>("loading");
@@ -132,7 +132,7 @@ export function useFeed(following = false): FeedState {
       return [...previous, ...result.value.items.filter((v) => !seen.has(v.id))];
     });
     setStatus("ready");
-  }, [following]);
+  }, [following, viewerKey]);
 
   useEffect(() => {
     requestGeneration.current += 1;
@@ -142,6 +142,7 @@ export function useFeed(following = false): FeedState {
     setItems([]);
     setReachedEnd(false);
     void load(null, false);
+    return () => { requestGeneration.current += 1; };
   }, [load]);
 
   const loadMore = useCallback(() => {

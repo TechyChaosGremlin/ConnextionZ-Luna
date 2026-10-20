@@ -27,11 +27,11 @@ import {
   type HashtagResult, type SearchFilters, type SearchResults, type Suggestion, EMPTY_RESULTS,
   clearSearches, fetchSuggestions, forgetSearch, loadMoreCreators, loadMoreHashtags, loadMoreVideos,
   recentSearches, rememberSearch, search, syncRecentSearches, totalResults, trendingHashtags, trendingSearches,
-} from "./search";
+} from "./search.ts";
 import { type Sound } from "./TrendingSounds";
 import { fetchSuggestedProfiles } from "./profile-graphql";
 import { registerCreator } from "./creators";
-import { noteFollowState } from "./follow-store";
+import { followStateRevision, noteFollowState } from "./follow-store";
 
 type Status = "idle" | "loading" | "ready" | "error";
 type Tab = "top" | "creators" | "videos" | "sounds" | "tags";
@@ -360,10 +360,11 @@ function DiscoverPanel({
   const [remoteSuggestions, setRemoteSuggestions] = useState<Creator[] | null>(null);
   useEffect(() => {
     let active = true;
+    const readRevision = followStateRevision();
     fetchSuggestedProfiles(6).then((profiles) => {
       if (active && profiles) {
         profiles.forEach((p) => {
-          if (p.isFollowing != null) noteFollowState(p.id, p.isFollowing);
+          if (p.isFollowing != null) noteFollowState(p.id, p.isFollowing, readRevision, p.followers ?? undefined);
         });
         setRemoteSuggestions(profiles.map(registerCreator));
       }

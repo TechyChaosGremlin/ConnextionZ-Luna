@@ -12,7 +12,7 @@ const outfile = join(directory, "paid-discovery.test.mjs");
 
 try {
   await build({
-    entryPoints: ["src/app/paid-discovery.test.tsx"],
+    entryPoints: [process.argv[2] ?? "src/app/paid-discovery.test.tsx"],
     outfile,
     bundle: true,
     platform: "node",

@@ -9,6 +9,31 @@
 
   Run `npm run dev` to start the development server.
 
+  ## Post identifiers and social state
+
+  The active API (`backend/app/main.py` and `backend/api/graphql.py`) uses
+  database UUID primary keys, generated as UUIDv7 for new posts. Feed, search,
+  profile, and create-post responses return that same ID. Keep it unchanged
+  for comments, likes, saves, shares, updates, deletion, and watch tracking;
+  their GraphQL arguments remain `UUID!`. The retired `backend/app_legacy`
+  models and frontend prototype fixtures use different identifiers and must
+  not supply IDs to the live API.
+
+  A failed feed request now shows an error and Retry, rather than substituting
+  prototype posts such as `"3"`. An empty API feed stays empty. Search also
+  reports post-query failures instead of returning demo posts.
+
+  Likes and follows require server confirmation; missing/expired sessions are
+  errors, not successful local-only changes. Shared viewer-scoped stores apply
+  mutation results, roll back failed optimistic writes, reject duplicate
+  in-flight clicks, and ignore reads started before a newer mutation or account
+  change. Fresh feed/search/profile reads hydrate `isLiked` and `isFollowing`
+  from the backend, including after reload. API creator identities are keyed by
+  their returned profile ID, never by a matching demo username.
+
+  Run `npm run test:social` for the ID/state regressions or
+  `npm run test:frontend` for the full frontend test set.
+
   ## Local registration setup
 
   Use `http://localhost:5173` for the frontend, not the hosted site.

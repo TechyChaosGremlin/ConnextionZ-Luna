@@ -49,6 +49,7 @@ interface DisplayVideo {
   thumbnail: string;
   /** An uploaded video file, when the post has one — image-only posts have none. */
   mediaUrl?: string;
+  durationSec?: number;
   isLiked: boolean;
   isSaved: boolean;
 }
@@ -72,6 +73,7 @@ function toDisplayVideo(item: FeedVideo): DisplayVideo {
     saves: item.saves,
     thumbnail: item.thumbnail,
     mediaUrl: item.mediaUrl,
+    durationSec: item.durationSec,
     isLiked: item.isLiked ?? false,
     isSaved: item.isSaved ?? false,
   };
@@ -556,9 +558,11 @@ function ShareSheet({ video, onClose, onShared }: { video: DisplayVideo; onClose
 // ─── ACTION RAIL ──────────────────────────────────────────────────────────────
 
 function ActionRail({
-  video, liked, likeCount, saved, saveCount, commentCount, shareCount, onLike, onSave, onCollab, onComment, onShare,
+  video, liked, likeCount, likePending, likeError, saved, saveCount, commentCount, shareCount, onLike, onSave, onCollab, onComment, onShare,
 }: {
   video: DisplayVideo; liked: boolean; likeCount: number; saved: boolean; saveCount: number; commentCount: number; shareCount: number;
+  likePending: boolean;
+  likeError: string;
   onLike: () => void; onSave: () => void; onCollab: () => void; onComment: () => void; onShare: () => void;
 }) {
   const followState = useFollow(video.creatorId);
@@ -568,6 +572,11 @@ function ActionRail({
       className="flex flex-col items-center gap-5 lg:gap-6 absolute right-6 lg:right-8 top-1/2 -translate-y-1/2 z-10"
       onClick={(event) => event.stopPropagation()}
     >
+      {(likeError || followState.error) && (
+        <p role="alert" className="absolute right-14 top-0 w-56 rounded-lg bg-black/80 p-3 text-xs text-white">
+          {likeError || followState.error}
+        </p>
+      )}
       <div className="relative mb-1">
         <button
           type="button"
@@ -589,7 +598,8 @@ function ActionRail({
           {followState.following ? "✓" : "+"}
         </button>
       </div>
-      <motion.button whileTap={{ scale: 0.85 }} onClick={onLike} className="flex flex-col items-center gap-1">
+      <motion.button whileTap={{ scale: 0.85 }} onClick={onLike} disabled={likePending}
+        aria-label={liked ? "Unlike post" : "Like post"} aria-pressed={liked} className="flex flex-col items-center gap-1">
         <motion.div animate={liked ? { scale: [1, 1.35, 1] } : {}} transition={{ duration: 0.25 }}>
           <Heart className={`w-7 h-7 drop-shadow-lg ${liked ? "fill-red-500 text-red-500" : "text-white"}`} />
         </motion.div>
@@ -845,8 +855,6 @@ export default function App() {
   const touchStartY = useRef(0);
   const pausedRef = useRef(paused);
 
-  const { items: feedItems, cursor: feedCursor, status: feedStatus, error: feedError, loadMore, reachedEnd, reload } = useFeed(feedTab === "following");
-
   useEffect(() => {
     activatePosts(account?.email ?? null);
     activateFollowGraph(account?.email ?? null);
@@ -854,6 +862,8 @@ export default function App() {
     activateSaveGraph(account?.email ?? null);
     activateShareGraph(account?.email ?? null);
   }, [account?.email]);
+
+  const { items: feedItems, cursor: feedCursor, status: feedStatus, error: feedError, loadMore, reachedEnd, reload } = useFeed(feedTab === "following", account?.email ?? null);
 
   // The two top-bar tabs are the same feed filtered, so switching them restarts
   // at the first video rather than leaving `idx` past the end of a shorter list.
@@ -874,7 +884,9 @@ export default function App() {
     return () => {
       window.clearInterval(timer);
       const duration = video.durationSec ?? 0;
-      void trackPostWatch(video.id, watch.seconds, duration > 0 && watch.seconds >= duration);
+      void trackPostWatch(video.id, watch.seconds, duration > 0 && watch.seconds >= duration).then((result) => {
+        if (!result.ok) console.warn("Post watch could not be recorded", result.error);
+      });
     };
   }, [video?.id]);
 
@@ -1028,6 +1040,8 @@ export default function App() {
               <ActionRail video={video} liked={likeState.liked} likeCount={likeState.likes}
                 saved={saveState.saved} saveCount={saveState.saves}
                 commentCount={commentCount}
+                likePending={likeState.pending}
+                likeError={likeState.error}
                 onLike={() => { void likeState.toggle(); }}
                 onSave={() => { void saveState.toggle(); }}
                 onCollab={() => setCollabTarget(video)}

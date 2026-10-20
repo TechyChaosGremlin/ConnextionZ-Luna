@@ -10,13 +10,23 @@
 // resolves; a failure rolls both back onto whichever button was pressed.
 
 import { useCallback, useState, useSyncExternalStore } from "react";
-import { getAccessToken, type Result } from "./auth-store";
+import { type Result } from "./auth-store";
 import { likePost, unlikePost } from "./profile-graphql";
 
 let liked = new Map<string, boolean>();
 let counts = new Map<string, number>();
 let pending = new Set<string>();
 let activeEmail: string | null = null;
+let revision = 0;
+let accountRevision = 0;
+let changed = new Map<string, number>();
+
+export const likeStateRevision = () => revision;
+export const getLikeState = (postId: string) => ({
+  liked: liked.get(postId),
+  likes: counts.get(postId),
+  pending: pending.has(postId),
+});
 
 const listeners = new Set<() => void>();
 
@@ -33,6 +43,8 @@ export function activateLikeGraph(email: string | null) {
   const normalizedEmail = email?.trim().toLowerCase() ?? null;
   if (activeEmail === normalizedEmail) return;
   activeEmail = normalizedEmail;
+  accountRevision = ++revision;
+  changed = new Map();
   liked = new Map();
   counts = new Map();
   pending = new Set();
@@ -40,22 +52,18 @@ export function activateLikeGraph(email: string | null) {
 }
 
 /**
- * Folds a post's server-known like state into the store. A no-op once the
- * post has been seen before, so a later page or refetch can never clobber an
- * in-flight or already-resolved toggle with a stale snapshot.
+ * Accept fresh reads, but never overwrite a mutation or another account with
+ * a snapshot requested before that change.
  */
-export function noteLikeState(postId: string, isLiked: boolean, likes: number) {
-  if (liked.has(postId)) return;
+export function noteLikeState(postId: string, isLiked: boolean, likes: number, readRevision = revision) {
+  if (readRevision < accountRevision || pending.has(postId) || (changed.get(postId) ?? 0) > readRevision) return;
   liked = new Map(liked).set(postId, isLiked);
   counts = new Map(counts).set(postId, likes);
   publish();
 }
 
 /** The network seam. Resolves once the like/unlike is durable. */
-async function requestLike(postId: string, next: boolean, optimisticCount: number): Promise<Result<{ liked: boolean; likes: number }>> {
-  if (!getAccessToken()) {
-    return { ok: true, value: { liked: next, likes: optimisticCount } };
-  }
+async function requestLike(postId: string, next: boolean): Promise<Result<{ liked: boolean; likes: number }>> {
   return next ? likePost(postId) : unlikePost(postId);
 }
 
@@ -65,6 +73,8 @@ async function requestLike(postId: string, next: boolean, optimisticCount: numbe
  */
 export async function toggleLike(postId: string): Promise<Result<boolean>> {
   if (pending.has(postId)) return { ok: false, error: "" };
+  if (!activeEmail) return { ok: false, error: "Sign in to like posts." };
+  const account = accountRevision;
 
   const previousLiked = liked.get(postId) ?? false;
   const previousCount = counts.get(postId) ?? 0;
@@ -73,9 +83,12 @@ export async function toggleLike(postId: string): Promise<Result<boolean>> {
   liked = new Map(liked).set(postId, next);
   counts = new Map(counts).set(postId, Math.max(0, previousCount + (next ? 1 : -1)));
   pending = new Set(pending).add(postId);
+  changed.set(postId, ++revision);
   publish();
 
-  const result = await requestLike(postId, next, Math.max(0, previousCount + (next ? 1 : -1)));
+  const result = await requestLike(postId, next);
+  if (account !== accountRevision) return { ok: false, error: "Your account changed. Try again." };
+  changed.set(postId, ++revision);
 
   pending = new Set(pending);
   pending.delete(postId);
@@ -101,9 +114,9 @@ export async function toggleLike(postId: string): Promise<Result<boolean>> {
  * been seeded or the viewer has toggled it.
  */
 export function useLike(postId: string, fallbackLiked: boolean, fallbackLikes: number) {
-  const isLiked = useSyncExternalStore(subscribe, () => liked.get(postId) ?? fallbackLiked);
-  const likeCount = useSyncExternalStore(subscribe, () => counts.get(postId) ?? fallbackLikes);
-  const isPending = useSyncExternalStore(subscribe, () => pending.has(postId));
+  const isLiked = useSyncExternalStore(subscribe, () => getLikeState(postId).liked ?? fallbackLiked);
+  const likeCount = useSyncExternalStore(subscribe, () => getLikeState(postId).likes ?? fallbackLikes);
+  const isPending = useSyncExternalStore(subscribe, () => getLikeState(postId).pending);
   const [error, setError] = useState("");
 
   const toggle = useCallback(async () => {
