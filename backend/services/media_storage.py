@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -33,6 +34,47 @@ CONTENT_TYPE_EXTENSIONS = {
     "video/quicktime": ".mov",
     "video/ogg": ".ogv",
 }
+
+# --- TEMPORARY DIAGNOSTIC (remove after live storage verification) ---------
+# Records only provider fault identifiers so Supabase S3 failures can be
+# triaged. Credentials, authorization headers, signed URLs, response bodies,
+# error messages, bucket names, and object keys are deliberately excluded.
+
+_logger = logging.getLogger(__name__)
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+
+def _diagnostic_token(value: object) -> str:
+    """Reduce a provider field to a short, opaque, log-safe token."""
+    if value is None:
+        return "unknown"
+    # Fail closed: anything that is not a plain identifier is dropped entirely,
+    # so a URL, query string, header, or credential fragment can never be
+    # partially reconstructed from this log line.
+    token = str(value).strip()
+    if not _SAFE_TOKEN.fullmatch(token):
+        return "redacted"
+    return token
+
+
+def _log_client_error(exc: BaseException) -> None:
+    """Log only the error code, HTTP status, and request id of a ClientError."""
+    if not isinstance(exc, ClientError):
+        return
+    response = exc.response if isinstance(getattr(exc, "response", None), dict) else {}
+    error = response.get("Error")
+    metadata = response.get("ResponseMetadata")
+    error = error if isinstance(error, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    _logger.warning(
+        "media storage diagnostic: code=%s http_status=%s request_id=%s",
+        _diagnostic_token(error.get("Code")),
+        _diagnostic_token(metadata.get("HTTPStatusCode")),
+        _diagnostic_token(metadata.get("RequestId")),
+    )
+
+
+# --- END TEMPORARY DIAGNOSTIC ----------------------------------------------
 
 
 class MediaStorageError(Exception):
@@ -103,6 +145,7 @@ class MediaStorage:
                 config=Config(signature_version="s3v4"),
             )
         except (BotoCoreError, ClientError) as exc:
+            _log_client_error(exc)
             raise MediaStorageError("Unable to initialize media storage") from exc
         self.bucket = bucket
         return self.client
@@ -153,11 +196,13 @@ class MediaStorage:
                     ExtraArgs={"ContentType": media_type},
                 )
             except (BotoCoreError, ClientError, OSError) as exc:
+                _log_client_error(exc)
                 try:
                     await asyncio.to_thread(
                         client.delete_object, Bucket=bucket, Key=storage_key
                     )
-                except (Boto3Error, BotoCoreError, ClientError, OSError):
+                except (Boto3Error, BotoCoreError, ClientError, OSError) as cleanup_exc:
+                    _log_client_error(cleanup_exc)
                     logging.getLogger(__name__).warning(
                         "Failed to clean up media after an upload error"
                     )
@@ -170,6 +215,7 @@ class MediaStorage:
         except HTTPException:
             raise
         except (Boto3Error, BotoCoreError, ClientError, OSError) as exc:
+            _log_client_error(exc)
             raise MediaStorageError("Unable to store media") from exc
         finally:
             if temporary_path:
@@ -186,6 +232,7 @@ class MediaStorage:
                 client.delete_object, Bucket=bucket, Key=storage_key
             )
         except (BotoCoreError, ClientError, OSError) as exc:
+            _log_client_error(exc)
             raise MediaStorageError("Unable to delete media") from exc
 
     async def download_url(self, storage_key: str) -> str:
@@ -201,6 +248,7 @@ class MediaStorage:
                 ExpiresIn=300,
             )
         except (BotoCoreError, ClientError, OSError) as exc:
+            _log_client_error(exc)
             raise MediaStorageError("Unable to access media") from exc
 
 
