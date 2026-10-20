@@ -280,7 +280,7 @@ def create_app() -> FastAPI:
         return {"status": "healthy", "service": "connextionz-api"}
 
     @app.get("/health/ready", tags=["health"])
-    async def readiness_check() -> dict:
+    async def readiness_check() -> JSONResponse:
         """Readiness check — verifies dependencies are available."""
         checks = {}
 
