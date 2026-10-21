@@ -20,7 +20,7 @@ export const PAID_FEED_QUERY = `
     feed(cursor: $cursor, limit: $limit, filter: { algorithm: PAID }) {
       nextCursor
       items {
-        id thumbnail mediaUrl caption views likes isLiked hashtags audio visibility
+        id thumbnail mediaUrl mediaType caption views likes isLiked hashtags audio visibility
         allowComments allowCollabs durationSec comments shares saves isSaved isShared collabWith
         isSponsored sponsoredLabel paidCampaignId paidDeliveryId paidInteractionContext
         creator {

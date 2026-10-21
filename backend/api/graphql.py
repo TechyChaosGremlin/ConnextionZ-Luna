@@ -324,6 +324,9 @@ class PostType:
     tags: Optional[List[str]] = None
     mentions: Optional[List[UUIDScalar]] = None
     sound_track: Optional[str] = None
+    thumbnail: str = ""
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
 
     like_count: int = 0
     comment_count: int = 0
@@ -399,6 +402,7 @@ class LegacyPostType:
     id: UUIDScalar
     thumbnail: str = ""
     media_url: Optional[str] = None
+    media_type: Optional[str] = None
     caption: str = ""
     views: int = 0
     likes: int = 0
@@ -1192,8 +1196,8 @@ class UpdatePostInput:
 
 @strawberry.input
 class PostInput:
-    media_id: UUIDScalar
-    thumbnail_media_id: UUIDScalar
+    media_id: Optional[UUIDScalar] = None
+    thumbnail_media_id: Optional[UUIDScalar] = None
     caption: Optional[str] = None
     mentions: List[UUIDScalar] = strawberry.field(default_factory=list)
     collab_with: Optional[str] = None
@@ -2398,8 +2402,30 @@ def _profile_to_gql(profile) -> ProfileType:
     )
 
 
+def _post_media_fields(post) -> tuple[str, Optional[str], Optional[str]]:
+    attached = [
+        media for media in getattr(post, "media", [])
+        if media.deleted_at is None and media.storage_key
+    ]
+    primary = next((media for media in attached if media.url == post.media_url), None)
+    if primary is None and not post.media_url:
+        primary = next(
+            (media for media in attached if media.media_type.startswith("video/")),
+            attached[0] if attached else None,
+        )
+    thumbnail = post.thumbnail or next(
+        (media.url for media in attached if media.media_type.startswith("image/")), ""
+    )
+    return (
+        thumbnail,
+        primary.url if primary else post.media_url,
+        primary.media_type if primary else getattr(getattr(post, "content_type", None), "value", None),
+    )
+
+
 def _post_to_gql(post) -> PostType:
     """Map a SQLAlchemy ``Post`` ORM instance to the strawberry ``PostType``."""
+    thumbnail, media_url, media_type = _post_media_fields(post)
     return PostType(
         id=post.id,
         user_id=post.user_id,
@@ -2411,6 +2437,9 @@ def _post_to_gql(post) -> PostType:
         tags=post.tags,
         mentions=post.mentions,
         sound_track=post.sound_track,
+        thumbnail=thumbnail,
+        media_url=media_url,
+        media_type=media_type,
         like_count=post.like_count,
         comment_count=post.comment_count,
         share_count=post.share_count,
@@ -3501,7 +3530,7 @@ async def _post(ctx, id) -> Optional[PostType]:
     from repositories.content_repository import PostRepository
     
     try:
-        post_id = UUID_type(id)
+        post_id = id if isinstance(id, UUID_type) else UUID_type(id)
     except ValueError:
         raise ValueError("Invalid post ID")
     
@@ -6419,10 +6448,12 @@ async def _post_to_legacy_post(
         except Exception:
             is_shared = False
 
+    thumbnail, media_url, media_type = _post_media_fields(post)
     return LegacyPostType(
         id=post.id,
-        thumbnail=post.thumbnail or "",
-        media_url=post.media_url,
+        thumbnail=thumbnail,
+        media_url=media_url,
+        media_type=media_type,
         caption=post.caption or "",
         views=post.view_count,
         likes=post.like_count,
@@ -6924,6 +6955,8 @@ async def _create_post_legacy(ctx, input) -> LegacyPostType:
     post_repo = PostRepository(ctx.db)
 
     status = input.status or "published"
+    if status != "draft":
+        raise ValueError("Create a draft and upload media before publishing.")
     post = Post(
         user_id=user.id,
         content_type=CT.VIDEO,
@@ -6938,6 +6971,7 @@ async def _create_post_legacy(ctx, input) -> LegacyPostType:
         allow_collabs=input.allow_collabs,
         duration_sec=input.duration_sec,
         scheduled_at=input.scheduled_at,
+        media=[],
     )
     await post_repo.create(post)
     await _notify_mentions(ctx, input.mentions, user.id, post.id, "post")
@@ -6964,7 +6998,7 @@ async def _create_post_legacy(ctx, input) -> LegacyPostType:
 
 
 async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
-    from repositories.content_repository import PostRepository
+    from repositories.content_repository import MediaRepository, PostRepository
     from app.models.content import ContentStatus as CS
     from app.models.analytics import EventType
     from services.analytics_event_service import AnalyticsEventService
@@ -6977,6 +7011,16 @@ async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
         raise ValueError("Post not found")
     if post.user_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the post author can update this post")
+
+    if input.status in ("published", "scheduled"):
+        attached = await MediaRepository(ctx.db).get_by_post_id(post.id)
+        if not any(media.url == post.media_url and media.storage_key for media in attached):
+            raise ValueError("Upload post media before publishing.")
+        if not any(
+            media.url == post.thumbnail and media.media_type.startswith("image/")
+            for media in attached
+        ):
+            raise ValueError("Upload a post thumbnail before publishing.")
 
     was_published = post.status == CS.PUBLISHED
     for field in (

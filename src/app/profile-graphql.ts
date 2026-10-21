@@ -2,6 +2,7 @@ export type GraphQLPost = {
   id: string;
   thumbnail: string;
   mediaUrl?: string | null;
+  mediaType?: string | null;
   caption: string;
   views: number;
   likes: number;
@@ -244,32 +245,70 @@ export async function uploadMediaFile(file: Blob, filename: string, kind: "media
   return typeof data?.url === "string" ? new URL(data.url, BACKEND_API_URL).toString() : null;
 }
 
-export async function uploadPostMediaFile(file: Blob, filename: string, postId: string): Promise<UploadedPostMedia | null> {
+async function mediaRequest(path: string, init: RequestInit = {}): Promise<Result<Record<string, unknown>>> {
+  let token = getAccessToken();
+  if (accessTokenNeedsRefresh(token)) token = await refreshAccessToken();
+  if (!token) return { ok: false, error: "Sign in again to access post media." };
   try {
-    const form = new FormData();
-    form.append("file", file, filename);
-    const accessToken = getAccessToken();
-    const response = await fetch(`${BACKEND_API_URL}/media/posts/${postId}`, {
-      method: "POST",
-      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-      body: form,
+    const send = (accessToken: string) => fetch(`${BACKEND_API_URL}${path}`, {
+      ...init,
+      headers: { ...init.headers, Authorization: `Bearer ${accessToken}` },
       credentials: "include",
+      cache: "no-store",
     });
-    if (!response.ok) return null;
-    const data = await response.json() as Record<string, unknown>;
-    const contentType = data.contentType ?? data.media_type;
-    if (typeof data.id !== "string" || typeof data.url !== "string" || typeof contentType !== "string") {
-      return null;
+    let response = await send(token);
+    if (response.status === 401) {
+      token = await refreshAccessToken();
+      if (token) response = await send(token);
     }
-    return {
-      id: data.id,
-      url: new URL(data.url, BACKEND_API_URL).toString(),
-      contentType,
-    };
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      return { ok: false, error: typeof body?.detail === "string" ? body.detail : "Post media request failed. Try again." };
+    }
+    return { ok: true, value: await response.json() as Record<string, unknown> };
   } catch (error) {
-    console.warn("Post media upload unavailable", error);
-    return null;
+    if (init.signal?.aborted) return { ok: false, error: "cancelled" };
+    console.warn("Post media request unavailable", error);
+    return { ok: false, error: "Could not reach media storage. Check your connection and try again." };
   }
+}
+
+export async function uploadPostMediaFile(
+  file: Blob, filename: string, postId: string, role: "primary" | "thumbnail" = "primary", signal?: AbortSignal,
+): Promise<Result<UploadedPostMedia>> {
+  const form = new FormData();
+  form.append("file", file, filename);
+  form.append("role", role);
+  const result = await mediaRequest(`/media/posts/${postId}`, { method: "POST", body: form, signal });
+  if (!result.ok) return result;
+  const data = result.value;
+  const contentType = data.contentType ?? data.media_type;
+  if (typeof data.id !== "string" || !data.id || typeof data.url !== "string" || !isProtectedMediaUrl(data.url) || typeof contentType !== "string") {
+    return { ok: false, error: "The server did not return the uploaded media reference." };
+  }
+  return { ok: true, value: { id: data.id, url: data.url, contentType } };
+}
+
+export function isProtectedMediaUrl(src: string): boolean {
+  const base = BACKEND_API_URL || globalThis.location?.origin || "http://localhost";
+  try {
+    const url = new URL(src, base);
+    return url.origin === new URL(base).origin && /^\/media\/[0-9a-f-]+\/content$/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export async function resolvePostMediaUrl(src: string): Promise<Result<string>> {
+  if (!src) return { ok: false, error: "This post has no media reference." };
+  if (!isProtectedMediaUrl(src)) return { ok: true, value: src };
+  const base = BACKEND_API_URL || globalThis.location?.origin || "http://localhost";
+  const path = new URL(src, base).pathname.replace(/\/content$/, "/url");
+  const result = await mediaRequest(path);
+  if (!result.ok) return result;
+  return typeof result.value.url === "string" && result.value.url.startsWith("https://")
+    ? { ok: true, value: result.value.url }
+    : { ok: false, error: "The server did not return a media download URL." };
 }
 
 export async function fetchFeedPageFromApi(cursor: string | null, limit = 10, following = false): Promise<{
@@ -284,6 +323,7 @@ export async function fetchFeedPageFromApi(cursor: string | null, limit = 10, fo
           id
           thumbnail
           mediaUrl
+          mediaType
           caption
           views
           likes
@@ -427,7 +467,7 @@ export async function searchPosts(
       searchPosts(query: $query, after: $after, limit: $limit, hashtag: $hashtag, sortBy: $sortBy) {
         nextCursor
         items {
-          id thumbnail mediaUrl caption views likes isLiked hashtags audio visibility
+          id thumbnail mediaUrl mediaType caption views likes isLiked hashtags audio visibility
           allowComments allowCollabs durationSec comments shares saves isSaved isShared collabWith
           creator { id username displayName avatarUrl avatarColor verified followers isFollowing }
         }
@@ -618,6 +658,7 @@ export async function fetchMeProfile(): Promise<GraphQLProfile | null> {
           id
           thumbnail
           mediaUrl
+          mediaType
           caption
           views
           likes
@@ -760,6 +801,7 @@ export async function fetchProfileByUsername(username: string): Promise<GraphQLP
           id
           thumbnail
           mediaUrl
+          mediaType
           caption
           views
           likes
@@ -843,6 +885,7 @@ const postFields = `
   id
   thumbnail
   mediaUrl
+  mediaType
   caption
   views
   likes
@@ -886,8 +929,8 @@ export async function fetchMyPlaylists(): Promise<GraphQLPlaylist[]> {
 }
 
 export type PostInput = {
-  mediaId: string;
-  thumbnailMediaId: string;
+  mediaId?: string;
+  thumbnailMediaId?: string;
   caption?: string;
   collabWith?: string;
   hashtags?: string[];
@@ -966,22 +1009,22 @@ export async function unsavePost(id: string): Promise<Result<GraphQLSaveResult>>
   return result.ok ? { ok: true, value: result.value.unsavePost } : result;
 }
 
-export async function createPost(input: PostInput): Promise<GraphQLPost | null> {
-  const data = await graphqlRequest<{ createPost: GraphQLPost }>(`
+export async function createPost(input: PostInput): Promise<Result<GraphQLPost>> {
+  const result = await graphqlRequestResult<{ createPost: GraphQLPost }>(`
     mutation CreatePost($input: PostInput!) {
       createPost(input: $input) { ${postFields} }
     }
   `, { input });
-  return data?.createPost ?? null;
+  return result.ok ? { ok: true, value: result.value.createPost } : result;
 }
 
-export async function updatePost(id: string, input: Partial<PostInput>): Promise<GraphQLPost | null> {
-  const data = await graphqlRequest<{ updatePost: GraphQLPost }>(`
+export async function updatePost(id: string, input: Partial<PostInput>): Promise<Result<GraphQLPost>> {
+  const result = await graphqlRequestResult<{ updatePost: GraphQLPost }>(`
     mutation UpdatePost($id: UUID!, $input: UpdatePostInput!) {
       updatePost(id: $id, input: $input) { ${postFields} }
     }
   `, { id, input });
-  return data?.updatePost ?? null;
+  return result.ok ? { ok: true, value: result.value.updatePost } : result;
 }
 
 export async function deletePost(id: string): Promise<boolean> {

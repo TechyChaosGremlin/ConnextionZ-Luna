@@ -11,17 +11,8 @@
 //   capturePoster()      →  grab a frame as the post's thumbnail, which is what
 //                           the feed and every profile grid actually render
 //
-// The picked file is never what gets stored. The preview plays from an object
-// URL that lives as long as the tab does, and what is persisted is the poster —
-// a downscaled JPEG — plus the metadata. That is deliberately the same split a
-// real client has: the blob goes to object storage, the record goes to the API.
-//
-// ── Replacing this with a real backend ──────────────────────────────────────
-// `publishPost()` in `posts-store.ts` is the seam for `POST /media` (multipart,
-// or a signed-URL PUT) followed by `POST /posts`. Use `revokeMedia()` once the
-// upload resolves. Client-side checks are for feedback only — the server must
-// re-validate type, size, duration and dimensions, since anything here can be
-// bypassed.
+// The original file and generated poster are uploaded by `publishPost`.
+// Object URLs are only composer previews, never durable post references.
 
 import { type Result } from "./auth-store";
 
@@ -49,6 +40,7 @@ export const POSTER_WIDTH = 720;
 export type MediaKind = "video" | "image";
 
 export interface PickedMedia {
+  file: File;
   kind: MediaKind;
   /** Object URL — playable/renderable for the life of the tab. */
   url: string;
@@ -135,7 +127,7 @@ export async function readMediaFile(file: File): Promise<Result<PickedMedia>> {
     return {
       ok: true,
       value: {
-        kind, url, width: img.naturalWidth, height: img.naturalHeight,
+        file, kind, url, width: img.naturalWidth, height: img.naturalHeight,
         durationSec: 0, name: file.name, bytes: file.size, type: file.type,
       },
     };
@@ -155,7 +147,7 @@ export async function readMediaFile(file: File): Promise<Result<PickedMedia>> {
   return {
     ok: true,
     value: {
-      kind, url,
+      file, kind, url,
       width: video.videoWidth || 0,
       height: video.videoHeight || 0,
       durationSec: duration,
@@ -187,8 +179,8 @@ function seekTo(video: HTMLVideoElement, seconds: number): Promise<boolean> {
  * scaled to `POSTER_WIDTH` and encoded as JPEG. This is what gets persisted and
  * what every grid tile renders, so it is deliberately small.
  *
- * Falls back to `null` rather than failing the publish — a post with no poster
- * still renders, because `<Thumb>` has its own placeholder.
+ * Returns null if a frame cannot be captured; video publishing then reports
+ * an error rather than leaving an empty profile tile.
  */
 export async function capturePoster(media: PickedMedia, atSeconds = 0.1): Promise<string | null> {
   const source = media.kind === "image"

@@ -288,7 +288,7 @@ async def test_private_media_requires_owner_or_admin(monkeypatch):
 @pytest.mark.asyncio
 async def test_media_content_redirects_to_presigned_url(monkeypatch):
     user = make_user()
-    media = SimpleNamespace(id=uuid.uuid4(), user_id=user.id, post_id=uuid.uuid4(), storage_key="uploads/a.jpg")
+    media = SimpleNamespace(id=uuid.uuid4(), user_id=user.id, post_id=uuid.uuid4(), storage_key="uploads/a.jpg", media_type="image/jpeg")
     post = SimpleNamespace(id=media.post_id, user_id=user.id, visibility="public")
     db = AsyncMock()
 

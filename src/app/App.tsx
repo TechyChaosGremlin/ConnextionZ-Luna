@@ -20,6 +20,8 @@ import { activateLikeGraph, useLike } from "./like-store";
 import { activateSaveGraph, useSave } from "./save-store";
 import { activateShareGraph, useShare } from "./share-store";
 import { activatePosts } from "./posts-store";
+import { Thumb } from "./profile-ui";
+import { PostMedia } from "./post-media";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Heart, MessageCircle, Bookmark, Music,
@@ -50,8 +52,9 @@ interface DisplayVideo {
   shares: number;
   saves: number;
   thumbnail: string;
-  /** An uploaded video file, when the post has one — image-only posts have none. */
+  /** The post's uploaded image or video. */
   mediaUrl?: string;
+  mediaType?: string;
   durationSec?: number;
   isLiked: boolean;
   isSaved: boolean;
@@ -76,33 +79,11 @@ function toDisplayVideo(item: FeedVideo): DisplayVideo {
     saves: item.saves,
     thumbnail: item.thumbnail,
     mediaUrl: item.mediaUrl,
+    mediaType: item.mediaType,
     durationSec: item.durationSec,
     isLiked: item.isLiked ?? false,
     isSaved: item.isSaved ?? false,
   };
-}
-
-/** The video background for a slide whose post has an uploaded video file. */
-function PostVideo({ mediaUrl, isActive, paused }: { mediaUrl: string; isActive: boolean; paused: boolean }) {
-  const ref = useRef<HTMLVideoElement>(null);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    if (isActive && !paused) el.play().catch(() => {});
-    else el.pause();
-  }, [isActive, paused]);
-
-  return (
-    <video
-      ref={ref}
-      src={mediaUrl}
-      loop
-      muted
-      playsInline
-      className="absolute inset-0 w-full h-full object-cover"
-    />
-  );
 }
 
 // ─── COMMENTS DATA ───────────────────────────────────────────────────────────
@@ -981,12 +962,13 @@ export default function App() {
               className="absolute inset-0"
               onClick={() => setPaused((p) => !p)}
             >
-              <div className="absolute inset-0 bg-cover bg-center" style={{ backgroundImage: `url(${video.thumbnail})` }} />
-
-              {/* Uploaded video background — image-only posts fall back to the thumbnail above */}
-              {video.mediaUrl && (
-                <PostVideo
-                  mediaUrl={video.mediaUrl}
+              <Thumb src={video.thumbnail} className="absolute inset-0 w-full h-full object-cover" />
+              {(video.mediaUrl || !video.thumbnail) && (
+                <PostMedia
+                  src={video.mediaUrl ?? ""}
+                  mediaType={video.mediaType}
+                  alt={`Post by @${video.username}`}
+                  className="absolute inset-0 w-full h-full object-cover"
                   isActive={idx === feed.findIndex((v) => v.id === video.id)}
                   paused={paused}
                 />

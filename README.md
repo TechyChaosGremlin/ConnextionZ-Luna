@@ -51,6 +51,35 @@
   Run `npm run test:profile-navigation` for navigation and backend-identity
   regressions.
 
+  ## Post media uploads
+
+  The composer creates a backend draft, uploads the original file through
+  `POST /media/posts/{postId}`, then publishes that same post ID. Videos also
+  upload a JPEG thumbnail with multipart `role=thumbnail`; image posts use the
+  original image for their thumbnail. Failed uploads remain unpublished drafts
+  and show an error. Retrying in the composer reuses its draft ID.
+
+  Uploads persist the media storage key and MIME type, plus stable
+  `/media/{mediaId}/content` references on the post. Profile, feed, and post
+  queries return those references and `mediaType`. Older attached media rows
+  with missing post references are resolved on reads without a database backfill.
+  Local caching retains stable references, never blob URLs or signed URLs.
+
+  The existing S3-compatible configuration supplies the bucket name and endpoint;
+  the bucket does not need to be public. Media renderers request
+  `GET /media/{mediaId}/url` with the session bearer token to obtain a private,
+  five-minute signed download URL. URLs are resolved again on mount/reload and
+  once automatically on a media load error; persistent failures show an error.
+  Image posts render as images, not video elements.
+
+  Run `npm run test:media` and
+  `.venv\Scripts\python.exe -m pytest backend/tests/test_media_upload.py backend/tests/test_post_media_pipeline.py`
+  for focused regressions. These tests mock storage and database repositories;
+  they do not upload to the live bucket or modify production data. The existing
+  live-storage smoke test remains opt-in for an explicitly approved nonproduction
+  target. No bucket-policy, environment-variable, or database-schema changes
+  are required for this fix.
+
   ## Local registration setup
 
   Use `http://localhost:5173` for the frontend, not the hosted site.

@@ -5,6 +5,7 @@ import { useTheme } from "./ThemeContext";
 import { ACCENT, EmptyState, SubPage, useTokens, type Tokens } from "./settings-ui";
 import { usePaidFeed, type PaidFeedState } from "./paid-feed-store.ts";
 import type { PaidFeedItem } from "./paid-feed-graphql.ts";
+import { PostMedia } from "./post-media";
 
 export function PaidDiscoveryLink({ onOpen }: { onOpen: () => void }) {
   return (
@@ -38,14 +39,9 @@ function PaidPostCard({ item, t }: { item: PaidFeedItem; t: Tokens }) {
           {label}
         </span>
       </div>
-      {item.mediaUrl ? (
-        <video src={item.mediaUrl} poster={item.thumbnail || undefined} controls playsInline
-          preload="none" aria-label={`Paid video by @${item.creator.username}`}
-          className="w-full max-h-[440px] object-contain bg-black" />
-      ) : item.thumbnail ? (
-        <img src={item.thumbnail} alt={`Post by @${item.creator.username}`}
-          loading="lazy" className="w-full max-h-[440px] object-contain" />
-      ) : null}
+      <PostMedia src={item.mediaUrl || item.thumbnail} mediaType={item.mediaType ?? (item.mediaUrl ? "video" : "image")}
+        controls alt={`Paid video by @${item.creator.username}`}
+        className="w-full max-h-[440px] object-contain bg-black" />
       {item.caption && (
         <p className="p-4 text-[14px] leading-relaxed whitespace-pre-wrap break-words"
           style={{ color: t.body }}>{item.caption}</p>

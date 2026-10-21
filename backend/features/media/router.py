@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import logging
 import uuid
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db_session
 from app.models.analytics import EventType
 from app.models.base import generate_uuidv7
-from app.models.content import Media
+from app.models.content import ContentType, Media
 from app.models.user import User, UserRole
 from app.rate_limits import (
     UPLOAD_VOLUME_ACTION,
@@ -50,6 +51,7 @@ async def upload_media(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
+    role: Annotated[Literal["primary", "thumbnail"], Form()] = "primary",
 ) -> dict[str, object]:
     post = await PostRepository(db).get_by_id(post_id)
     if not post:
@@ -80,6 +82,14 @@ async def upload_media(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Media upload failed"
         ) from exc
 
+    if role == "thumbnail" and not stored.media_type.startswith("image/"):
+        try:
+            await media_storage.delete(stored.storage_key)
+        except MediaStorageError as exc:
+            logger.error("Failed to clean up an invalid post thumbnail")
+            raise HTTPException(status_code=503, detail="Thumbnail upload cleanup failed") from exc
+        raise HTTPException(status_code=415, detail="A post thumbnail must be an image")
+
     media = Media(
         id=media_id,
         post_id=post.id,
@@ -93,6 +103,15 @@ async def upload_media(
     )
     try:
         await MediaRepository(db).create(media)
+        if role == "thumbnail":
+            post.thumbnail = media.url
+        else:
+            post.media_url = media.url
+            post.content_type = (
+                ContentType.VIDEO if media.media_type.startswith("video/") else ContentType.IMAGE
+            )
+            if post.content_type == ContentType.IMAGE:
+                post.thumbnail = media.url
         if media.media_type.startswith("video/"):
             await AnalyticsEventService(db).track_event(
                 event_type=EventType.VIDEO_UPLOADED,
@@ -102,6 +121,7 @@ async def upload_media(
             )
         await db.commit()
     except Exception:
+        logger.exception("Failed to persist uploaded post media")
         await db.rollback()
         try:
             await media_storage.delete(stored.storage_key)
@@ -145,6 +165,25 @@ async def get_media_content(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> RedirectResponse:
+    payload = await _authorized_media_url(media_id, current_user, db)
+    return RedirectResponse(str(payload["url"]), headers={"Cache-Control": "private, no-store"})
+
+
+@router.get("/{media_id}/url")
+async def get_media_url(
+    media_id: uuid.UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> JSONResponse:
+    return JSONResponse(
+        await _authorized_media_url(media_id, current_user, db),
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+async def _authorized_media_url(
+    media_id: uuid.UUID, current_user: User, db: AsyncSession,
+) -> dict[str, object]:
     media = await _get_media_or_404(db, media_id)
     post = await PostRepository(db).get_by_id(media.post_id)
     if not post:
@@ -152,7 +191,11 @@ async def get_media_content(
     if post.visibility != "public" and not _can_manage(current_user, media.user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to view media")
     try:
-        return RedirectResponse(await media_storage.download_url(media.storage_key))
+        return {
+            "url": await media_storage.download_url(media.storage_key),
+            "expires_in": 300,
+            "media_type": media.media_type,
+        }
     except MediaStorageError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Media is unavailable"

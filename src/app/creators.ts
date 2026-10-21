@@ -29,6 +29,7 @@
 export interface ContentItem {
   id: string;
   thumbnail: string;
+  mediaType?: string;
   caption: string;
   views: number;
   likes: number;
@@ -56,7 +57,7 @@ export interface FeedVideo extends ContentItem {
   comments: number;
   shares: number;
   saves: number;
-  /** An uploaded video file, when the post has one — image-only posts have none. */
+  /** Durable media reference, for either an image or a video. */
   mediaUrl?: string;
   durationSec?: number;
   /** Whether the signed-in viewer has already liked this post. */

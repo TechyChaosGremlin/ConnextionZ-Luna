@@ -27,6 +27,7 @@ import { ACCENT, useTokens } from "./settings-ui";
 import { type Creator } from "./creators";
 import { useFollow, useFollowerCount } from "./follow-store";
 import { useViewer } from "./session";
+import { useMediaSource } from "./post-media";
 
 // ─── FORMATTING ──────────────────────────────────────────────────────────────
 
@@ -573,16 +574,18 @@ export function CreatorRow({
 export function Thumb({
   src, alt = "", className = "", style,
 }: { src: string; alt?: string; className?: string; style?: CSSProperties }) {
-  const [failed, setFailed] = useState<string | null>(null);
+  const media = useMediaSource(src);
 
-  if (!src || failed === src) {
+  if (!src || !media.url) {
     return (
-      <span aria-hidden className={className}
-        style={{ ...style, background: "linear-gradient(135deg, rgba(0,174,239,0.22), rgba(124,58,237,0.18))" }} />
+      <span className={className} role={src && media.error ? "alert" : undefined}
+        style={{ ...style, background: "linear-gradient(135deg, rgba(0,174,239,0.22), rgba(124,58,237,0.18))" }}>
+        {src && media.error ? "Media unavailable" : null}
+      </span>
     );
   }
   return (
-    <img src={src} alt={alt} loading="lazy" onError={() => setFailed(src)}
+    <img src={media.url} alt={alt} loading="lazy" onError={media.onError}
       className={className} style={style} />
   );
 }
@@ -607,7 +610,9 @@ export function ContentGrid({
         const openable = !!onOpen && (!canOpen || canOpen(item.id));
         const overlay = (
           <>
-            <Thumb src={item.thumbnail} className="absolute inset-0 w-full h-full object-cover" />
+            {item.thumbnail
+              ? <Thumb src={item.thumbnail} className="absolute inset-0 w-full h-full object-cover" />
+              : <span role="alert" className="absolute inset-0 flex items-center justify-center text-xs">Media unavailable</span>}
             <span className="absolute inset-x-0 bottom-0 h-14"
               style={{ background: "linear-gradient(to top, rgba(0,0,0,0.75), transparent)" }} />
             <span className="absolute bottom-1.5 left-2 text-white text-[11px] font-bold drop-shadow">

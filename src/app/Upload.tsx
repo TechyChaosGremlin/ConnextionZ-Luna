@@ -31,7 +31,7 @@ import {
 } from "./posts-store";
 import { CREATORS } from "./creators";
 import { useFollowingCreators } from "./follow-store";
-import { Avatar } from "./profile-ui";
+import { Avatar, Thumb } from "./profile-ui";
 
 type Stage = "pick" | "compose" | "uploading" | "published";
 
@@ -71,15 +71,11 @@ export function UploadScreen({
 
   const fileRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  // The preview is freed on unmount unless the post was published, in which case
-  // the store owns the URL and the feed is still playing from it.
-  const keepMedia = useRef(false);
-
   const hashtags = parseHashtags(tagInput);
 
   useEffect(() => () => {
     abortRef.current?.abort();
-    if (!keepMedia.current) revokeMedia(media);
+    revokeMedia(media);
   }, [media]);
 
   // ── Picking ───────────────────────────────────────────────────────────────
@@ -91,9 +87,6 @@ export function UploadScreen({
     const result = await readMediaFile(file);
     setReading(false);
     if (!result.ok) { setError(result.error); return; }
-    // A fresh pick is this screen's to free again — the flag only protects the
-    // media of a post that has actually been published.
-    keepMedia.current = false;
     // Replacing a pick frees the one it replaces.
     setMedia((previous) => { revokeMedia(previous); return result.value; });
     setStage("compose");
@@ -146,7 +139,6 @@ export function UploadScreen({
       setStage("compose");
       return;
     }
-    keepMedia.current = true;
     setPublished(result.value);
     setStage("published");
     onPublished?.(result.value);
@@ -158,8 +150,6 @@ export function UploadScreen({
   };
 
   const postAnother = () => {
-    // The published post owns its media now, so this pick is handed over rather
-    // than revoked — the composer just starts again with an empty one.
     setMedia(null);
     setPublished(null);
     setCaption("");
@@ -413,7 +403,7 @@ export function UploadScreen({
               style={{ background: t.groupBg, border: t.groupBorder }}>
               <div className="w-16 h-20 rounded-xl overflow-hidden flex-shrink-0" style={{ background: "rgba(0,0,0,0.25)" }}>
                 {published.thumbnail
-                  ? <img src={published.thumbnail} alt="" className="w-full h-full object-cover" />
+                  ? <Thumb src={published.thumbnail} className="w-full h-full object-cover" />
                   : <div className="w-full h-full" style={{ background: "linear-gradient(135deg, rgba(0,174,239,0.22), rgba(124,58,237,0.18))" }} />}
               </div>
               <div className="min-w-0 flex-1">
