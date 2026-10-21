@@ -72,6 +72,71 @@
   once automatically on a media load error; persistent failures show an error.
   Image posts render as images, not video elements.
 
+  On your own Profile, **Repair missing media** lists your loaded video posts with
+  missing media/thumbnail references. Select the existing post, choose a video
+  and a JPEG thumbnail (up to 8MB), review both previews, and explicitly confirm.
+  A post with an attached video but no thumbnail needs only the JPEG. This uploads
+  new copies; it does not find or restore an unidentified original storage object.
+  The existing post UUID, caption, visibility, engagement and relationships are
+  preserved; no create-post or publish mutation is sent. Upload timestamps and
+  normal video-upload analytics may change.
+
+  Repair reuses the authenticated multipart endpoint with `repair_missing=true`.
+  Normal and repair uploads both check missing-slot preconditions, upload outside
+  the row lock, then lock/refetch the post and recheck ownership, media references
+  and missing-slot preconditions before attaching. Competing requests return
+  HTTP 409 and clean up only their own staged object; existing media is never
+  replaced by this endpoint. Primary uploads require no active media rows or
+  post media references. Thumbnail repair sends `expected_primary_id`, the
+  confirmed video's media UUID, and requires that same associated video and an
+  empty thumbnail both before storage I/O and under the final lock. Byte validation
+  requires video for primary repair and JPEG for thumbnail repair.
+  The normal composer keeps a random `upload_id` per file in the current draft
+  and verifies it through the owner/admin-only
+  `GET /media/posts/{post_id}/uploads/{upload_id}?role=primary|thumbnail` receipt
+  endpoint before retrying. A receipt confirms the exact active media row and
+  current post slot; thumbnail receipts also check the confirmed primary ID.
+  Missing receipts permit retry with the same identity, not adoption of another
+  upload. Every attempt stages a separate object key, so even concurrent attempts
+  with the same receipt ID cannot overwrite each other's bytes. Confirmed
+  attachments are retained across thumbnail/publish retries. Publication sends
+  those confirmed media IDs; the server checks them under the same post lock
+  before changing status, so a deleted/replaced slot cannot be published instead.
+  Identities live only in the open composer; a reload does not automatically
+  resume a draft. Normal thumbnail uploads also require an active primary.
+  The repair dialog still fails closed on a lost response and requires
+  close/reload/review before continuing.
+  The two files commit separately: a failed JPEG upload leaves the video attached.
+  Retry keeps confirmed uploads and checks the authenticated profile before sending
+  only the missing file. If a response was lost or another upload won the race,
+  the guard rejects overwriting; close/reload and review the post before continuing.
+  Upload completion is verified by re-reading the same post. Repair is limited
+  to posts returned by the current profile query and cannot identify bucket
+  objects or replace existing media.
+
+  No database reservation or migration is used. Concurrent attempts can stage
+  separate objects before one loses the final precondition check. Failed cleanup
+  is reported explicitly and may require operator review. The focused interleaving
+  unit tests simulate row locking and storage. Separate opt-in PostgreSQL tests
+  exercise real row locks and transaction visibility with storage still mocked.
+
+  Failure before commit is rolled back before staged-object cleanup. Once commit
+  has been attempted, any exception is treated conservatively as an uncertain
+  outcome: the object is retained and HTTP 503 requests verification/retry. A
+  rollback after a missing commit acknowledgement is not proof that commit failed.
+  This can leave an orphan, but cannot intentionally delete possibly committed media.
+
+  Individual media deletion and post/account deletion acquire the post locks,
+  detach references and soft-delete media in the database, then clean storage only
+  after a confirmed commit. Delete a video's thumbnail before its primary video;
+  otherwise individual primary deletion returns HTTP 409. Concurrent thumbnail
+  repair either wins that lock (and blocks primary deletion) or detects the deleted
+  primary before attaching. Other posts' live URL references block deletion;
+  shared storage objects are retained while another active row/reference needs them.
+  A failed individual cleanup leaves a tombstone so the same media DELETE can
+  retry. Cleanup failures after whole-post/account deletion may require operator
+  review. No object keys are returned by the receipt or error responses.
+
   Run `npm run test:media` and
   `.venv\Scripts\python.exe -m pytest backend/tests/test_media_upload.py backend/tests/test_post_media_pipeline.py`
   for focused regressions. These tests mock storage and database repositories;
@@ -79,6 +144,30 @@
   live-storage smoke test remains opt-in for an explicitly approved nonproduction
   target. No bucket-policy, environment-variable, or database-schema changes
   are required for this fix.
+
+  For real PostgreSQL media race tests, install local PostgreSQL binaries with
+  `initdb` and `pg_ctl` on PATH, then run in PowerShell:
+
+  ```powershell
+  $env:MEDIA_TEST_LOCAL_POSTGRES = "1"
+  & .\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider -c backend\pyproject.toml -o "addopts=" backend\tests\test_media_postgres.py -q
+  Remove-Item Env:\MEDIA_TEST_LOCAL_POSTGRES
+  ```
+
+  This test-only fixture initializes a fresh temporary cluster with generated
+  credentials on a loopback-only ephemeral port. It never consumes a database URL
+  from application settings or test environment variables. Each case creates and
+  drops its own schema; the cluster is stopped and its temporary files removed
+  afterward. No migrations, real accounts, or remote storage are used.
+  The tests run the production repositories and independent SQLAlchemy sessions
+  using READ COMMITTED, `autoflush=False`, and `expire_on_commit=False`. They
+  observe PostgreSQL lock waits with `pg_blocking_pids` and verify committed rows
+  from independent sessions. Coverage includes normal/repair slot contention,
+  thumbnail repair versus primary deletion in both orders, live-reference
+  preservation, and reattachment while old-object cleanup is paused.
+  Commit-acknowledgement loss is injected before/after a real commit: this checks
+  the handler's conservative cleanup behavior, not actual network fault recovery.
+  Hosted pooler behavior and live storage remain outside these tests.
 
   ## Local registration setup
 

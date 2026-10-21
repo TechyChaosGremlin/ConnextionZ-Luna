@@ -275,15 +275,36 @@ async function mediaRequest(path: string, init: RequestInit = {}): Promise<Resul
 
 export async function uploadPostMediaFile(
   file: Blob, filename: string, postId: string, role: "primary" | "thumbnail" = "primary", signal?: AbortSignal,
+  repairMissing = false,
+  expectedPrimaryId?: string,
+  uploadId?: string,
 ): Promise<Result<UploadedPostMedia>> {
+  if (uploadId) {
+    const receipt = await mediaRequest(
+      `/media/posts/${postId}/uploads/${uploadId}?role=${role}` +
+      (expectedPrimaryId ? `&expected_primary_id=${expectedPrimaryId}` : ""),
+      { signal },
+    );
+    if (!receipt.ok) return receipt;
+    if (receipt.value.attachment !== null) return uploadedMediaResult(receipt.value, uploadId);
+  }
   const form = new FormData();
   form.append("file", file, filename);
   form.append("role", role);
+  if (repairMissing) form.append("repair_missing", "true");
+  if (expectedPrimaryId) form.append("expected_primary_id", expectedPrimaryId);
+  if (uploadId) form.append("upload_id", uploadId);
   const result = await mediaRequest(`/media/posts/${postId}`, { method: "POST", body: form, signal });
   if (!result.ok) return result;
-  const data = result.value;
+  return uploadedMediaResult(result.value, uploadId);
+}
+
+function uploadedMediaResult(data: Record<string, unknown>, expectedId?: string): Result<UploadedPostMedia> {
   const contentType = data.contentType ?? data.media_type;
-  if (typeof data.id !== "string" || !data.id || typeof data.url !== "string" || !isProtectedMediaUrl(data.url) || typeof contentType !== "string") {
+  if (typeof data.id !== "string" || !data.id || (expectedId && data.id !== expectedId) ||
+      typeof data.url !== "string" || !isProtectedMediaUrl(data.url) ||
+      (expectedId && new URL(data.url, BACKEND_API_URL || globalThis.location?.origin || "http://localhost").pathname !== `/media/${expectedId}/content`) ||
+      typeof contentType !== "string") {
     return { ok: false, error: "The server did not return the uploaded media reference." };
   }
   return { ok: true, value: { id: data.id, url: data.url, contentType } };

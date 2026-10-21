@@ -31,13 +31,16 @@ class PostRepository(BaseRepository[Post]):
         """Initialize with database session."""
         super().__init__(db, Post)
 
-    async def get_by_id(self, post_id: uuid.UUID, include_deleted: bool = False) -> Optional[Post]:
+    async def get_by_id(
+        self, post_id: uuid.UUID, include_deleted: bool = False, *, for_update: bool = False,
+    ) -> Optional[Post]:
         """
         Get post by ID.
 
         Args:
             post_id: Post ID (UUID)
             include_deleted: Whether to include soft-deleted posts
+            for_update: Lock and refresh the post for a guarded media repair
 
         Returns:
             Post object or None if not found
@@ -45,6 +48,8 @@ class PostRepository(BaseRepository[Post]):
         stmt = select(Post).where(Post.id == post_id)
         if not include_deleted:
             stmt = stmt.where(Post.deleted_at.is_(None))
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -529,16 +534,36 @@ class MediaRepository(BaseRepository[Media]):
         stmt = select(Media).where(Media.id == media_id)
         if not include_deleted:
             stmt = stmt.where(Media.deleted_at.is_(None))
-        result = await self.db.execute(stmt)
+        result = await self.db.execute(stmt.execution_options(populate_existing=True))
         return result.scalar_one_or_none()
 
-    async def get_by_post_id(self, post_id: uuid.UUID) -> list[Media]:
+    async def get_by_post_id(self, post_id: uuid.UUID, *, include_deleted: bool = False) -> list[Media]:
+        stmt = select(Media).where(Media.post_id == post_id)
+        if not include_deleted:
+            stmt = stmt.where(Media.deleted_at.is_(None))
         result = await self.db.execute(
-            select(Media)
-            .where(Media.post_id == post_id, Media.deleted_at.is_(None))
-            .order_by(Media.created_at.asc())
+            stmt.order_by(Media.created_at.asc()).execution_options(populate_existing=True)
         )
         return list(result.scalars().all())
+
+    async def has_live_references(self, storage_key: str, url: str) -> bool:
+        statement = select(or_(
+            select(Media.id).where(
+                Media.storage_key == storage_key, Media.deleted_at.is_(None),
+            ).exists(),
+            select(Post.id).where(
+                Post.deleted_at.is_(None), or_(Post.media_url == url, Post.thumbnail == url),
+            ).exists(),
+        ))
+        return bool(await self.db.scalar(statement))
+
+    async def has_other_post_references(self, media: Media) -> bool:
+        return bool(await self.db.scalar(select(
+            select(Post.id).where(
+                Post.id != media.post_id, Post.deleted_at.is_(None),
+                or_(Post.media_url == media.url, Post.thumbnail == media.url),
+            ).exists(),
+        )))
 
     async def get_by_user_id(self, user_id: uuid.UUID) -> list[Media]:
         result = await self.db.execute(
@@ -546,6 +571,13 @@ class MediaRepository(BaseRepository[Media]):
             .where(Media.user_id == user_id, Media.deleted_at.is_(None))
             .order_by(Media.created_at.asc())
         )
+        return list(result.scalars().all())
+
+    async def get_for_user_deletion(self, user_id: uuid.UUID) -> list[Media]:
+        result = await self.db.execute(select(Media).where(or_(
+            Media.user_id == user_id,
+            Media.post_id.in_(select(Post.id).where(Post.user_id == user_id)),
+        )).execution_options(populate_existing=True))
         return list(result.scalars().all())
 
     async def soft_delete(self, media: Media) -> None:

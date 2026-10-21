@@ -14,6 +14,7 @@ from pydantic import SecretStr
 from starlette.requests import Request
 
 from app.models.user import AccountStatus, User, UserRole
+from app.models.content import ContentType
 from api.graphql import _delete_account, _delete_post
 from features.media.router import delete_media, get_media_content, upload_media
 from services.media_storage import MediaStorage, MediaStorageError, StoredMedia
@@ -183,11 +184,13 @@ async def test_storage_delete_is_safe_to_retry():
 @pytest.mark.asyncio
 async def test_upload_persists_media_for_owned_post(monkeypatch):
     user = make_user()
-    post = SimpleNamespace(id=uuid.uuid4(), user_id=user.id)
+    post = SimpleNamespace(
+        id=uuid.uuid4(), user_id=user.id, media_url=None, thumbnail=None, content_type=ContentType.IMAGE,
+    )
     db = AsyncMock()
     created = []
 
-    async def get_post(self, post_id):
+    async def get_post(self, post_id, **kwargs):
         return post
 
     async def store_file(file, user_id, media_id):
@@ -198,6 +201,7 @@ async def test_upload_persists_media_for_owned_post(monkeypatch):
         return media
 
     monkeypatch.setattr("repositories.content_repository.PostRepository.get_by_id", get_post)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_post_id", AsyncMock(return_value=[]))
     monkeypatch.setattr("features.media.router.media_storage.upload", store_file)
     monkeypatch.setattr("repositories.content_repository.MediaRepository.create", create_media)
 
@@ -236,11 +240,13 @@ async def test_upload_rejects_non_owner_before_storage_access(monkeypatch):
 @pytest.mark.asyncio
 async def test_upload_removes_stored_object_when_persistence_fails(monkeypatch):
     user = make_user()
-    post = SimpleNamespace(id=uuid.uuid4(), user_id=user.id)
+    post = SimpleNamespace(
+        id=uuid.uuid4(), user_id=user.id, media_url=None, thumbnail=None, content_type=ContentType.VIDEO,
+    )
     db = AsyncMock()
     delete_stored = AsyncMock()
 
-    async def get_post(self, post_id):
+    async def get_post(self, post_id, **kwargs):
         return post
 
     async def store_file(file, user_id, media_id):
@@ -250,6 +256,7 @@ async def test_upload_removes_stored_object_when_persistence_fails(monkeypatch):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr("repositories.content_repository.PostRepository.get_by_id", get_post)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_post_id", AsyncMock(return_value=[]))
     monkeypatch.setattr("features.media.router.media_storage.upload", store_file)
     monkeypatch.setattr("features.media.router.media_storage.delete", delete_stored)
     monkeypatch.setattr("repositories.content_repository.MediaRepository.create", create_media)
@@ -319,7 +326,7 @@ async def test_delete_rejects_non_owner(monkeypatch):
     db = AsyncMock()
     delete_stored = AsyncMock()
 
-    async def get_media(self, media_id):
+    async def get_media(self, media_id, **kwargs):
         return media
 
     monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_id", get_media)
@@ -332,112 +339,125 @@ async def test_delete_rejects_non_owner(monkeypatch):
     delete_stored.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_delete_media_cleans_storage_and_persists_record_deletion(monkeypatch):
+@pytest.fixture
+def deletion_state(monkeypatch):
     user = make_user()
+    post = SimpleNamespace(
+        id=uuid.uuid4(), user_id=user.id, media_url="/media/video/content", thumbnail=None,
+    )
     media = SimpleNamespace(
-        id=uuid.uuid4(), user_id=user.id, storage_key="uploads/alice/a.jpg"
+        id=uuid.uuid4(), user_id=user.id, post_id=post.id, url=post.media_url,
+        storage_key="uploads/alice/a.jpg", deleted_at=None,
     )
     db = AsyncMock()
-    delete_stored = AsyncMock()
-    soft_delete = AsyncMock()
+    events = []
 
-    async def get_media(self, media_id):
+    async def get_media(self, media_id, **kwargs):
         return media
 
+    async def get_post(self, post_id, **kwargs):
+        return post
+
+    async def get_records(self, *args, **kwargs):
+        return [media]
+
+    async def soft_delete(self, item):
+        item.deleted_at = "synthetic deletion"
+        events.append("detach")
+
+    async def commit():
+        events.append("commit")
+
+    async def cleanup(key):
+        assert events[-1] == "commit"
+        events.append("cleanup")
+
+    delete_stored = AsyncMock(side_effect=cleanup)
+    db.commit.side_effect = commit
     monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_id", get_media)
+    monkeypatch.setattr("repositories.content_repository.PostRepository.get_by_id", get_post)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_post_id", get_records)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_user_id", get_records)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_for_user_deletion", get_records)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.has_live_references", AsyncMock(return_value=False))
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.has_other_post_references", AsyncMock(return_value=False))
     monkeypatch.setattr("repositories.content_repository.MediaRepository.soft_delete", soft_delete)
     monkeypatch.setattr("features.media.router.media_storage.delete", delete_stored)
-
-    await delete_media(media.id, user, db)
-
-    delete_stored.assert_awaited_once_with(media.storage_key)
-    soft_delete.assert_awaited_once_with(media)
-    db.commit.assert_awaited_once()
+    return SimpleNamespace(user=user, post=post, media=media, db=db, cleanup=delete_stored, events=events)
 
 
 @pytest.mark.asyncio
-async def test_failed_storage_cleanup_keeps_media_record_for_retry(monkeypatch):
-    user = make_user()
-    media = SimpleNamespace(
-        id=uuid.uuid4(), user_id=user.id, storage_key="uploads/alice/a.jpg"
-    )
-    db = AsyncMock()
-    soft_delete = AsyncMock()
-    delete_stored = AsyncMock(side_effect=MediaStorageError("Unable to delete media"))
+async def test_delete_media_cleans_storage_after_committed_detachment(deletion_state):
+    state = deletion_state
+    await delete_media(state.media.id, state.user, state.db)
+    assert state.post.media_url is None
+    assert state.media.deleted_at is not None
+    assert state.events == ["detach", "commit", "cleanup"]
+    state.cleanup.assert_awaited_once_with(state.media.storage_key)
 
-    async def get_media(self, media_id):
-        return media
 
-    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_id", get_media)
-    monkeypatch.setattr("repositories.content_repository.MediaRepository.soft_delete", soft_delete)
-    monkeypatch.setattr("features.media.router.media_storage.delete", delete_stored)
-
+@pytest.mark.asyncio
+async def test_failed_storage_cleanup_retains_tombstone_for_safe_retry(deletion_state):
+    state = deletion_state
+    state.cleanup.side_effect = MediaStorageError("Unable to delete media")
     with pytest.raises(HTTPException) as error:
-        await delete_media(media.id, user, db)
-
+        await delete_media(state.media.id, state.user, state.db)
     assert error.value.status_code == 503
-    soft_delete.assert_not_awaited()
-    db.commit.assert_not_awaited()
+    assert state.media.deleted_at is not None
+    assert state.post.media_url is None
+    state.cleanup.side_effect = None
+    await delete_media(state.media.id, state.user, state.db)
+    assert state.cleanup.await_count == 2
+    assert state.db.commit.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_post_deletion_cleans_storage_objects(monkeypatch):
-    from repositories.content_repository import MediaRepository, PostRepository
-
-    user = make_user()
-    post_id = uuid.uuid4()
-    media = SimpleNamespace(storage_key="uploads/alice/post.jpg")
-    db = AsyncMock()
-    delete_stored = AsyncMock()
-
-    async def get_post(self, requested_id):
-        return SimpleNamespace(id=post_id, user_id=user.id)
-
-    async def get_media(self, requested_post_id):
-        return [media]
-
-    async def soft_delete_media(self, media_item):
-        return None
-
-    async def soft_delete_post(self, requested_id):
-        return True
-
-    monkeypatch.setattr(PostRepository, "get_by_id", get_post)
-    monkeypatch.setattr(PostRepository, "soft_delete", soft_delete_post)
-    monkeypatch.setattr(MediaRepository, "get_by_post_id", get_media)
-    monkeypatch.setattr(MediaRepository, "soft_delete", soft_delete_media)
-    monkeypatch.setattr("services.media_lifecycle_service.media_storage.delete", delete_stored)
-    ctx = SimpleNamespace(db=db, require_auth=lambda: user)
-
-    assert await _delete_post(ctx, post_id)
-
-    delete_stored.assert_awaited_once_with(media.storage_key)
-    db.commit.assert_awaited_once()
+@pytest.mark.parametrize("commit_failed", [False, True])
+async def test_delete_never_cleans_objects_with_live_references(deletion_state, monkeypatch, commit_failed):
+    state = deletion_state
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.has_live_references", AsyncMock(return_value=True))
+    if commit_failed:
+        state.db.commit.side_effect = ConnectionError("synthetic uncertain commit")
+        with pytest.raises(HTTPException) as error:
+            await delete_media(state.media.id, state.user, state.db)
+        assert error.value.status_code == 503
+    else:
+        await delete_media(state.media.id, state.user, state.db)
+    state.cleanup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_account_deletion_cleans_owned_storage_objects(monkeypatch):
-    from repositories.content_repository import MediaRepository
+@pytest.mark.parametrize("delete_account", [False, True])
+async def test_post_and_account_deletion_cleanup_follows_commit(deletion_state, monkeypatch, delete_account):
+    state = deletion_state
+    monkeypatch.setattr("repositories.content_repository.PostRepository.soft_delete", AsyncMock(return_value=True))
+    ctx = SimpleNamespace(db=state.db, require_auth=lambda: state.user)
+    if delete_account:
+        assert await _delete_account(ctx)
+        state.db.delete.assert_awaited_once_with(state.user)
+    else:
+        assert await _delete_post(ctx, state.post.id)
+    assert state.events == ["detach", "commit", "cleanup"]
 
-    user = make_user()
-    media = SimpleNamespace(storage_key="uploads/alice/account.jpg")
-    db = AsyncMock()
-    delete_stored = AsyncMock()
 
-    async def get_media(self, user_id):
-        return [media]
+@pytest.mark.asyncio
+async def test_uncertain_delete_commit_preserves_unshared_object(deletion_state):
+    state = deletion_state
+    state.db.commit.side_effect = ConnectionError("synthetic uncertain commit")
+    with pytest.raises(HTTPException) as error:
+        await delete_media(state.media.id, state.user, state.db)
+    assert error.value.status_code == 503
+    state.cleanup.assert_not_awaited()
 
-    async def soft_delete_media(self, media_item):
-        return None
 
-    monkeypatch.setattr(MediaRepository, "get_by_user_id", get_media)
-    monkeypatch.setattr(MediaRepository, "soft_delete", soft_delete_media)
-    monkeypatch.setattr("services.media_lifecycle_service.media_storage.delete", delete_stored)
-    ctx = SimpleNamespace(db=db, require_auth=lambda: user)
-
-    assert await _delete_account(ctx)
-
-    delete_stored.assert_awaited_once_with(media.storage_key)
-    db.delete.assert_awaited_once_with(user)
-    db.commit.assert_awaited_once()
+@pytest.mark.asyncio
+async def test_delete_refuses_dangling_other_post_references(deletion_state, monkeypatch):
+    state = deletion_state
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.has_other_post_references", AsyncMock(return_value=True))
+    with pytest.raises(HTTPException) as error:
+        await delete_media(state.media.id, state.user, state.db)
+    assert error.value.status_code == 409
+    assert state.media.deleted_at is None
+    assert state.post.media_url == state.media.url
+    state.db.commit.assert_not_awaited()
+    state.cleanup.assert_not_awaited()

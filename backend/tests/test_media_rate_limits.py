@@ -17,6 +17,7 @@ from app.dependencies import get_db_session
 from app.errors import register_exception_handlers
 from app.main import RateLimitMiddleware
 from app.models.user import UserRole
+from app.models.content import ContentType
 from app.rate_limits import (
     RATE_LIMIT_MESSAGE,
     UPLOAD_VOLUME_LIMITS,
@@ -51,8 +52,10 @@ def upload_harness(monkeypatch):
 
     monkeypatch.setattr(media_router, "upload_volume_limiter", ActionRateLimiter(UPLOAD_VOLUME_LIMITS))
 
-    async def get_post(self, _post_id):
-        return SimpleNamespace(id=POST_ID, user_id=USER_ONE)
+    async def get_post(self, _post_id, **kwargs):
+        return SimpleNamespace(
+            id=POST_ID, user_id=USER_ONE, media_url=None, thumbnail=None, content_type=ContentType.IMAGE,
+        )
 
     async def store_upload(file, user_id, media_id):
         return StoredMedia("image/jpeg", file.size or 3, f"uploads/{user_id}/{media_id}.jpg")
@@ -60,6 +63,7 @@ def upload_harness(monkeypatch):
     storage_upload = AsyncMock(side_effect=store_upload)
     create_record = AsyncMock(return_value=None)
     monkeypatch.setattr("repositories.content_repository.PostRepository.get_by_id", get_post)
+    monkeypatch.setattr("repositories.content_repository.MediaRepository.get_by_post_id", AsyncMock(return_value=[]))
     monkeypatch.setattr(media_router.media_storage, "upload", storage_upload)
     monkeypatch.setattr("repositories.content_repository.MediaRepository.create", create_record)
 

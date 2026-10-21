@@ -13,7 +13,7 @@ import { useMemo, useSyncExternalStore } from "react";
 import { type Result } from "./auth-store";
 import { type ContentItem, type FeedVideo, OWN_POSTS } from "./creators";
 import { type MediaKind, type PickedMedia, capturePoster } from "./media-upload";
-import { createPost as createBackendPost, updatePost, uploadPostMediaFile } from "./profile-graphql";
+import { createPost as createBackendPost, updatePost, uploadPostMediaFile, type UploadedPostMedia } from "./profile-graphql";
 
 const POSTS_KEY = "connextionz.posts";
 
@@ -186,7 +186,10 @@ export function useOwnFeedVideos(): FeedVideo[] {
 /** Thrown-free stand-in for an aborted request, so callers can branch on it. */
 export const UPLOAD_CANCELLED = "cancelled";
 
-const pendingDrafts = new WeakMap<PickedMedia, { email: string; id: string }>();
+const pendingDrafts = new WeakMap<PickedMedia, {
+  email: string; id: string; primaryId: string; thumbnailId: string;
+  primary?: UploadedPostMedia; thumbnail?: UploadedPostMedia;
+}>();
 
 /**
  * Creates a draft, attaches durable media, then publishes the same post ID.
@@ -230,20 +233,32 @@ export async function publishPost(
   if (!pending || pending.email !== email) {
     const created = await createBackendPost({ ...input, status: "draft" });
     if (!created.ok) return created;
-    pending = { email, id: created.value.id };
+    pending = {
+      email, id: created.value.id,
+      primaryId: crypto.randomUUID(), thumbnailId: crypto.randomUUID(),
+    };
     pendingDrafts.set(media, pending);
   }
   if (options.signal?.aborted) return { ok: false, error: UPLOAD_CANCELLED };
   options.onProgress?.(0.1);
-  const uploaded = await uploadPostMediaFile(media.file, media.name, pending.id, "primary", options.signal);
-  if (!uploaded.ok) return uploaded;
+  if (!pending.primary) {
+    const uploaded = await uploadPostMediaFile(
+      media.file, media.name, pending.id, "primary", options.signal, false, undefined, pending.primaryId,
+    );
+    if (!uploaded.ok) return uploaded;
+    pending.primary = uploaded.value;
+  }
   options.onProgress?.(0.7);
-  if (media.kind === "video" && poster) {
+  if (media.kind === "video" && poster && !pending.thumbnail) {
     try {
       const response = await fetch(poster, { signal: options.signal });
       if (!response.ok) return { ok: false, error: "Could not read the video thumbnail." };
-      const thumbnail = await uploadPostMediaFile(await response.blob(), "poster.jpg", pending.id, "thumbnail", options.signal);
+      const thumbnail = await uploadPostMediaFile(
+        await response.blob(), "poster.jpg", pending.id, "thumbnail", options.signal,
+        false, pending.primary.id, pending.thumbnailId,
+      );
       if (!thumbnail.ok) return thumbnail;
+      pending.thumbnail = thumbnail.value;
     } catch (error) {
       if (options.signal?.aborted) return { ok: false, error: UPLOAD_CANCELLED };
       console.warn("Video thumbnail upload failed", error);
@@ -251,9 +266,12 @@ export async function publishPost(
     }
   }
   if (options.signal?.aborted) return { ok: false, error: UPLOAD_CANCELLED };
-  const completed = await updatePost(pending.id, input);
+  const completed = await updatePost(pending.id, {
+    ...input, mediaId: pending.primary.id, thumbnailMediaId: pending.thumbnail?.id ?? pending.primary.id,
+  });
   if (!completed.ok) return completed;
-  if (!completed.value.mediaUrl || !completed.value.thumbnail) {
+  if (completed.value.mediaUrl !== pending.primary.url ||
+      completed.value.thumbnail !== (pending.thumbnail?.url ?? pending.primary.url)) {
     return { ok: false, error: "The server did not confirm the post's media. Reload your profile before retrying." };
   }
   pendingDrafts.delete(media);
@@ -264,7 +282,7 @@ export async function publishPost(
     views: completed.value.views,
     likes: completed.value.likes,
     kind: media.kind,
-    mediaType: uploaded.value.contentType,
+    mediaType: pending.primary.contentType,
     mediaUrl: completed.value.mediaUrl,
     status: draft.scheduledAt ? "scheduled" : "published",
     createdAt: Date.now(),

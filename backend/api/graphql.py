@@ -1182,6 +1182,8 @@ class CreatePostInput:
 
 @strawberry.input
 class UpdatePostInput:
+    media_id: Optional[UUIDScalar] = None
+    thumbnail_media_id: Optional[UUIDScalar] = None
     caption: Optional[str] = None
     collab_with: Optional[str] = None
     hashtags: Optional[List[str]] = None
@@ -5211,21 +5213,22 @@ async def _create_post(ctx, input) -> PostType:
 async def _delete_post(ctx, id) -> bool:
     """Soft-delete a post. Only the author or admin can delete."""
     from repositories.content_repository import PostRepository
-    from services.media_lifecycle_service import delete_post_media
+    from services.media_lifecycle_service import cleanup_media_objects, delete_post_media
 
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
 
-    post = await post_repo.get_by_id(id)
+    post = await post_repo.get_by_id(id, for_update=True)
     if not post:
         raise ValueError("Post not found")
     if post.user_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the post author can delete this post")
 
-    await delete_post_media(ctx.db, id)
+    cleanup = await delete_post_media(ctx.db, id)
     success = await post_repo.soft_delete(id)
     if success:
         await ctx.db.commit()
+        await cleanup_media_objects(cleanup)
     return success
 
 
@@ -6805,12 +6808,13 @@ async def _comments(ctx, post_id, limit) -> List[CommentGQLType]:
 
 
 async def _delete_account(ctx) -> bool:
-    from services.media_lifecycle_service import delete_user_media
+    from services.media_lifecycle_service import cleanup_media_objects, delete_user_media
 
     user = ctx.require_auth()
-    await delete_user_media(ctx.db, user.id)
+    cleanup = await delete_user_media(ctx.db, user.id)
     await ctx.db.delete(user)
     await ctx.db.commit()
+    await cleanup_media_objects(cleanup)
     return True
 
 
@@ -7006,13 +7010,19 @@ async def _update_post_legacy(ctx, id, input) -> LegacyPostType:
     user = ctx.require_auth()
     post_repo = PostRepository(ctx.db)
 
-    post = await post_repo.get_by_id(id)
+    post = await post_repo.get_by_id(id, for_update=True)
     if not post:
         raise ValueError("Post not found")
     if post.user_id != user.id and user.role.value not in ("admin",):
         raise PermissionError("Only the post author can update this post")
 
     if input.status in ("published", "scheduled"):
+        if (
+            (input.media_id is not None and post.media_url != f"/media/{input.media_id}/content")
+            or (input.thumbnail_media_id is not None
+                and post.thumbnail != f"/media/{input.thumbnail_media_id}/content")
+        ):
+            raise ValueError("Post media changed. Reload before publishing.")
         attached = await MediaRepository(ctx.db).get_by_post_id(post.id)
         if not any(media.url == post.media_url and media.storage_key for media in attached):
             raise ValueError("Upload post media before publishing.")

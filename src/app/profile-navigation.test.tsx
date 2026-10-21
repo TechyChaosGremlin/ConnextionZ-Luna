@@ -106,3 +106,12 @@ test("missing authenticated profile is not replaced with a live demo profile", a
   assert.doesNotMatch(source, /updateAvatar/);
   assert.match(source, /<button onClick=\{onEditProfile\} aria-label="Edit profile"/);
 });
+
+test("repair media action is owner-only and sourced only from authenticated profile posts", async () => {
+  const source = await readFile("src/app/Profile.tsx", "utf8");
+  assert.match(source, /\{isOwner && onRepairMedia && \([\s\S]*?Repair missing media/);
+  const ownScreen = source.slice(source.indexOf("export function OwnProfileScreen"), source.indexOf("// ─── SCREEN"));
+  assert.match(ownScreen, /onRepairMedia=\{posts.some\(canRepairPost\)/);
+  assert.match(ownScreen, /<PostMediaRepair key=\{creator.id\} posts=\{posts\}/);
+  assert.match(source, /posts: state.email === account.email \? state.posts : \[\]/);
+});

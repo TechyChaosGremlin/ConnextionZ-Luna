@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db_session
 from app.models.analytics import EventType
 from app.models.base import generate_uuidv7
-from app.models.content import ContentType, Media
+from app.models.content import ContentType, Media, Post
 from app.models.user import User, UserRole
 from app.rate_limits import (
     UPLOAD_VOLUME_ACTION,
@@ -25,7 +25,7 @@ from app.rate_limits import (
 from features.auth.middleware import get_current_active_user
 from repositories.content_repository import MediaRepository, PostRepository
 from services.analytics_event_service import AnalyticsEventService
-from services.media_lifecycle_service import delete_media_records
+from services.media_lifecycle_service import cleanup_media_objects, delete_media_records
 from services.media_storage import MediaStorageError, media_storage
 
 router = APIRouter(prefix="/media", tags=["media"])
@@ -37,11 +37,56 @@ def _can_manage(user: User, owner_id: uuid.UUID) -> bool:
     return user.id == owner_id or user.role == UserRole.ADMIN
 
 
+async def _rollback_or_unconfirmed(db: AsyncSession) -> None:
+    try:
+        await db.rollback()
+    except Exception as exc:
+        logger.error("Media rollback unavailable; stored objects retained")
+        raise HTTPException(
+            status_code=503,
+            detail="Database confirmation is unavailable. Retry to verify media state; stored objects were retained.",
+        ) from exc
+
+
 async def _get_media_or_404(db: AsyncSession, media_id: uuid.UUID) -> Media:
     media = await MediaRepository(db).get_by_id(media_id)
     if not media:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media not found")
     return media
+
+
+async def _check_upload_state(
+    db: AsyncSession, post: Post | None, user: User, role: str, repair_missing: bool,
+    expected_primary_id: uuid.UUID | None,
+) -> Post:
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if not _can_manage(user, post.user_id):
+        raise HTTPException(status_code=403, detail="Not allowed to upload media")
+    if repair_missing and post.content_type != ContentType.VIDEO:
+        raise HTTPException(status_code=409, detail="This repair workflow is only for existing video posts")
+    attached = await MediaRepository(db).get_by_post_id(post.id)
+    if role == "primary":
+        if attached or post.media_url or post.thumbnail:
+            raise HTTPException(
+                status_code=409, detail="Media already exists. Reload the post before uploading.",
+            )
+    elif post.thumbnail:
+        raise HTTPException(
+            status_code=409, detail="A thumbnail already exists. Reload the post before uploading.",
+        )
+    if role == "thumbnail":
+        if (repair_missing and expected_primary_id is None) or not any(
+            media.url == post.media_url and media.storage_key
+            and (expected_primary_id is None or media.id == expected_primary_id)
+            and (not repair_missing or media.media_type.startswith("video/"))
+            for media in attached
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The confirmed video no longer matches this post. Reload before repairing its thumbnail.",
+            )
+    return post
 
 
 @router.post("/posts/{post_id}", status_code=status.HTTP_201_CREATED)
@@ -52,12 +97,14 @@ async def upload_media(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     role: Annotated[Literal["primary", "thumbnail"], Form()] = "primary",
+    repair_missing: Annotated[bool, Form()] = False,
+    expected_primary_id: Annotated[uuid.UUID | None, Form()] = None,
+    upload_id: Annotated[uuid.UUID | None, Form()] = None,
 ) -> dict[str, object]:
-    post = await PostRepository(db).get_by_id(post_id)
-    if not post:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
-    if not _can_manage(current_user, post.user_id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to upload media")
+    repo = PostRepository(db)
+    post = await repo.get_by_id(post_id)
+    post = await _check_upload_state(db, post, current_user, role, repair_missing, expected_primary_id)
+    initial_state = (post.user_id, post.content_type, post.media_url, post.thumbnail)
 
     try:
         upload_volume_limiter.consume(
@@ -74,34 +121,52 @@ async def upload_media(
             headers={"Retry-After": str(exc.retry_after)},
         ) from exc
 
-    media_id = generate_uuidv7()
+    media_id = upload_id or generate_uuidv7()
+    owner_id = post.user_id if repair_missing else current_user.id
     try:
-        stored = await media_storage.upload(file, current_user.id, media_id)
+        # Retries may reuse a receipt ID, never an object key.
+        stored = await media_storage.upload(file, owner_id, generate_uuidv7())
     except MediaStorageError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Media upload failed"
         ) from exc
 
-    if role == "thumbnail" and not stored.media_type.startswith("image/"):
+    invalid_repair_type = repair_missing and (
+        (role == "primary" and not stored.media_type.startswith("video/"))
+        or (role == "thumbnail" and stored.media_type != "image/jpeg")
+    )
+    if invalid_repair_type or (role == "thumbnail" and not stored.media_type.startswith("image/")):
         try:
             await media_storage.delete(stored.storage_key)
         except MediaStorageError as exc:
-            logger.error("Failed to clean up an invalid post thumbnail")
-            raise HTTPException(status_code=503, detail="Thumbnail upload cleanup failed") from exc
+            logger.error("Failed to clean up an invalid post media upload")
+            detail = (
+                "Invalid media upload cleanup failed"
+                if invalid_repair_type else "Thumbnail upload cleanup failed"
+            )
+            raise HTTPException(status_code=503, detail=detail) from exc
+        if invalid_repair_type:
+            raise HTTPException(status_code=415, detail="Repair requires a video and a JPEG thumbnail")
         raise HTTPException(status_code=415, detail="A post thumbnail must be an image")
 
-    media = Media(
-        id=media_id,
-        post_id=post.id,
-        user_id=current_user.id,
-        media_type=stored.media_type,
-        url=f"/media/{media_id}/content",
-        file_size_bytes=stored.file_size_bytes,
-        storage_provider="s3",
-        storage_key=stored.storage_key,
-        is_processed=False,
-    )
     try:
+        post = await repo.get_by_id(post_id, for_update=True)
+        post = await _check_upload_state(db, post, current_user, role, repair_missing, expected_primary_id)
+        if (post.user_id, post.content_type, post.media_url, post.thumbnail) != initial_state:
+            raise HTTPException(
+                status_code=409, detail="Post media changed during upload. Reload before retrying.",
+            )
+        media = Media(
+            id=media_id,
+            post_id=post.id,
+            user_id=owner_id,
+            media_type=stored.media_type,
+            url=f"/media/{media_id}/content",
+            file_size_bytes=stored.file_size_bytes,
+            storage_provider="s3",
+            storage_key=stored.storage_key,
+            is_processed=False,
+        )
         await MediaRepository(db).create(media)
         if role == "thumbnail":
             post.thumbnail = media.url
@@ -119,10 +184,17 @@ async def upload_media(
                 post=post,
                 metadata={"file_size_bytes": media.file_size_bytes},
             )
-        await db.commit()
+    except HTTPException:
+        await _rollback_or_unconfirmed(db)
+        try:
+            await media_storage.delete(stored.storage_key)
+        except MediaStorageError as exc:
+            logger.error("Failed to clean up media after an upload conflict")
+            raise HTTPException(status_code=503, detail="Conflicting media upload cleanup failed") from exc
+        raise
     except Exception:
-        logger.exception("Failed to persist uploaded post media")
-        await db.rollback()
+        logger.error("Failed to persist uploaded post media")
+        await _rollback_or_unconfirmed(db)
         try:
             await media_storage.delete(stored.storage_key)
         except MediaStorageError:
@@ -132,6 +204,49 @@ async def upload_media(
             detail="Media upload failed",
         )
 
+    try:
+        await db.commit()
+    except Exception:
+        logger.error("Media commit outcome is uncertain; uploaded object retained")
+        await _rollback_or_unconfirmed(db)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Upload confirmation is unavailable. Retry with the same upload identity to verify it."
+                if upload_id else
+                "Upload confirmation is unavailable. Reload the post to verify its media before retrying."
+            ),
+        )
+
+    return _media_payload(media)
+
+
+@router.get("/posts/{post_id}/uploads/{upload_id}")
+async def get_upload_receipt(
+    post_id: uuid.UUID,
+    upload_id: uuid.UUID,
+    role: Literal["primary", "thumbnail"],
+    expected_primary_id: uuid.UUID | None = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    post = await PostRepository(db).get_by_id(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if not _can_manage(current_user, post.user_id):
+        raise HTTPException(status_code=403, detail="Not allowed to verify this upload")
+    media = await MediaRepository(db).get_by_id(upload_id, include_deleted=True)
+    if media is None:
+        return {"attachment": None}
+    reference = post.media_url if role == "primary" else post.thumbnail
+    if (
+        media.post_id != post.id or media.deleted_at is not None or media.url != reference
+        or not media.storage_key
+        or (role == "thumbnail" and not media.media_type.startswith("image/"))
+        or (role == "thumbnail" and expected_primary_id is not None
+            and post.media_url != f"/media/{expected_primary_id}/content")
+    ):
+        raise HTTPException(status_code=409, detail="This upload is no longer attached. Reload before retrying.")
     return _media_payload(media)
 
 
@@ -208,23 +323,24 @@ async def delete_media(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> None:
-    media = await _get_media_or_404(db, media_id)
+    media = await MediaRepository(db).get_by_id(media_id, include_deleted=True)
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
     if not _can_manage(current_user, media.user_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to delete media")
     try:
-        await delete_media_records(db, [media])
-    except MediaStorageError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Media deletion failed"
-        ) from exc
-    try:
+        cleanup = await delete_media_records(db, [media], current_user=current_user)
         await db.commit()
+    except HTTPException:
+        await _rollback_or_unconfirmed(db)
+        raise
     except Exception:
-        await db.rollback()
+        await _rollback_or_unconfirmed(db)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Media deletion failed",
+            status_code=503,
+            detail="Media deletion was not confirmed. Retry to verify; stored objects were retained.",
         )
+    await cleanup_media_objects(cleanup)
 
 
 def _media_payload(media: Media) -> dict[str, object]:

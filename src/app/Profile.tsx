@@ -21,13 +21,15 @@ import { followStateRevision, noteFollowState, useFollowerCount, useFollowingCou
 import { likeStateRevision, noteLikeState } from "./like-store";
 import { useSession } from "./session";
 import { type Result } from "./auth-store";
+import { PostMediaRepair } from "./PostMediaRepair";
+import { canRepairPost } from "./post-media-repair";
 import {
   Avatar, ContentGrid, CollabScorePill, CreatorRow, ProfileActionBar, SegmentedTabs,
   StatCounts, Thumb, VerifiedBadge, formatCount, useScrolled,
 } from "./profile-ui";
 import {
   fetchFollowersPage, fetchFollowingPage, fetchMeProfile, fetchMyFollowersPage, fetchMyFollowingPage,
-  fetchProfileByUsername, type GraphQLProfilePage,
+  fetchProfileByUsername, type GraphQLProfilePage, type GraphQLPost,
 } from "./profile-graphql";
 
 type ProfileTab = "posts" | "playlists" | "collabs";
@@ -42,18 +44,18 @@ export function useOwnCreator() {
   const { account } = useSession();
   const followingCount = useFollowingCount();
   const [attempt, setAttempt] = useState(0);
-  const [state, setState] = useState<{ email: string; creator: Creator | null; error: string }>({
-    email: account.email, creator: null, error: "",
+  const [state, setState] = useState<{ email: string; creator: Creator | null; posts: GraphQLPost[]; error: string }>({
+    email: account.email, creator: null, posts: [], error: "",
   });
 
   useEffect(() => {
     let active = true;
-    setState({ email: account.email, creator: null, error: "" });
+    setState({ email: account.email, creator: null, posts: [], error: "" });
     const readRevision = likeStateRevision();
     fetchMeProfile().then((profile) => {
       if (!active) return;
       if (!profile?.id || !profile.username) {
-        setState({ email: account.email, creator: null, error: "Could not load your creator profile. Try again." });
+        setState({ email: account.email, creator: null, posts: [], error: "Could not load your creator profile. Try again." });
         return;
       }
       profile.posts?.forEach((post) => noteLikeState(post.id, post.isLiked ?? false, post.likes, readRevision));
@@ -91,7 +93,7 @@ export function useOwnCreator() {
           plays: p.plays,
         })),
       };
-      setState({ email: account.email, creator, error: "" });
+      setState({ email: account.email, creator, posts: profile.posts ?? [], error: "" });
     });
 
     return () => { active = false; };
@@ -99,6 +101,7 @@ export function useOwnCreator() {
 
   return {
     creator: state.email === account.email ? state.creator : null,
+    posts: state.email === account.email ? state.posts : [],
     error: state.email === account.email ? state.error : "",
     reload: () => setAttempt((value) => value + 1),
   };
@@ -111,12 +114,18 @@ export function OwnProfileScreen({
   onOpenSettings: () => void;
   onEditProfile: () => void;
 }) {
-  const { creator, error, reload } = useOwnCreator();
+  const { creator, posts, error, reload } = useOwnCreator();
+  const [repairOpen, setRepairOpen] = useState(false);
   const t = useTokens(useTheme());
 
   if (creator) {
-    return <ProfileScreen key={creator.id} creator={creator} isOwner
-      onBack={onBack} onOpenSettings={onOpenSettings} onEditProfile={onEditProfile} />;
+    return <>
+      <ProfileScreen key={creator.id} creator={creator} isOwner
+        onBack={onBack} onOpenSettings={onOpenSettings} onEditProfile={onEditProfile}
+        onRepairMedia={posts.some(canRepairPost) ? () => setRepairOpen(true) : undefined} />
+      {repairOpen && <PostMediaRepair key={creator.id} posts={posts}
+        onClose={() => { setRepairOpen(false); reload(); }} />}
+    </>;
   }
 
   return (
@@ -142,7 +151,7 @@ export function OwnProfileScreen({
 
 export function ProfileScreen({
   creator: initialCreator, isOwner, onBack, onEditProfile, onOpenSettings, onOpenDashboard, onOpenProfile,
-  onMessage, onCollab, onShare, onOpenPost, canOpenPost,
+  onMessage, onCollab, onShare, onOpenPost, canOpenPost, onRepairMedia,
 }: {
   creator: Creator;
   isOwner: boolean;
@@ -161,6 +170,7 @@ export function ProfileScreen({
   onOpenPost?: (postId: string) => void;
   /** Which posts have somewhere to open; the rest render as plain tiles. */
   canOpenPost?: (postId: string) => boolean;
+  onRepairMedia?: () => void;
 }) {
   const isDark = useTheme();
   const t = useTokens(isDark);
@@ -345,6 +355,11 @@ export function ProfileScreen({
             onMessage={onMessage ? () => onMessage(creator) : undefined}
             onCollab={onCollab ? () => onCollab(creator) : undefined}
           />
+          {isOwner && onRepairMedia && (
+            <button type="button" onClick={onRepairMedia} className="mt-3 text-sm font-semibold" style={{ color: ACCENT }}>
+              Repair missing media
+            </button>
+          )}
 
           {!isOwner && (
             <p className="flex items-center gap-1.5 text-[12px] mt-3" style={{ color: t.sub }}>
