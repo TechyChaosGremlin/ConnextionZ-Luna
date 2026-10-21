@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { ArrowLeft, ChevronRight, X, AlertCircle, Loader2, Star } from "lucide-react";
+import { ArrowLeft, ChevronRight, X, AlertCircle, Loader2 } from "lucide-react";
 import { type Account, profileOf, hasPassword, deleteAccount } from "./auth-store";
 import {
   type Preferences, loadPreferences, savePreferences, clearPreferences,
@@ -81,16 +81,18 @@ const ADMIN_SECTIONS: SettingsSection[] = [
 // ─── SETTINGS SCREEN ─────────────────────────────────────────────────────────
 
 export function SettingsScreen({
-  account, onBack, onLogout, onDeleteProfile, onAccountChange, isDark = true, onToggleTheme,
+  account, onBack, onOpenProfile, onLogout, onDeleteProfile, onAccountChange, isDark = true, onToggleTheme, initialRoute = null,
 }: {
   account: Account;
   onBack: () => void;
+  onOpenProfile: () => void;
   onLogout: () => void;
   onDeleteProfile: () => void;
   /** Called after a profile or password edit so the app holds the fresh account. */
   onAccountChange: (account: Account) => void;
   isDark?: boolean;
   onToggleTheme?: () => void;
+  initialRoute?: SettingsRoute | null;
 }) {
   const t = useTokens(isDark);
   const profile = profileOf(account);
@@ -99,7 +101,7 @@ export function SettingsScreen({
   // A stack, not a single route: pages cross-link to each other (Help Center →
   // Report a Problem, Collab Preferences → Response Time), and Back has to
   // return to where you came from rather than always to the list.
-  const [stack, setStack] = useState<SettingsRoute[]>([]);
+  const [stack, setStack] = useState<SettingsRoute[]>(() => initialRoute ? [initialRoute] : []);
   const [prefs, setPrefs] = useState<Preferences>(() => loadPreferences(account.email));
   const [savedPill, setSavedPill] = useState(false);
   const pillTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -139,8 +141,7 @@ export function SettingsScreen({
             <h1 className="font-extrabold text-[26px]" style={{ color: t.heading }}>Settings</h1>
           </div>
 
-          {/* Profile card — doubles as the shortcut into Edit Profile. */}
-          <button onClick={() => push("editProfile")}
+          <button onClick={onOpenProfile} aria-label="View your creator profile"
             className="w-full flex items-center gap-4 p-4 rounded-2xl mb-6 text-left transition-opacity active:opacity-70"
             style={{ background: t.cardBg, border: t.cardBorder }}>
             <div className="w-14 h-14 rounded-full flex items-center justify-center text-white text-xl font-bold flex-shrink-0"
@@ -150,13 +151,7 @@ export function SettingsScreen({
             <div className="min-w-0 flex-1">
               <p className="font-bold text-[16px] truncate" style={{ color: t.heading }}>@{profile.username}</p>
               <p className="text-[13px] truncate" style={{ color: t.sub }}>{account.email}</p>
-              {prefs.privacy.showCollabScore && (
-                <div className="flex items-center gap-1.5 mt-1.5">
-                  <Star className="w-3 h-3" style={{ color: ACCENT, fill: ACCENT }} />
-                  <span className="text-[12px] font-bold" style={{ color: ACCENT }}>4.8</span>
-                  <span className="text-[12px]" style={{ color: t.sub }}>· 312 collabs</span>
-                </div>
-              )}
+              <p className="text-[12px] mt-1.5 font-semibold" style={{ color: ACCENT }}>View creator profile</p>
             </div>
             <ChevronRight className="w-4 h-4 flex-shrink-0" style={{ color: t.chevron }} />
           </button>

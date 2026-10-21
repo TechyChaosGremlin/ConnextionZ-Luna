@@ -6,13 +6,8 @@
 // Keeping it as one component is what stops the two from drifting: a change to
 // the header, the tabs or the grid lands on both by construction.
 //
-// The owner's profile is assembled from the session rather than the directory —
-// see `useOwnCreator` — so an edited bio or a new avatar shows up here the
-// moment it is saved, with no refetch and no second copy of the identity.
-//
-// ── Replacing this with a real backend ──────────────────────────────────────
-// The supplied identity gives the first paint; GraphQL refreshes the profile
-// and viewer-specific interaction state when the screen opens.
+// The owner's identity and content come from authenticated GraphQL `me`,
+// never from the prototype directory or locally seeded posts.
 
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
@@ -21,17 +16,15 @@ import {
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { ACCENT, useTokens, EmptyState } from "./settings-ui";
-import { registerCreator, type Creator, OWN_PLAYLISTS, OWN_STATS } from "./creators";
-import { useOwnContent } from "./posts-store";
+import { registerCreator, type Creator } from "./creators";
 import { followStateRevision, noteFollowState, useFollowerCount, useFollowingCount } from "./follow-store";
 import { likeStateRevision, noteLikeState } from "./like-store";
-import { useSession, useViewer } from "./session";
-import { updateAvatar, type Result } from "./auth-store";
+import { useSession } from "./session";
+import { type Result } from "./auth-store";
 import {
   Avatar, ContentGrid, CollabScorePill, CreatorRow, ProfileActionBar, SegmentedTabs,
   StatCounts, Thumb, VerifiedBadge, formatCount, useScrolled,
 } from "./profile-ui";
-import { AvatarPicker } from "./avatar-picker";
 import {
   fetchFollowersPage, fetchFollowingPage, fetchMeProfile, fetchMyFollowersPage, fetchMyFollowingPage,
   fetchProfileByUsername, type GraphQLProfilePage,
@@ -43,22 +36,28 @@ type ProfileTab = "posts" | "playlists" | "collabs";
 
 /**
  * The signed-in creator as a `Creator`, so the screen has one shape to render.
- * `following` is live from the follow store — unfollowing anyone, from anywhere,
- * moves this number.
+ * Follow-graph changes trigger a fresh read of the backend counts.
  */
-export function useOwnCreator(): Creator {
-  const viewer = useViewer();
+export function useOwnCreator() {
+  const { account } = useSession();
   const followingCount = useFollowingCount();
-  const posts = useOwnContent();
-  const [remoteProfile, setRemoteProfile] = useState<Creator | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const [state, setState] = useState<{ email: string; creator: Creator | null; error: string }>({
+    email: account.email, creator: null, error: "",
+  });
 
   useEffect(() => {
     let active = true;
+    setState({ email: account.email, creator: null, error: "" });
     const readRevision = likeStateRevision();
     fetchMeProfile().then((profile) => {
-      if (!active || !profile) return;
+      if (!active) return;
+      if (!profile?.id || !profile.username) {
+        setState({ email: account.email, creator: null, error: "Could not load your creator profile. Try again." });
+        return;
+      }
       profile.posts?.forEach((post) => noteLikeState(post.id, post.isLiked ?? false, post.likes, readRevision));
-      setRemoteProfile({
+      const creator: Creator = {
         id: profile.id,
         username: profile.username,
         displayName: profile.displayName ?? profile.username,
@@ -70,10 +69,10 @@ export function useOwnCreator(): Creator {
         verified: !!profile.verified,
         online: !!profile.online,
         collabStatus: profile.collabStatus ?? "Available for Collaboration",
-        collabScore: profile.collabScore ?? OWN_STATS.collabScore,
-        collabCount: profile.collabCount ?? OWN_STATS.collabCount,
-        followers: profile.followers ?? OWN_STATS.followers,
-        following: followingCount,
+        collabScore: profile.collabScore ?? 0,
+        collabCount: profile.collabCount ?? 0,
+        followers: profile.followers ?? 0,
+        following: profile.following ?? 0,
         openToCollab: profile.openToCollab ?? true,
         responseTime: profile.responseTime ?? "< 4 hours",
         posts: (profile.posts ?? []).map((p) => ({
@@ -91,37 +90,52 @@ export function useOwnCreator(): Creator {
           itemLabel: p.itemLabel,
           plays: p.plays,
         })),
-      });
+      };
+      setState({ email: account.email, creator, error: "" });
     });
 
     return () => { active = false; };
-  }, [followingCount]);
+  }, [account.email, account.profile, followingCount, attempt]);
 
-  return useMemo<Creator>(() => {
-    const base: Creator = {
-      id: "me",
-      username: viewer.username,
-      displayName: viewer.displayName,
-      avatarUrl: viewer.avatarUrl,
-      avatarColor: viewer.avatarColor,
-      bio: viewer.bio,
-      location: viewer.location,
-      website: viewer.website,
-      verified: false,
-      online: true,
-      collabStatus: "Available for Collaboration",
-      collabScore: OWN_STATS.collabScore,
-      collabCount: OWN_STATS.collabCount,
-      followers: OWN_STATS.followers,
-      following: followingCount,
-      openToCollab: true,
-      responseTime: "< 4 hours",
-      posts,
-      playlists: OWN_PLAYLISTS,
-    };
+  return {
+    creator: state.email === account.email ? state.creator : null,
+    error: state.email === account.email ? state.error : "",
+    reload: () => setAttempt((value) => value + 1),
+  };
+}
 
-    return remoteProfile ?? base;
-  }, [viewer, followingCount, posts, remoteProfile]);
+export function OwnProfileScreen({
+  onBack, onOpenSettings, onEditProfile,
+}: {
+  onBack: () => void;
+  onOpenSettings: () => void;
+  onEditProfile: () => void;
+}) {
+  const { creator, error, reload } = useOwnCreator();
+  const t = useTokens(useTheme());
+
+  if (creator) {
+    return <ProfileScreen key={creator.id} creator={creator} isOwner
+      onBack={onBack} onOpenSettings={onOpenSettings} onEditProfile={onEditProfile} />;
+  }
+
+  return (
+    <div className="absolute inset-0 z-20 flex flex-col px-5 pt-14" style={{ background: t.bg }}>
+      <div className="flex items-center justify-between">
+        <button onClick={onBack} aria-label="Back" style={{ color: t.heading }}>Back</button>
+        <h1 className="text-xl font-bold" style={{ color: t.heading }}>Profile</h1>
+        <button onClick={onOpenSettings} style={{ color: ACCENT }}>Settings</button>
+      </div>
+      <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center" style={{ color: t.body }}>
+        {error ? (
+          <>
+            <p role="alert">{error}</p>
+            <button onClick={reload} className="rounded-full px-4 py-2 font-semibold" style={{ color: ACCENT }}>Retry</button>
+          </>
+        ) : <p role="status">Loading your creator profile...</p>}
+      </div>
+    </div>
+  );
 }
 
 // ─── SCREEN ──────────────────────────────────────────────────────────────────
@@ -150,15 +164,13 @@ export function ProfileScreen({
 }) {
   const isDark = useTheme();
   const t = useTokens(isDark);
-  const { account, setAccount } = useSession();
+  const { account } = useSession();
   const [loadedCreator, setLoadedCreator] = useState<{ username: string; viewer: string; creator: Creator } | null>(null);
   const [profileLoadError, setProfileLoadError] = useState("");
   const creator = !isOwner && loadedCreator?.username === initialCreator.username && loadedCreator.viewer === account.email
     ? loadedCreator.creator : initialCreator;
   const [tab, setTab] = useState<ProfileTab>("posts");
   const [connections, setConnections] = useState<"followers" | "following" | null>(null);
-  const [avatarSaving, setAvatarSaving] = useState(false);
-  const [avatarError, setAvatarError] = useState("");
   const { ref: scrollRef, scrolled } = useScrolled(90);
 
   // Reads the store, not the prop: it moves the instant a follow toggles and
@@ -207,21 +219,6 @@ export function ProfileScreen({
     { id: "playlists", label: "Playlists", count: creator.playlists.length },
     { id: "collabs", label: "Collabs", count: collabPosts.length },
   ];
-
-  /**
-   * The owner can swap their photo straight from the header. It saves on
-   * confirm — unlike Edit Profile, where the photo is staged with the rest of
-   * the form — but both run the same picker, so validation, the crop and the
-   * preview cannot diverge between the two entry points.
-   */
-  const saveAvatar = async (dataUrl: string) => {
-    setAvatarError("");
-    setAvatarSaving(true);
-    const result = await updateAvatar(account.email, dataUrl);
-    setAvatarSaving(false);
-    if (!result.ok) { setAvatarError(result.error); return; }
-    setAccount(result.value);
-  };
 
   return (
     <div className="absolute inset-0 z-20 overflow-hidden" style={{ background: t.bg }}>
@@ -275,18 +272,10 @@ export function ProfileScreen({
           {/* ── Identity ── */}
           <div className="flex items-end justify-between gap-3 mb-4">
             {isOwner ? (
-              <div className="relative">
-                <AvatarPicker
-                  variant="avatarOnly"
-                  avatarUrl={creator.avatarUrl}
-                  name={creator.displayName || creator.username}
-                  color={creator.avatarColor}
-                  onChange={saveAvatar}
-                  size={92}
-                  disabled={avatarSaving}
-                  busy={avatarSaving}
-                />
-              </div>
+              <button onClick={onEditProfile} aria-label="Edit profile">
+                <Avatar src={creator.avatarUrl} name={creator.displayName || creator.username}
+                  color={creator.avatarColor} size={92} ring ringColor={ACCENT} />
+              </button>
             ) : (
               <Avatar src={creator.avatarUrl} name={creator.displayName} color={creator.avatarColor}
                 size={92} ring ringColor={ACCENT} online={creator.online} />
@@ -295,10 +284,6 @@ export function ProfileScreen({
               <CollabScorePill score={creator.collabScore} count={creator.collabCount} />
             </div>
           </div>
-
-          {avatarError && (
-            <p className="text-[12px] mb-3 leading-snug" style={{ color: "#f87171" }} role="alert">{avatarError}</p>
-          )}
 
           <div className="flex items-center gap-2 mb-0.5">
             <h1 className="font-extrabold text-[22px] leading-tight truncate" style={{ color: t.heading }}>

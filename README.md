@@ -34,6 +34,23 @@
   Run `npm run test:social` for the ID/state regressions or
   `npm run test:frontend` for the full frontend test set.
 
+  ## Profile and Settings navigation
+
+  The app uses local screen state in `src/app/App.tsx`, not URL-based routes.
+  The Profile navigation item opens `OwnProfileScreen` inside the authenticated
+  `SessionProvider`. Its identity, counts, posts, and playlists come from the
+  GraphQL `me` response; failed loads show Retry instead of a demo profile.
+
+  Settings is a separate `settings` screen, opened by the profile's Settings
+  button (also available while the profile is loading or unavailable).
+  Edit Profile and the profile-avatar edit shortcut open the existing
+  `editProfile` Settings subroute. Settings Back and its profile card return
+  to the creator profile; the explicit Edit Profile settings row stays intact.
+  No database or deployment configuration changes are required.
+
+  Run `npm run test:profile-navigation` for navigation and backend-identity
+  regressions.
+
   ## Local registration setup
 
   Use `http://localhost:5173` for the frontend, not the hosted site.

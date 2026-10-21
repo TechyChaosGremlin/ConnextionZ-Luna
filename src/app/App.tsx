@@ -3,6 +3,9 @@ import { TrendingSounds } from "./TrendingSounds";
 import { PaidDiscoveryScreen } from "./PaidDiscovery";
 import { AuthFlow } from "./Auth";
 import { SettingsScreen, DeleteProfileModal } from "./Settings";
+import { OwnProfileScreen } from "./Profile";
+import { SessionProvider } from "./session";
+import { type SettingsRoute } from "./SettingsPages";
 import { UploadScreen } from "./Upload";
 import { type Account, getSession, endSession } from "./auth-store";
 import { GoLiveSetup, CreatorLiveView, ViewerLiveView, LiveBannerStrip } from "./LiveStream";
@@ -840,7 +843,8 @@ export default function App() {
   // The signed-in account, restored from the persisted session on load.
   const [account, setAccount] = useState<Account | null>(() => getSession());
   const [isDark, setIsDark] = useState(true);
-  const [screen, setScreen] = useState<"feed" | "discover" | "paid" | "profile" | "inbox">("feed");
+  const [screen, setScreen] = useState<"feed" | "discover" | "paid" | "profile" | "settings" | "inbox">("feed");
+  const [settingsRoute, setSettingsRoute] = useState<SettingsRoute | null>(null);
   const [feedTab, setFeedTab] = useState<"forYou" | "following">("forYou");
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [liveMode, setLiveMode] = useState<"off" | "setup" | "creator" | "viewer" | "upload">("off");
@@ -954,6 +958,7 @@ export default function App() {
 
   return (
     <ThemeContext.Provider value={isDark}>
+      <SessionProvider key={account.email} account={account} onAccountChange={setAccount}>
       <div
         className={`h-[100dvh] w-full overflow-hidden${isDark ? " dark" : ""}`}
         style={{ background: isDark ? "#000" : "#f2f5fb", fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif" }}
@@ -1110,13 +1115,30 @@ export default function App() {
             )}
           </AnimatePresence>
 
-          {/* ── Profile / Settings ── */}
+          {/* ── Creator profile ── */}
           <AnimatePresence>
             {screen === "profile" && (
+              <motion.div key="profile" className="absolute inset-0 z-20"
+                initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 34, stiffness: 300 }}>
+                <OwnProfileScreen key={account.email}
+                  onBack={() => setScreen("feed")}
+                  onOpenSettings={() => { setSettingsRoute(null); setScreen("settings"); }}
+                  onEditProfile={() => { setSettingsRoute("editProfile"); setScreen("settings"); }}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* ── Settings ── */}
+          <AnimatePresence>
+            {screen === "settings" && (
               <motion.div key="settings" initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 34, stiffness: 300 }}>
                 <SettingsScreen
+                  key={`${account.email}:${settingsRoute ?? "root"}`}
                   account={account}
-                  onBack={() => setScreen("feed")}
+                  initialRoute={settingsRoute}
+                  onBack={() => setScreen("profile")}
+                  onOpenProfile={() => setScreen("profile")}
                   onLogout={handleLogout}
                   onDeleteProfile={() => setShowDeleteModal(true)}
                   onAccountChange={setAccount}
@@ -1213,6 +1235,7 @@ export default function App() {
           </AnimatePresence>
         </div>
       </div>
+      </SessionProvider>
     </ThemeContext.Provider>
   );
 }
