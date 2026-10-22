@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, beforeEach, test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { PostMedia } from "./post-media";
+import { ContentGrid } from "./profile-ui";
 import { PostMediaRepair } from "./PostMediaRepair";
 import { canRepairPost, repairPostMedia, validateRepairFile, type RepairProgress } from "./post-media-repair";
 import type { GraphQLPost } from "./profile-graphql";
@@ -521,6 +522,33 @@ test("media without an authenticated session never makes an anonymous storage re
   values.delete("connextionz.accessToken");
   globalThis.fetch = async () => { throw new Error("An anonymous request must not be sent"); };
   assert.deepEqual(await resolvePostMediaUrl(mediaUrl), { ok: false, error: "Sign in again to access post media." });
+});
+
+test("profile posts with missing associations remain visible without invented media or storage requests", async () => {
+  saved = brokenPost();
+  const requests: string[] = [];
+  const send = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    requests.push(String(input));
+    return send(input, init);
+  };
+  const posts = (await fetchMeProfile())?.posts;
+  assert.equal(posts?.length, 1);
+  const post = posts![0];
+  assert.equal(post.id, POST);
+  assert.equal(post.mediaUrl, null);
+  assert.equal(post.thumbnail, "");
+  assert.equal(post.mediaType, "video");
+  const grid = renderToStaticMarkup(<ContentGrid items={[post]} />);
+  assert.equal((grid.match(/Media unavailable/g) ?? []).length, 1);
+  assert.doesNotMatch(grid, /<img|<video|Repair missing media/);
+  const media = renderToStaticMarkup(<PostMedia src={post.mediaUrl ?? ""} mediaType={post.mediaType} alt={post.caption} />);
+  assert.match(media, /no media reference/);
+  assert.deepEqual(await resolvePostMediaUrl(post.mediaUrl ?? ""), {
+    ok: false, error: "This post has no media reference.",
+  });
+  assert.equal(requests.length, 1);
+  assert.deepEqual(calls, []);
 });
 
 test("renderer distinguishes image and video metadata and reports missing media", () => {

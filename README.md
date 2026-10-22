@@ -72,14 +72,21 @@
   once automatically on a media load error; persistent failures show an error.
   Image posts render as images, not video elements.
 
-  On your own Profile, **Repair missing media** lists your loaded video posts with
-  missing media/thumbnail references. Select the existing post, choose a video
-  and a JPEG thumbnail (up to 8MB), review both previews, and explicitly confirm.
-  A post with an attached video but no thumbnail needs only the JPEG. This uploads
-  new copies; it does not find or restore an unidentified original storage object.
-  The existing post UUID, caption, visibility, engagement and relationships are
-  preserved; no create-post or publish mutation is sent. Upload timestamps and
-  normal video-upload analytics may change.
+  Creator profiles do not expose a media-repair action or dialog. Missing media
+  remains explicitly unavailable; post counts and metadata are not evidence that
+  a storage object can be retrieved. The existing repair backend and standalone
+  repair components are retained, but are not connected to the profile.
+
+  The three investigated posts have no associated media rows, and no reliable
+  mapping to their original storage objects has been established. Original object
+  existence remains unverified. An authorized operator must first establish an
+  authoritative post-to-object mapping from trusted records/backups before any
+  approved restoration. Do not guess keys from filenames or timestamps.
+  Alternatively, the creator must supply each post's intended video and a JPEG
+  poster (up to 8MB) for an explicitly approved authenticated upload to that same
+  existing post UUID: primary video first, then thumbnail bound to its returned
+  media ID. This uploads new copies, not recovery of unidentified originals.
+  Neither path is automatic, and no production recovery has been verified.
 
   Repair reuses the authenticated multipart endpoint with `repair_missing=true`.
   Normal and repair uploads both check missing-slot preconditions, upload outside

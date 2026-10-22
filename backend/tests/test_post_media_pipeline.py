@@ -790,6 +790,44 @@ async def test_upload_associates_media_and_reloaded_queries_return_metadata(pipe
 
 
 @pytest.mark.asyncio
+async def test_missing_associations_return_posts_without_fabricating_or_signing_media(pipeline, monkeypatch):
+    state, ctx = pipeline
+    state.post.status = ContentStatus.PUBLISHED
+    state.post.media_url = None
+    state.post.thumbnail = ""
+    assert state.post.media == []
+    before = copy.deepcopy(vars(state.post))
+    signing = AsyncMock()
+    monkeypatch.setattr("features.media.router.media_storage.download_url", signing)
+    feed = await _post_to_feed_item(ctx, state.post)
+    monkeypatch.setattr("api.graphql._feed", AsyncMock(return_value=FeedPageType(items=[feed])))
+    result = await schema.execute(
+        """
+        query MissingPostMedia($id: UUID!) {
+          myPosts { id thumbnail mediaUrl mediaType }
+          me { posts { id thumbnail mediaUrl mediaType } }
+          feed { items { id thumbnail mediaUrl mediaType } }
+          post(id: $id) { id thumbnail mediaUrl mediaType }
+        }
+        """,
+        variable_values={"id": str(state.post.id)},
+        context_value=ctx,
+    )
+    assert not result.errors
+    expected = {
+        "id": str(state.post.id), "thumbnail": "", "mediaUrl": None, "mediaType": "video",
+    }
+    assert result.data == {
+        "myPosts": [expected], "me": {"posts": [expected]},
+        "feed": {"items": [expected]}, "post": expected,
+    }
+    assert vars(state.post) == before
+    signing.assert_not_awaited()
+    ctx.db.commit.assert_not_awaited()
+    ctx.db.flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_old_uploaded_media_is_read_without_rewriting_database_records(pipeline, monkeypatch):
     state, ctx = pipeline
     state.post.media = [
